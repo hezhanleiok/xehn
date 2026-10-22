@@ -1,0 +1,5 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 自适应图标底板色：取自 logo 卡片边缘的浅蓝白 -->
+    <color name="ic_launcher_background">#F1F6FF</color>
+</resources>

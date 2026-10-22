@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Compose 自己画全部界面，这里只需要一个无 ActionBar 的宿主主题。
+        故意不继承 MaterialComponents/AppCompat：省掉一整个依赖，Compose 的
+        Material3 主题在 setContent 里单独给。
+
+        targetSdk 35 起系统强制 edge-to-edge，状态栏/导航栏会直接压在内容上。
+        所以这里把两根栏都设成透明，界面自己用 insets 让开（不然顶部那排图标
+        会落在系统状态栏窗口底下，点不动）。
+        windowLightStatusBar 只是启动瞬间的初值，运行中由 XiaoheTheme 按
+        应用主题动态改 —— 深色主题下必须换成浅色图标。
+    -->
+    <style name="Theme.XiaoheVpn" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

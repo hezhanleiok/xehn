@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 软件名（桌面图标、任务列表、通知标题都用它） -->
+    <string name="app_name">Xehn</string>
+    <string name="channel_name">连接状态</string>
+    <string name="notif_connecting">正在连接…</string>
+    <string name="notif_connected">已连接</string>
+    <string name="notif_disconnected">未连接</string>
+    <string name="action_disconnect">断开</string>
+</resources>

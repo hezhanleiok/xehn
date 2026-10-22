@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    自适应图标：foreground 是裁掉白边后的卡片，按画布 90% 摆放。
+    启动器按自己的形状裁剪，卡片自身那圈白色圆角落在遮罩之外，所以不会有
+    四角白边；background 用与卡片边缘同色系的浅蓝白，遮罩边缘自然衔接。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

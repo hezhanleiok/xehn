@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    通知栏小图标：必须是单色 + 透明背景，系统只取 alpha 通道。
+    用自绘矢量图，避免依赖 android.R.drawable 里那些名字随时会变的系统图。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5L12,1zM12,11h7c-0.53,4.12 -3.28,7.79 -7,9.03V11H5V6.3l7,-3.11V11z" />
+</vector>

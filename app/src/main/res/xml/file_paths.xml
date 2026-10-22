@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    只开放 cache/logs 一个目录：日志分享是 FileProvider 的唯一用途。
+    不要改成 <root-path> 或 files-path —— 那等于把整个私有目录交给第三方应用。
+-->
+<paths>
+    <cache-path name="logs" path="logs/" />
+</paths>

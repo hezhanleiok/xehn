@@ -1,0 +1,42 @@
+# Android / Gradle
+.gradle/
+.kotlin/
+build/
+local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+keystore.properties
+
+# gomobile 产物：由 tools/build-engine.ps1 生成，不入库
+app/libs/*.aar
+app/libs/*.jar
+
+# 真凭据：绝不入库。原因与补法见 docs/credentials/README.md
+app/src/main/assets/account.json
+app/src/main/assets/psiphon/client.config
+
+# 运行期状态与日志（可能含账号私钥）
+*.log
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+captures/
+.codebuddy/
+.DS_Store
+Thumbs.db
+
+# 编辑器/命令留下的备份
+*.bak
+*.orig
+*.rej
+
+# 会话期间生成的临时文件（构建日志、抓屏、诊断脚本）
+.tmp_*
+
+# Go
+engine/*.exe
+engine/*.test
