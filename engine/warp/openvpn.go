@@ -34,7 +34,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	ovpn "github.com/xhwarp/android-engine/third_party/mihomo/openvpn"
@@ -240,12 +239,6 @@ type OpenVPNOptions struct {
 	UnderlayPrefer   string
 	IPv6             bool
 
-	// Upstream 决定「怎么连到节点」，取值见 OpenVPNUpstream* 常量。
-	//
-	// 这是速度的开关：直连走宿主内核 socket（和电脑版同一条路径），经 WARP 则是
-	// gVisor 用户态 TCP + 多一层加密 —— 真机实测前者几十 Mbps、后者只有 2–3 Mbps。
-	Upstream string
-
 	HandshakeTimeout time.Duration
 	VerifyTimeout    time.Duration
 	Budget           time.Duration
@@ -386,36 +379,15 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	nodeAddr := net.JoinHostPort(cfgText.RemoteHost, strconv.Itoa(cfgText.RemotePort))
 	o.report(fmt.Sprintf("OpenVPN 节点 %s（%s/%s）", nodeAddr, cfgText.Proto, firstNonEmpty(cfgText.Cipher, "默认加密")))
 
-	// ①② 选上游 → 拨节点 → 握手。
+	// ①② 上游只有一条：先进 WARP，再从隧道里拨节点。
 	//
-	// 直连（宿主内核 socket）和经 WARP（gVisor 用户态 TCP）差一个数量级：
-	// 真机实测经 WARP 只有 2–3 Mbps，而电脑版同一条内核路径能跑到几十 Mbps。
-	// 差在两处 —— WARP 多一层加密/多 200ms RTT，以及 gVisor 的 TCP 窗口在
-	// 250ms 往返下把吞吐锁死（窗口/RTT）。所以默认 auto：先直连，握手失败再退 WARP。
-	modes := openvpnUpstreamOrder(o.Upstream, o.report)
-
-	var client *ovpn.Client
-	var under *Session
-	var push *ovpn.PushReply
-	var nodeConn net.Conn
-	var usedMode string
-	var lastErr error
-	for i, mode := range modes {
-		under, client, push, nodeConn, lastErr = tryOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr, mode)
-		if lastErr == nil {
-			usedMode = mode
-			break
-		}
-		o.report(fmt.Sprintf("%s 上游不可用：%v", openvpnUpstreamLabel(mode), lastErr))
-		if i+1 < len(modes) {
-			o.report("改用 WARP 上游重试（多一层加密，速度会明显变慢）…")
-		}
-	}
-	if client == nil {
-		if lastErr == nil {
-			lastErr = errors.New("没有可用的上游")
-		}
-		return nil, fmt.Errorf("连接 OpenVPN 节点 %s 失败：%w", nodeAddr, lastErr)
+	// 曾经有过「宿主 socket 直连节点」的模式（理论上更快，因为它省掉了 WARP 和
+	// gVisor 用户态 TCP），但 2026-10-22 真机实测：这条网络里直连节点的 TCP
+	// 全部 i/o timeout，连接失败**全部**由它引入，而直连成功的那几个也过不了数据。
+	// 所以整条直连分支（含设置里的「连节点方式」）在 0.2.3 移除，不再作为选项。
+	under, client, push, err := dialOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr)
+	if err != nil {
+		return nil, fmt.Errorf("连接 OpenVPN 节点 %s 失败：%w", nodeAddr, err)
 	}
 	// ok 只在真正把会话交出去之后置位；中途任何 return 都要把上游隧道关掉，
 	// 否则一条 netstack 隧道会留在后台空转（系统看不到，日志里也看不出来）。
@@ -458,16 +430,6 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 		return nil, err
 	}
 
-	// ③.5 系统 VPN 已经建立 —— 直连模式要在这里把节点连接再保护一次，
-	//     否则握手用的那个 socket 会被刚起来的 tun 抓走（见 reProtect 注释）。
-	if usedMode == OpenVPNUpstreamDirect {
-		if reProtect(nodeConn) {
-			o.report("节点连接已补打 protect（系统 VPN 建好后）")
-		} else {
-			o.report("警告：节点连接没能打上 protect，数据可能被自己的 tun 抓回去")
-		}
-	}
-
 	// ④ 起泵。
 	f := os.NewFile(uintptr(fd), "ovpn-tun")
 	if f == nil {
@@ -480,11 +442,7 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	ex := &openvpnExit{client: client, file: f}
 	ex.startPump(context.Background())
 
-	// 直连模式没有外层隧道：给 Session 一个空载体，Close/计数照常工作。
 	sess := under
-	if sess == nil {
-		sess = &Session{tn: directCarrier{}, Endpoint: nodeAddr}
-	}
 	sess.ovpn = ex
 	sess.tunFD = fd
 
@@ -508,125 +466,53 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	return sess, nil
 }
 
-// OpenVPN 上游（连节点的方式）取值。
-const (
-	// OpenVPNUpstreamAuto 先直连，握手失败再退 WARP（默认，见 DialOpenVPN 注释）。
-	OpenVPNUpstreamAuto = "auto"
-	// OpenVPNUpstreamDirect 只走宿主 socket，最接近电脑版的速度。
-	OpenVPNUpstreamDirect = "direct"
-	// OpenVPNUpstreamWarp 先进 WARP 再从隧道里拨节点，稳但慢。
-	OpenVPNUpstreamWarp = "warp"
-)
-
-// openvpnUpstreamOrder 把配置值翻成尝试顺序；显式锁定的模式不自动回落。
-func openvpnUpstreamOrder(mode string, report func(string)) []string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case OpenVPNUpstreamDirect:
-		return []string{OpenVPNUpstreamDirect}
-	case OpenVPNUpstreamWarp:
-		return []string{OpenVPNUpstreamWarp}
-	case "", OpenVPNUpstreamAuto:
-		return []string{OpenVPNUpstreamDirect, OpenVPNUpstreamWarp}
-	default:
-		if report != nil {
-			report(fmt.Sprintf("未知的 OpenVPN 上游 %q，按 auto（先直连后 WARP）处理", mode))
-		}
-		return []string{OpenVPNUpstreamDirect, OpenVPNUpstreamWarp}
-	}
-}
-
-func openvpnUpstreamLabel(mode string) string {
-	if mode == OpenVPNUpstreamDirect {
-		return "直连"
-	}
-	return "WARP"
-}
-
-// directCarrier 是「直连」会话的占位隧道。
+// dialOpenVPNUpstream 起 WARP 上游 → 经它拨节点 → 完成 OpenVPN 握手。
 //
-// 直连没有外层隧道，但 Session.Close / counters 需要一个非 nil 的 tn；
-// stack() 返回 nil 是有意的：没有任何代码应该在直连模式下再往 netstack 里拨号。
-type directCarrier struct{}
-
-func (directCarrier) handshake(context.Context, string, time.Duration) bool { return false }
-func (directCarrier) ports() []int                                          { return nil }
-func (directCarrier) attempts() int                                         { return 0 }
-func (directCarrier) stack() *ipStack                                       { return nil }
-func (directCarrier) counters() (uint64, uint64)                            { return 0, 0 }
-func (directCarrier) Close()                                                {}
-
-// openvpnDirectHandshakeCap 是直连握手的时间上限。
+// 上游**只有这一条**：不进 WARP 的「直连节点」模式在 0.2.3 被删掉了 ——
+// 真机实测那条路在本网络里全是 i/o timeout（连接失败全部由它引入），
+// 偶尔握手成功也过不了数据，留着只是给用户多一个失败面。
 //
-// 直连被墙时通常表现为握手卡住而不是立刻 RST；给 12s 就够判断，剩下的预算留给
-// 后面的 WARP 回退，不能让「直连超时」把整次连接的时间花光。
-const openvpnDirectHandshakeCap = 12 * time.Second
-
-// dialHostNode 从宿主网络直接拨节点，并把这个 socket 排除出系统 VPN。
-//
-// protect 必须在建 socket 那一刻挂上：系统 VPN 起来之后，所有未被排除的 socket
-// 都会被路由进我们自己的 tun，节点连接会被自己的隧道吞掉（递归）。
-func dialHostNode(ctx context.Context, proto, addr string, timeout time.Duration) (net.Conn, error) {
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	dctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	d := &net.Dialer{Timeout: timeout, Control: protectControlFn}
-	return d.DialContext(dctx, proto, addr)
-}
-
-// tryOpenVPNUpstream 按指定上游拨节点并完成 OpenVPN 握手。
-//
-// 失败时自己清理：conn / 上游隧道 / 客户端都不留给调用方，避免回退路径里
-// 残留一条 netstack 隧道（这种残留系统看不到，只能靠内存涨和日志里少一行察觉）。
-func tryOpenVPNUpstream(
+// 失败时自己清理：conn / 上游隧道 / 客户端都不留给调用方，避免残留一条
+// netstack 隧道（这种残留系统看不到，只能靠内存涨和日志里少一行察觉）。
+func dialOpenVPNUpstream(
 	ctx context.Context,
 	o OpenVPNOptions,
 	cfg OpenVPNConfig,
 	clientCfg *ovpn.ClientConfig,
 	nodeAddr string,
-	mode string,
-) (under *Session, client *ovpn.Client, push *ovpn.PushReply, raw net.Conn, err error) {
-	var conn net.Conn
-	if mode == OpenVPNUpstreamDirect {
-		o.report(fmt.Sprintf("直连节点 %s（宿主 socket，不经 WARP）", nodeAddr))
-		conn, err = dialHostNode(ctx, cfg.Proto, nodeAddr, o.HandshakeTimeout)
-		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("直连节点失败: %w", err)
-		}
-	} else {
-		// 系统 tun fd 这一轮归 OpenVPN 的包泵，基础协议退成 netstack。
-		savedTunFD := tunFD
-		tunFD = 0
-		under, err = Dial(ctx, Options{
-			Proto:            o.UnderlayProto,
-			Endpoint:         o.UnderlayEndpoint,
-			Prefer:           o.UnderlayPrefer,
-			IPv6:             o.IPv6,
-			Sample:           2,
-			HandshakeTimeout: o.HandshakeTimeout,
-			VerifyTimeout:    o.VerifyTimeout,
-			Budget:           o.Budget,
-			NoHedge:          true,
-			Report:           o.Report,
-		})
-		tunFD = savedTunFD
-		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("WARP 上游（%s）建立失败: %w", o.UnderlayProto, err)
-		}
-		stack := under.tn.stack()
-		if stack == nil {
-			under.Close()
-			return nil, nil, nil, nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
-		}
-		o.report(fmt.Sprintf("上游就绪（%s 出口 %s），经 WARP 拨节点…", o.UnderlayProto, under.ExitIP))
-		// TCP/UDP 都走 gVisor，系统的路由表完全不参与，所以这一步在系统 VPN
-		// 建起来之前就能完成。
-		conn, err = dialThroughStack(ctx, stack, cfg.Proto, nodeAddr, o.HandshakeTimeout)
-		if err != nil {
-			under.Close()
-			return nil, nil, nil, nil, fmt.Errorf("经 WARP 连接节点失败: %w", err)
-		}
+) (under *Session, client *ovpn.Client, push *ovpn.PushReply, err error) {
+	// 系统 tun fd 这一轮归 OpenVPN 的包泵，基础协议退成 netstack。
+	savedTunFD := tunFD
+	tunFD = 0
+	under, err = Dial(ctx, Options{
+		Proto:            o.UnderlayProto,
+		Endpoint:         o.UnderlayEndpoint,
+		Prefer:           o.UnderlayPrefer,
+		IPv6:             o.IPv6,
+		Sample:           2,
+		HandshakeTimeout: o.HandshakeTimeout,
+		VerifyTimeout:    o.VerifyTimeout,
+		Budget:           o.Budget,
+		NoHedge:          true,
+		Report:           o.Report,
+	})
+	tunFD = savedTunFD
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("WARP 上游（%s）建立失败: %w", o.UnderlayProto, err)
+	}
+	stack := under.tn.stack()
+	if stack == nil {
+		under.Close()
+		return nil, nil, nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
+	}
+	o.report(fmt.Sprintf("上游就绪（%s 出口 %s），经 WARP 拨节点…", o.UnderlayProto, under.ExitIP))
+
+	// TCP/UDP 都走 gVisor，系统的路由表完全不参与，所以这一步在系统 VPN
+	// 建起来之前就能完成。
+	conn, err := dialThroughStack(ctx, stack, cfg.Proto, nodeAddr, o.HandshakeTimeout)
+	if err != nil {
+		under.Close()
+		return nil, nil, nil, fmt.Errorf("经 WARP 连接节点失败: %w", err)
 	}
 
 	packetIO := ovpn.NewDatagramPacketIO(conn)
@@ -636,62 +522,24 @@ func tryOpenVPNUpstream(
 	client, err = ovpn.NewClient(clientCfg, packetIO)
 	if err != nil {
 		_ = conn.Close()
-		if under != nil {
-			under.Close()
-		}
-		return nil, nil, nil, nil, fmt.Errorf("OpenVPN 客户端初始化失败: %w", err)
+		under.Close()
+		return nil, nil, nil, fmt.Errorf("OpenVPN 客户端初始化失败: %w", err)
 	}
 
-	budget := handshakeWindow(o.HandshakeTimeout)
-	if mode == OpenVPNUpstreamDirect && budget > openvpnDirectHandshakeCap {
-		budget = openvpnDirectHandshakeCap
-	}
-	hsCtx, hsCancel := context.WithTimeout(ctx, budget)
+	hsCtx, hsCancel := context.WithTimeout(ctx, handshakeWindow(o.HandshakeTimeout))
 	push, err = client.Handshake(hsCtx)
 	hsCancel()
 	if err != nil {
 		_ = client.Close()
-		if under != nil {
-			under.Close()
-		}
-		return nil, nil, nil, nil, fmt.Errorf("OpenVPN 握手失败: %w", err)
+		under.Close()
+		return nil, nil, nil, fmt.Errorf("OpenVPN 握手失败: %w", err)
 	}
 	if push == nil || len(push.Prefixes) == 0 {
 		_ = client.Close()
-		if under != nil {
-			under.Close()
-		}
-		return nil, nil, nil, nil, errors.New("OpenVPN 握手成功但服务器没有下发 ifconfig 地址")
+		under.Close()
+		return nil, nil, nil, errors.New("OpenVPN 握手成功但服务器没有下发 ifconfig 地址")
 	}
-	return under, client, push, conn, nil
-}
-
-// reProtect 在系统 VPN 建好之后，把节点连接再保护一次。
-//
-// 为什么需要第二次：VpnService.protect() 在 VPN 还没 establish 时拿不到 fwmark，
-// 有些系统版本上会直接返回 false（等于没保护）。而这个 socket 是握手之前建的，
-// 等 tun 起来之后它就会被自己的隧道抓回去 —— 现象是握手成功、出口验证零流量。
-// 直连模式尤其明显，所以建 tun 成功后必须补一刀。
-//
-// 经 WARP 时 conn 是 netstack 里的 socket，不是 syscall.Conn，这里自然跳过。
-func reProtect(c net.Conn) bool {
-	sc, ok := c.(syscall.Conn)
-	if !ok {
-		return false
-	}
-	rc, err := sc.SyscallConn()
-	if err != nil {
-		return false
-	}
-	prot := currentProtector()
-	if prot == nil {
-		return false
-	}
-	done := false
-	_ = rc.Control(func(fd uintptr) {
-		done = prot.Protect(int(fd))
-	})
-	return done
+	return under, client, push, nil
 }
 
 // dialThroughStack 在隧道 netstack 里拨一个 TCP/UDP 连接。

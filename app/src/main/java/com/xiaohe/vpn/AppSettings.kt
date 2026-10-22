@@ -61,13 +61,6 @@ data class AppSettings(
     val openvpnNodeId: String = "",
     /** 固定节点的显示名（只用于日志与界面）。 */
     val openvpnNodeLabel: String = "",
-    /**
-     * 连节点的方式（速度开关）：
-     *   "auto"   = 先直连，握手失败自动转 WARP（默认）
-     *   "direct" = 只直连（宿主内核 socket，和电脑版同一条路径，最快）
-     *   "warp"   = 只经 WARP（稳但慢：多一层加密 + gVisor 用户态 TCP）
-     */
-    val openvpnUpstream: String = "auto",
     val ipv6: Boolean = false,
     val mtu: Int = 1280,
     val dns: String = "1.1.1.1, 223.5.5.5",
@@ -124,7 +117,6 @@ object SettingsStore {
             openvpnCountry = p.getString("openvpnCountry", d.openvpnCountry) ?: d.openvpnCountry,
             openvpnNodeId = p.getString("openvpnNodeId", d.openvpnNodeId) ?: d.openvpnNodeId,
             openvpnNodeLabel = p.getString("openvpnNodeLabel", d.openvpnNodeLabel) ?: d.openvpnNodeLabel,
-            openvpnUpstream = p.getString("openvpnUpstream", d.openvpnUpstream) ?: d.openvpnUpstream,
             mode = p.getString("mode", d.mode) ?: d.mode,
             proxyPort = p.getInt("proxyPort", d.proxyPort),
             proxyLan = p.getBoolean("proxyLan", d.proxyLan),
@@ -155,7 +147,6 @@ object SettingsStore {
             putString("openvpnCountry", s.openvpnCountry)
             putString("openvpnNodeId", s.openvpnNodeId)
             putString("openvpnNodeLabel", s.openvpnNodeLabel)
-            putString("openvpnUpstream", s.openvpnUpstream)
             putString("mode", s.mode)
             putInt("proxyPort", s.proxyPort)
             putBoolean("proxyLan", s.proxyLan)

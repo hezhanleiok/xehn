@@ -243,8 +243,6 @@ class WarpVpnService : VpnService() {
                         (if (first.shared) "·共享" else "") + "，" +
                         (if (first.hasMeasuredLatency) "${first.latencyMs}ms" else "未测") + "）"
                 )
-                // 上游必须先下发：它决定「怎么连节点」，是速度差一个数量级的那一项。
-                e.setOpenVPNUpstream(s.openvpnUpstream)
                 e.setOpenVPNExit(
                     cands.joinToString(",") { it.id },
                     nodeSlotLabel(nodes, first),

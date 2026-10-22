@@ -252,20 +252,6 @@ func (e *Engine) SetOpenVPNExit(idsCSV, label, country string) {
 	e.sess.logf("[engine] OpenVPN 出口 = %s（%s），候选 %d 个", label, country, len(kept))
 }
 
-// SetOpenVPNUpstream sets how the engine reaches the node: "auto" (direct first,
-// then WARP), "direct" (host socket only) or "warp" (always through WARP).
-//
-// 直连和经 WARP 的速度差一个数量级（真机 2–3 Mbps vs 电脑版几十 Mbps），
-// 所以默认 auto；这个开关只是给受限网络留一个手动锁定。
-func (e *Engine) SetOpenVPNUpstream(mode string) {
-	wb := e.warpBackendOf()
-	if wb == nil {
-		return
-	}
-	wb.SetOpenVPNUpstream(mode)
-	e.sess.logf("[engine] OpenVPN 上游 = %s", wb.openvpnUpstreamMode())
-}
-
 // splitCSV 是 idsCSV 的解析：去空白、去空项、去重（顺序保持）。
 func splitCSV(s string) []string {
 	parts := strings.Split(s, ",")

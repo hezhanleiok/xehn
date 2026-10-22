@@ -57,13 +57,8 @@ type warpBackend struct {
 	// ovpnFailed 记录最近失败过的节点（id → 失败时间）。Kotlin 侧给的候选顺序是稳定的，
 	// 靠这里把它们跳过去，下一轮才会落到「同国同类的下一个」。
 	ovpnFailed map[string]time.Time
-	// openvpnUpstream 是「怎么连节点」：auto / direct / warp（见 warp.OpenVPNUpstream*）。
-	// 默认 auto：先直连（和电脑版同一条内核路径，快一个数量级），失败再退 WARP。
-	openvpnUpstream string
-	// directBlockedAt 记录「直连刚被网络拦过」的时间（auto 模式下用）。
-	// 没有它的话，受限网络里每个候选都要先白等一次直连超时（实测 12s × 5 个候选），
-	// 用户看到的就是「点了连接半天没反应」。
-	directBlockedAt time.Time
+	// 注：曾经有过「直连节点 / 经 WARP」两种上游（openvpnUpstream + directBlockedAt），
+	// 0.2.3 起只剩经 WARP 一条 —— 见 warp/openvpn.go 里 dialOpenVPNUpstream 的注释。
 	// 建系统 VPN 的回调。OpenVPN 必须先握手拿到服务器下发的 ifconfig，
 	// 才能用那个地址 establish —— 所以 tun 要由引擎在连接过程中回调 Kotlin 建。
 	openvpnTun func(warp.OpenVPNTun) (int, error)
@@ -168,56 +163,6 @@ func (b *warpBackend) RefreshVPNGateNodes(ctx context.Context, report func(strin
 //
 // ids 是 VPN Gate 节点 ID（按尝试顺序）；配置原文由引擎自己从节点缓存里取，
 // 不需要经过 Kotlin（一份 .ovpn 约 13 KB，来回搬没有意义）。
-// SetOpenVPNUpstream 设置连节点的方式（auto / direct / warp）。
-// 非法值在这里就归一成 auto，避免连接时才报错。
-func (b *warpBackend) SetOpenVPNUpstream(mode string) {
-	switch mode {
-	case warp.OpenVPNUpstreamDirect, warp.OpenVPNUpstreamWarp:
-	default:
-		mode = warp.OpenVPNUpstreamAuto
-	}
-	b.mu.Lock()
-	b.openvpnUpstream = mode
-	b.mu.Unlock()
-}
-
-// openvpnUpstreamMode 读当前上游模式（空 = auto）。
-func (b *warpBackend) openvpnUpstreamMode() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.openvpnUpstream == "" {
-		return warp.OpenVPNUpstreamAuto
-	}
-	return b.openvpnUpstream
-}
-
-// openvpnDirectBlockTTL 是「直连被拦」记忆的有效期。
-//
-// 网络拦截通常是整条线路的特征（换 Wi-Fi/换运营商才可能变），10 分钟足够
-// 避免同一轮连接里反复白等，又不会把临时抽风当成永久结论。
-const openvpnDirectBlockTTL = 10 * time.Minute
-
-// markDirectBlocked 记录一次「直连被网络拦」，返回是否是新记录（用于只打一次日志）。
-func (b *warpBackend) markDirectBlocked() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	fresh := time.Since(b.directBlockedAt) > openvpnDirectBlockTTL
-	b.directBlockedAt = time.Now()
-	return fresh
-}
-
-func (b *warpBackend) clearDirectBlocked() {
-	b.mu.Lock()
-	b.directBlockedAt = time.Time{}
-	b.mu.Unlock()
-}
-
-// directRecentlyBlocked 判断直连是否刚被拦过（TTL 内）。
-func (b *warpBackend) directRecentlyBlocked() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return !b.directBlockedAt.IsZero() && time.Since(b.directBlockedAt) < openvpnDirectBlockTTL
-}
 
 func (b *warpBackend) SetOpenVPNExit(enabled bool, ids []string, label, country string) {
 	b.mu.Lock()
@@ -268,13 +213,6 @@ func (b *warpBackend) connectOpenVPN(
 	prefer := b.preferEndpoint(req.Proto)
 	ids = b.freshOpenVPNIDs(ids, report)
 
-	// auto 模式下如果直连刚被网络拦过，就别再每个候选白等 12 秒。
-	upstream := b.openvpnUpstreamMode()
-	if upstream == warp.OpenVPNUpstreamAuto && b.directRecentlyBlocked() {
-		upstream = warp.OpenVPNUpstreamWarp
-		report(fmt.Sprintf("直连最近被网络拦过（%v 内不再试），本轮直接走 WARP 上游", openvpnDirectBlockTTL))
-	}
-
 	tried := 0
 	var lastErr error
 	for _, id := range ids {
@@ -294,7 +232,6 @@ func (b *warpBackend) connectOpenVPN(
 		sess, err := warp.DialOpenVPN(ctx, warp.OpenVPNOptions{
 			Config:           cfg,
 			Label:            id,
-			Upstream:         upstream,
 			UnderlayProto:    req.Proto,
 			UnderlayEndpoint: req.Endpoint,
 			UnderlayPrefer:   prefer,
@@ -308,10 +245,6 @@ func (b *warpBackend) connectOpenVPN(
 		if err == nil {
 			b.rememberEndpoint(req.Proto, sess.Endpoint)
 			b.clearOpenVPNFailure(id)
-			if upstream == warp.OpenVPNUpstreamDirect {
-				// 直连这条网络能用，清掉「被拦」记忆，下次 auto 还会先试直连。
-				b.clearDirectBlocked()
-			}
 
 			// 出口国家以实测为准；节点列表里自报的国家只在实测解析不到时兜底。
 			exitCountry := sess.Country
@@ -331,13 +264,6 @@ func (b *warpBackend) connectOpenVPN(
 		lastErr = err
 		report(fmt.Sprintf("节点 %s 失败：%v", id, err))
 		b.markOpenVPNFailed(id)
-		// 直连「拨号」就超时 = 这条网络到节点的 TCP 被拦了，不是节点的问题。
-		// 记住它，本进程内后续候选不再白等一次 12 秒的直连超时。
-		if strings.Contains(err.Error(), "直连节点失败") {
-			if b.markDirectBlocked() {
-				report("直连被网络拦截（拨号超时），后续候选直接走 WARP")
-			}
-		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有任何可用节点配置")
