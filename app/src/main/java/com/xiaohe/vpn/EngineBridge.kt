@@ -215,6 +215,16 @@ object EngineBridge {
         engineOrCreate(context).setOpenVPNExit(ids.joinToString(","), label, country)
     }
 
+    /**
+     * 连节点的方式：auto（先直连、失败转 WARP）/ direct / warp。
+     *
+     * 直连走宿主内核 socket，和电脑版同一条路径；经 WARP 是 gVisor 用户态 TCP，
+     * 真机实测只有 2–3 Mbps。不存在「开着的会话中途改」——只在 Connect 之前下发。
+     */
+    fun setOpenVPNUpstream(context: Context, mode: String) {
+        engineOrCreate(context).setOpenVPNUpstream(mode)
+    }
+
     /** UI 侧记录一行日志，与引擎日志同一条流。 */
     fun note(line: String) {
         _state.value = _state.value.copy(logs = (_state.value.logs + line).takeLast(LOG_KEEP))

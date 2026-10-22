@@ -15,6 +15,17 @@ import (
 // go blank because one URL said 403.
 const traceURL = "https://www.cloudflare.com/cdn-cgi/trace"
 
+// traceIPURLs 是**不需要 DNS** 的 trace 端点，出口验证的最后一档。
+//
+// 为什么必须有这一档：上面两档（/meta 和 traceURL）都是域名，DNS 一挂，
+// verify 就返回「数据面不通」——把一条能用的隧道判死。真机踩过两次
+// （2026-10-22 白天和晚上各一次），表现和「节点没转发流量」完全一样。
+// IP 字面量只要隧道还在转发就一定通，与 DNS 无关。
+var traceIPURLs = []string{
+	"https://1.1.1.1/cdn-cgi/trace",
+	"https://1.0.0.1/cdn-cgi/trace",
+}
+
 // egressProbe answers one question: does this tunnel actually carry traffic, and
 // where does it come out?
 //
@@ -29,10 +40,22 @@ const traceURL = "https://www.cloudflare.com/cdn-cgi/trace"
 // is really up, really routing, and really protected, which is exactly what the
 // user sees on the phone.
 func egressProbe(ctx context.Context, tn tunnel, timeout time.Duration) (string, bool) {
+	body, _, ok := egressProbeReason(ctx, tn, timeout)
+	return body, ok
+}
+
+// egressProbeReason 与 egressProbe 相同，额外返回失败原因（写进日志用）。
+func egressProbeReason(ctx context.Context, tn tunnel, timeout time.Duration) (string, string, bool) {
 	if st := tn.stack(); st != nil {
-		return st.fetch(ctx, timeout)
+		return st.fetchReason(ctx, timeout)
 	}
-	return fetchViaSystem(ctx, timeout)
+	if body, ok := fetchViaSystem(ctx, timeout); ok {
+		return body, "", true
+	}
+	if ctx.Err() != nil {
+		return "", "系统网络请求超时", false
+	}
+	return "", "系统网络请求失败（DNS 或被拒）", false
 }
 
 // fetchViaSystem fetches the exit metadata over the normal network stack.
@@ -66,7 +89,16 @@ func fetchMetaVia(ctx context.Context, timeout time.Duration, network string) (s
 	if body, ok := fetchMeta(reqCtx, client, metaURL); ok {
 		return body, true
 	}
-	return fetchMeta(reqCtx, client, traceURL)
+	if body, ok := fetchMeta(reqCtx, client, traceURL); ok {
+		return body, true
+	}
+	// 最后一档：IP 字面量。上面两档都要 DNS，DNS 不通不代表隧道不通。
+	for _, u := range traceIPURLs {
+		if body, ok := fetchMeta(reqCtx, client, u); ok {
+			return body, true
+		}
+	}
+	return "", false
 }
 
 // traceValue pulls one "key=value" line out of a /cdn-cgi/trace body.

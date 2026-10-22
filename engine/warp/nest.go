@@ -11,7 +11,7 @@ import (
 	"strconv"
 
 	"github.com/amnezia-vpn/amneziawg-go/conn"
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	netstack "github.com/xhwarp/android-engine/warp/netstackx"
 )
 
 // WARP-in-WARP（协议名 wwarp）：一条 WARP 隧道套在另一条 WARP 隧道里。

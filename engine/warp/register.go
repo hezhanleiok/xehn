@@ -20,7 +20,7 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	netstack "github.com/xhwarp/android-engine/warp/netstackx"
 )
 
 const (

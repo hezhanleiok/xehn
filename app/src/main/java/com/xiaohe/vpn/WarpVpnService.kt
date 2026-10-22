@@ -67,10 +67,14 @@ class WarpVpnService : VpnService() {
         /**
          * OpenVPN 出口的系统 tun MTU。
          *
-         * 服务端 tun-mtu 通常是 1500，但我们的外层还要经 WARP（netstack MTU 1280）
-         * 再封装一次；1400 给内层 TCP 留出 MSS 余量，避免大包被外层反复分片。
+         * 服务端 tun-mtu 通常是 1500，但经 WARP 时外层 netstack MTU 只有 1280
+         * （MSS 1240），一个内层包要再套 OpenVPN 头（长度 2 + opcode 1 + HMAC 20
+         * + IV 16 + CBC 填充 ≤16 ≈ 55），所以内层最多 ~1185。
+         *
+         * 原来用 1400，每个包都被外层拆成 1240+160 两段 —— 包量和加密次数接近翻倍。
+         * 现在取 1160，1 个包正好 1 个外层段。直连模式下这也是个稳妥值。
          */
-        private const val OPENVPN_TUN_MTU = 1400
+        private const val OPENVPN_TUN_MTU = 1160
 
         /** 看门狗多久看一次快照。 */
         private const val WATCHDOG_TICK_MS = 5_000L
@@ -239,6 +243,8 @@ class WarpVpnService : VpnService() {
                         (if (first.shared) "·共享" else "") + "，" +
                         (if (first.hasMeasuredLatency) "${first.latencyMs}ms" else "未测") + "）"
                 )
+                // 上游必须先下发：它决定「怎么连节点」，是速度差一个数量级的那一项。
+                e.setOpenVPNUpstream(s.openvpnUpstream)
                 e.setOpenVPNExit(
                     cands.joinToString(",") { it.id },
                     nodeSlotLabel(nodes, first),

@@ -251,6 +251,25 @@ fun SettingsScreen(
             subtitle = openvpnSubtitle(settings, nodes),
         ) { if (settings.openvpn) nodePicker = true }
 
+        // 上游 = 速度开关。直连走宿主内核 socket（和电脑版同一条路径），经 WARP 是
+        // gVisor 用户态 TCP + 多一层加密，真机实测差一个数量级（2–3 Mbps vs 几十）。
+        SettingChips(
+            title = "连节点方式",
+            subtitle = when (settings.openvpnUpstream) {
+                "direct" -> "只直连：最快，但节点若被墙会连不上（建议先试「自动」）"
+                "warp" -> "只经 WARP：更稳，但多一层加密 + 用户态 TCP，实测只有 2–3 Mbps"
+                else -> "自动：先直连（12 秒），握手失败再转 WARP"
+            },
+            options = listOf(
+                "auto" to "自动",
+                "direct" to "直连",
+                "warp" to "经 WARP",
+            ),
+            selected = settings.openvpnUpstream.ifEmpty { "auto" },
+            onSelect = { onChange(settings.copy(openvpnUpstream = it)) },
+            enabled = settings.openvpn,
+        )
+
         if (nodePicker) {
             OpenVpnNodePicker(
                 nodes = nodes,

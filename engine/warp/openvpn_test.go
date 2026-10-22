@@ -97,7 +97,10 @@ func TestOpenVPNTunFromPush(t *testing.T) {
 	if len(tun.DNS) != 1 || tun.DNS[0] != "10.211.1.1" {
 		t.Fatalf("dns = %v", tun.DNS)
 	}
-	if tun.MTU != 1400 {
-		t.Fatalf("MTU = %d，期望 1400（外层还要经 WARP 封装）", tun.MTU)
+	// 1160 不是随手写的：经 WARP 时外层 MSS 是 1240，一个内层包还要套 ~55 字节的
+	// OpenVPN 头（长度 2 + opcode 1 + HMAC 20 + IV 16 + CBC 填充），1400 会被拆成
+	// 两段，包量和加密次数接近翻倍。
+	if tun.MTU != 1160 {
+		t.Fatalf("MTU = %d，期望 1160（外层 MSS 1240 - OpenVPN 头 ~55）", tun.MTU)
 	}
 }

@@ -204,12 +204,12 @@ func dialWGTunnel(ctx context.Context, o Options, run protoRun) (*Session, error
 			}
 			o.report(fmt.Sprintf("%s 握手成功，验证出口…", endpoint))
 			start := time.Now()
-			body, passed := egressProbe(ctx, tn, o.VerifyTimeout)
+			body, why, passed := egressProbeReason(ctx, tn, o.VerifyTimeout)
 			if !passed {
 				// 握手成功但过不了数据 —— 这正是「连上了却打不开网页」的那类
 				// 半死端点，继续换下一个，绝不报成功。
-				lastErr = fmt.Errorf("%s 握手成功但数据面不通", endpoint)
-				o.report(fmt.Sprintf("%s 数据面不通，换下一个", endpoint))
+				lastErr = fmt.Errorf("%s 握手成功但数据面不通（%s）", endpoint, why)
+				o.report(fmt.Sprintf("%s 数据面不通（%s），换下一个", endpoint, why))
 				continue
 			}
 			s := &Session{

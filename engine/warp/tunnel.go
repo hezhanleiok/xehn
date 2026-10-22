@@ -15,7 +15,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/amnezia-vpn/amneziawg-go/tun"
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	netstack "github.com/xhwarp/android-engine/warp/netstackx"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
@@ -25,8 +25,19 @@ type ipStack struct {
 	client *http.Client
 }
 
+// netstackTCPBufferMax 是外层 gVisor TCP 的收/发缓冲上限。
+//
+// 单程 RTT ~250ms 时，吞吐 ≈ 窗口/RTT：8MB ⇒ 理论上限 ~256 Mbps，远高于
+// VPN Gate 节点本身能给到的带宽，所以再大只是白占内存（每条连接都可能吃满）。
+// 上游默认在 1MB 量级，实测把「WARP → 节点」这条链锁在 17 Mbps。
+// ⚠ 暂时关掉（0 = 用上游默认缓冲）。取值来自 2026-10-22 深夜的真机对照：
+// 打开 8MB 之后的构建出现「握手成功但数据面不通」，关掉之后恢复。
+// 要重新启用前必须先在真机验证：先 2MB 试，再逐步加，别直接上 8MB。
+const netstackTCPBufferMax = 0
+
 func newIPStack(local []netip.Addr, mtu int) (tun.Device, *ipStack, error) {
-	tunDev, tnet, err := netstack.CreateNetTUN(local, []netip.Addr{netip.MustParseAddr(tunnelDNS)}, mtu)
+	tunDev, tnet, err := netstack.CreateNetTUNBuffered(
+		local, []netip.Addr{netip.MustParseAddr(tunnelDNS)}, mtu, netstackTCPBufferMax)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -252,13 +263,54 @@ func (s *ipStack) durability(count int, timeout time.Duration) (time.Duration, f
 }
 
 func (s *ipStack) fetch(ctx context.Context, timeout time.Duration) (string, bool) {
+	body, _, ok := s.fetchReason(ctx, timeout)
+	return body, ok
+}
+
+// fetchReason 与 fetch 相同，但把失败原因带出来。
+//
+// 没有原因时，「DNS 挂了」「出口拒了 /meta」「隧道真的没通」三种情况在日志里
+// 一模一样（都写成「数据面不通」），而它们的处理方式完全不同 —— 前两种会
+// 把能用的端点误判成死端点，真机已经踩过两次。
+func (s *ipStack) fetchReason(ctx context.Context, timeout time.Duration) (string, string, bool) {
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if !resolveMetaAddr(reqCtx, s.tnet) {
-		return "", false
+	if resolveMetaAddr(reqCtx, s.tnet) {
+		s.client.Timeout = timeout
+		if body, ok := fetchMeta(reqCtx, s.client, metaURL); ok {
+			return body, "", true
+		}
+		if body, ok := fetchMeta(reqCtx, s.client, traceURL); ok {
+			return body, "", true
+		}
 	}
-	s.client.Timeout = timeout
-	return fetchMeta(reqCtx, s.client, metaURL)
+	// DNS 不通或上面两档被出口拒绝：改用 IP 字面量，这一步不需要任何解析。
+	if body, ok := s.fetchLiteral(reqCtx, timeout); ok {
+		return body, "", true
+	}
+	if reqCtx.Err() != nil {
+		return "", "隧道内请求超时", false
+	}
+	return "", "隧道内请求失败（DNS 或被出口拒绝）", false
+}
+
+// fetchLiteral 在隧道里直连 IP 字面量的 trace 端点，绕开 DNS。
+func (s *ipStack) fetchLiteral(ctx context.Context, timeout time.Duration) (string, bool) {
+	client := &http.Client{Timeout: timeout, Transport: &http.Transport{
+		DisableKeepAlives:   true,
+		TLSHandshakeTimeout: timeout,
+		DialContext: func(dctx context.Context, _, addr string) (net.Conn, error) {
+			// addr 是 URL 里的 host:port；traceIPURLs 全是 IP 字面量，
+			// 所以这里不会触发解析。
+			return s.tnet.DialContext(dctx, "tcp", addr)
+		},
+	}}
+	for _, u := range traceIPURLs {
+		if body, ok := fetchMeta(ctx, client, u); ok {
+			return body, true
+		}
+	}
+	return "", false
 }
 
 func (s *ipStack) speedTest(ctx context.Context) (float64, bool) {
