@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - xehn-android
+    tags:
+      - "v*"
     paths:
       - "app/**"
       - "engine/**"
@@ -16,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: android-apk-${{ github.ref }}
@@ -90,10 +92,18 @@ jobs:
         shell: pwsh
         run: ./gradlew.bat --no-daemon --console=plain :app:assembleDebug
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: xehn-android-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Xehn Android ${{ github.ref_name }}
+          generate_release_notes: true
+          files: app/build/outputs/apk/debug/*.apk
