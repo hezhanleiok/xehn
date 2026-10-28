@@ -46,12 +46,18 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: "latest"
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;27.0.12077973
+          accept-android-sdk-licenses: true
 
-      - name: Install Android SDK components
+      - name: Configure Android and Go environment
         shell: pwsh
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
-          if ($LASTEXITCODE -ne 0) { throw "sdkmanager failed" }
           $sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
           if (-not $sdk) { throw "Android SDK path was not provided by setup-android" }
           "ANDROID_HOME=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
