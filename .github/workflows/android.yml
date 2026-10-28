@@ -47,7 +47,9 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          cmdline-tools-version: "latest"
+          # Pin a published command-line tools package instead of the broken
+          # commandlinetools-win-latest_latest.zip alias (HTTP 404).
+          cmdline-tools-version: "11076708"
           packages: |
             platform-tools
             platforms;android-35
