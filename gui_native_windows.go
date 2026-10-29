@@ -1261,6 +1261,18 @@ func (u *natUI) protoOK(p string) bool {
 // result drives the protocol tiles (unsupported ones are visibly marked) and
 // the version line. Runs off the GUI thread; probeCoreCapabilities caches, so
 // repeat calls are cheap.
+// coreMissingHint explains a missing core in terms the user can act on: the
+// two causes look identical in a log line but need different fixes.
+func coreMissingHint(dir, bin string) string {
+	if _, err := os.Stat(dir); err != nil {
+		return tr("内核缺失：当前目录下没有 core 文件夹。请解压整个压缩包后再运行 xehn.exe（不要只把 exe 单独拿出来）。")
+	}
+	if fi, err := os.Stat(bin); err == nil && fi.Size() == 0 {
+		return tr("内核文件 core\\mihomo.exe 是 0 字节（下载或解压中断），请删掉它后用底栏「核心」按钮重新下载。")
+	}
+	return tr("内核缺失：core\\mihomo.exe 不存在。多数情况是被杀毒软件隔离，请把 XEHN 目录加入白名单后，用底栏「核心」按钮重新下载。")
+}
+
 func (u *natUI) probeCore() {
 	dir, err := coreDir()
 	if err != nil {
@@ -1268,8 +1280,15 @@ func (u *natUI) probeCore() {
 	}
 	u.sync(func() { u.refreshCoreCard(dir) })
 	bin := core.CoreInDir(dir)
-	if _, err := os.Stat(bin); err != nil {
-		return // not installed yet; doCore re-probes after the download
+	if fi, err := os.Stat(bin); err != nil || fi.Size() == 0 {
+		// Say which of the two very different problems this is. "Core missing"
+		// has two causes that need opposite fixes: the user ran the bare exe
+		// without the rest of the archive, or a security product removed
+		// mihomo.exe after extraction.
+		u.sync(func() {
+			u.addLog(coreMissingHint(dir, bin), true)
+		})
+		return
 	}
 	ver, supported, perr := probeCoreCapabilities(bin, dir)
 	u.sync(func() {
