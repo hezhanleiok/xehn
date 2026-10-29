@@ -376,6 +376,11 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	}
 
 	u.m.set = loadSettings()
+	// A previous session that was killed from Task Manager (or crashed) never
+	// got to put WinINET back, and the browser then stays pointed at a port
+	// nobody listens on — the reported "no internet after quitting". Heal it
+	// before anything else can rely on the proxy state.
+	u.healStaleProxy()
 	u.m.set.AutoStart = autoStartEnabled()
 	u.syncSessionFromSettings()
 
@@ -549,6 +554,31 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	cw.Dispose()
 	mw.Dispose()
 	return nil
+}
+
+// healStaleProxy clears a WinINET proxy that still points at our mixed port
+// while nothing is listening on it. It is the startup half of the cleanup: the
+// exit path restores the proxy, and this catches the sessions that never reached
+// it (killed, crashed, or a restore that was blocked).
+func (u *natUI) healStaleProxy() {
+	port := u.m.set.MixedPort
+	if port <= 0 {
+		port = core.DefaultMixedPort
+	}
+	if !core.SystemProxyEnabledAt(port) {
+		return
+	}
+	// Only stale when nothing answers: a second instance or a live core would
+	// own this port, and clearing then would break a working session.
+	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
+		_ = conn.Close()
+		return
+	}
+	if err := core.ClearSystemProxy(); err != nil {
+		u.addLog(tr("清理残留的系统代理失败: ")+err.Error(), true)
+		return
+	}
+	u.addLog(trf("已清理上次退出残留的系统代理（127.0.0.1:%d）", port), false)
 }
 
 func (u *natUI) disposeFonts() {

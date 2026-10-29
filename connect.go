@@ -1407,6 +1407,42 @@ func pickOuterEndpoint(ctx context.Context, opts options) (string, error) {
 	return best.Endpoint, nil
 }
 
+// restoreHostProxy puts WinINET back the way it was before the session, and
+// falls back to simply switching it off when no snapshot was persisted: a
+// connect that died before saving one still left the proxy pointing at a port
+// that is about to stop listening, and "no internet after quitting" is exactly
+// that leftover.
+func restoreHostProxy(state clientState) {
+	if state.TUN || state.NoProxy {
+		return
+	}
+	var snap core.ProxySnapshot
+	if len(state.ProxySnap) > 0 && json.Unmarshal(state.ProxySnap, &snap) == nil {
+		err := core.UnsetSystemProxy(&snap)
+		if err == nil {
+			return
+		}
+		if proxyHelperAllowed() && core.RestoreSystemProxyElevated(&snap) == nil {
+			return
+		}
+		fmt.Fprintln(os.Stderr, errPal.warn("restore system proxy: "+err.Error()))
+	} else if core.SystemProxyEnabledAt(state.MixedPort) {
+		// No snapshot: the proxy is ours, so switch it off rather than leave the
+		// host pointed at a dead port.
+		off := &core.ProxySnapshot{}
+		if err := core.UnsetSystemProxy(off); err != nil {
+			if proxyHelperAllowed() {
+				_ = core.RestoreSystemProxyElevated(off)
+			}
+			fmt.Fprintln(os.Stderr, errPal.warn("clear system proxy: "+err.Error()))
+		}
+	}
+	if core.SystemProxyEnabledAt(state.MixedPort) {
+		fmt.Fprintln(os.Stderr, errPal.warn(fmt.Sprintf(
+			"系统代理仍指向 127.0.0.1:%d，请手动关闭系统代理，或以管理员身份运行本程序后断开", state.MixedPort)))
+	}
+}
+
 // disconnect stops the core and restores the system proxy.
 func runDisconnectCmd(ctx context.Context, opts options) error {
 	state, err := loadState()
@@ -1431,6 +1467,13 @@ func runDisconnectCmd(ctx context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
+	// The host proxy goes first. It is a local registry write, and leaving it
+	// pointing at a mixed port whose core is about to die is the failure users
+	// actually feel — every page times out until they find the Windows proxy
+	// settings. Restoring before the process kills means a wedged kill (or the
+	// caller's timeout) cannot strand it.
+	restoreHostProxy(state)
+
 	if state.CorePID > 0 {
 		// The core was started by an earlier connect (CLI: a different process,
 		// GUI: a different Core instance), so only the recorded pid can reach
@@ -1451,23 +1494,6 @@ func runDisconnectCmd(ctx context.Context, opts options) error {
 			}
 		} else {
 			fmt.Fprintln(os.Stderr, errPal.warn("psiphon exe not found: "+perr.Error()))
-		}
-	}
-	if !state.TUN && len(state.ProxySnap) > 0 {
-		var snap core.ProxySnapshot
-		if json.Unmarshal(state.ProxySnap, &snap) == nil {
-			err := core.UnsetSystemProxy(&snap)
-			if err != nil && proxyHelperAllowed() {
-				// A blocked restore would leave the browser pointed at the
-				// dead mixed port — a broken host. One UAC prompt beats that.
-				if herr := core.RestoreSystemProxyElevated(&snap); herr == nil {
-					err = nil
-				}
-			}
-			if err != nil {
-				fmt.Fprintln(os.Stderr, errPal.warn("restore system proxy: "+err.Error()))
-				fmt.Fprintln(os.Stderr, errPal.warn("请手动关闭系统代理，或以管理员身份运行本程序后断开"))
-			}
 		}
 	}
 	state.Connected = false
