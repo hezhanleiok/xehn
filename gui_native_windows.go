@@ -935,7 +935,9 @@ func (u *natUI) statusLoop() {
 }
 
 func (u *natUI) spinLoop() {
-	t := time.NewTicker(60 * time.Millisecond)
+	// 40ms (25fps) is the slowest rate at which a rotating arc still reads as
+	// smooth; the previous 60ms tick visibly stepped.
+	t := time.NewTicker(40 * time.Millisecond)
 	defer t.Stop()
 	for {
 		select {
