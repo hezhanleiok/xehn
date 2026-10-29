@@ -17,9 +17,29 @@ import (
 // the window exists; a failure is logged and the client keeps working with the
 // plain close-to-exit behaviour.
 func (u *natUI) initTray() {
+	u.trayAttempts = 0
+	u.tryInitTray()
+}
+
+// tryInitTray creates the icon, retrying a few times: Shell_NotifyIcon fails
+// when the shell is still starting up (a fresh logon, an Explorer restart, a
+// busy taskbar), and the failure is transient in exactly those cases. If every
+// attempt fails the client keeps working, but closing the window then exits for
+// real — hiding a window that has no icon anywhere would leave a process the
+// user cannot reach.
+func (u *natUI) tryInitTray() {
+	if u.ni != nil || u.quitting {
+		return
+	}
 	ni, err := walk.NewNotifyIcon(u.mw)
 	if err != nil {
-		u.addLog(tr("创建托盘图标失败: ")+err.Error(), true)
+		u.trayAttempts++
+		if u.trayAttempts < 5 {
+			time.AfterFunc(400*time.Millisecond, func() { u.sync(u.tryInitTray) })
+			return
+		}
+		u.trayFailed = true
+		u.addLog(tr("创建托盘图标失败: ")+err.Error()+tr("；关闭窗口将直接退出程序"), true)
 		return
 	}
 	u.ni = ni
@@ -52,7 +72,8 @@ func (u *natUI) initTray() {
 	actions.Add(quit)
 
 	if err := ni.SetVisible(true); err != nil {
-		u.addLog(tr("创建托盘图标失败: ")+err.Error(), true)
+		u.trayFailed = true
+		u.addLog(tr("创建托盘图标失败: ")+err.Error()+tr("；关闭窗口将直接退出程序"), true)
 	}
 }
 

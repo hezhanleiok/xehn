@@ -258,6 +258,8 @@ type natUI struct {
 	quitting      bool
 	quitScheduled bool
 	trayHinted    bool
+	trayAttempts  int
+	trayFailed    bool
 
 	// scrollDrag is the settings scrollbar's grab state: the wheel used to be
 	// the only way to scroll that page, which is what users complained about.
@@ -466,6 +468,12 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	// "exit" sets u.quitting and lets the close through.
 	mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		if u.quitting {
+			return
+		}
+		if u.ni == nil || u.trayFailed {
+			// Without a tray icon there is no way back to a hidden window, so
+			// closing has to mean closing.
+			u.quitting = true
 			return
 		}
 		*canceled = true
