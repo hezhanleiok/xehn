@@ -97,15 +97,15 @@ func (u *natUI) paintConnectButton(c *walk.Canvas, cx, cy float64) {
 
 	switch {
 	case connecting:
-		// One ring, one arc, nothing else. The previous version stacked a
-		// breathing halo on a thick arc on a tinted disc: busy, and over the
-		// warm window background the tint read as a muddy yellow. A single
-		// accent segment on a faint track is what every clean spinner does, and
-		// it stays legible without shouting.
-		radius := homeBtnR - 26
-		u.circleStrokeW(c, mix(th.line, th.card, 0.45), cx, cy, radius, 3)
+		// The spinner takes the power glyph's slot, not the disc's radius: same
+		// footprint as the icon it replaces, so the label keeps the space it has
+		// in the idle and connected states. Drawn at the disc's radius the ring
+		// ran straight through the text.
+		spinCY := cy - 14
+		const spinR = 22.0
+		u.circleStrokeW(c, mix(th.line, th.card, 0.55), cx, spinCY, spinR, 3)
 		start := float64(u.m.spin*12%360) - 90
-		u.arcW(c, th.accent, cx, cy, radius, 3.4, start, start+90)
+		u.arcW(c, th.accent, cx, spinCY, spinR, 3.4, start, start+90)
 
 		label := tr("连接中…")
 		if u.m.connecting && !u.m.cancelling && !u.m.connectAt.IsZero() {
@@ -119,13 +119,13 @@ func (u *natUI) paintConnectButton(c *walk.Canvas, cx, cy float64) {
 			// the seconds keep counting and the cancel looks ignored.
 			label = tr("正在取消…")
 		}
-		u.textC(c, label, u.f.f13b, th.text, u.r(cx-110, cy+16, 220, 24))
+		u.textC(c, label, u.f.f13b, th.dim, u.r(cx-110, cy+16, 220, 24))
 		if u.m.connecting && !u.m.connectAt.IsZero() {
 			// The click cancels the attempt — say so, or the button reads as
 			// dead the moment it stops responding to "connect". Only shown
 			// while a pipeline is really running: during a protocol switch's
 			// disconnect phase there is nothing to cancel yet.
-			u.textC(c, tr("点此取消"), u.f.f9, th.dim, u.r(cx-110, cy+40, 220, 18))
+			u.textC(c, tr("点此取消"), u.f.f9, th.faint, u.r(cx-110, cy+40, 220, 18))
 		}
 	case connected:
 		// White on the success fill: the glyph and the word have to stay legible
