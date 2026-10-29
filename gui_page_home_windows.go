@@ -97,15 +97,18 @@ func (u *natUI) paintConnectButton(c *walk.Canvas, cx, cy float64) {
 
 	switch {
 	case connecting:
-		// The spinner takes the power glyph's slot, not the disc's radius: same
-		// footprint as the icon it replaces, so the label keeps the space it has
-		// in the idle and connected states. Drawn at the disc's radius the ring
-		// ran straight through the text.
-		spinCY := cy - 14
-		const spinR = 22.0
-		u.circleStrokeW(c, mix(th.line, th.card, 0.55), cx, spinCY, spinR, 3)
-		start := float64(u.m.spin*12%360) - 90
-		u.arcW(c, th.accent, cx, spinCY, spinR, 3.4, start, start+90)
+		// Three dots breathing in sequence, in the power glyph's slot. No ring,
+		// no rotation: a rotating arc reads as a progress wheel that never
+		// arrives, while three dots say "working" without implying a position.
+		const dotGap = 13.0
+		for i := 0; i < 3; i++ {
+			// Each dot is a third of a cycle behind the previous one; the cosine
+			// gives a soft in-and-out rather than a blink.
+			phase := math.Mod(float64(u.m.spin)+float64(i)*8, 24) / 24
+			t := 0.5 - 0.5*math.Cos(2*math.Pi*phase)
+			col := mix(mix(th.accent, rx(255, 255, 255), 0.70), th.accent, t)
+			u.circleFill(c, col, cx-dotGap+float64(i)*dotGap, cy-14, 3.4+1.4*t)
+		}
 
 		label := tr("连接中…")
 		if u.m.connecting && !u.m.cancelling && !u.m.connectAt.IsZero() {
@@ -120,13 +123,6 @@ func (u *natUI) paintConnectButton(c *walk.Canvas, cx, cy float64) {
 			label = tr("正在取消…")
 		}
 		u.textC(c, label, u.f.f13b, th.dim, u.r(cx-110, cy+16, 220, 24))
-		if u.m.connecting && !u.m.connectAt.IsZero() {
-			// The click cancels the attempt — say so, or the button reads as
-			// dead the moment it stops responding to "connect". Only shown
-			// while a pipeline is really running: during a protocol switch's
-			// disconnect phase there is nothing to cancel yet.
-			u.textC(c, tr("点此取消"), u.f.f9, th.faint, u.r(cx-110, cy+40, 220, 18))
-		}
 	case connected:
 		// White on the success fill: the glyph and the word have to stay legible
 		// against a colour instead of the frosted glass they were drawn for.

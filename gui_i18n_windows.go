@@ -242,7 +242,6 @@ var enStrings = map[string]string{
 	"以管理员身份重启失败: ":                      "Restart as administrator failed: ",
 	"TUN 模式需要管理员权限：设置已保存，以管理员身份重新运行后生效": "TUN mode needs administrator rights: saved, applies after you run the program as administrator",
 	"正在取消…":      "Cancelling…",
-	"点此取消":       "click to cancel",
 	"已取消连接":      "Connect cancelled",
 	"正在取消连接…":    "Cancelling…",
 	"显示主窗口":      "Show window",
