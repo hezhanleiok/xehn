@@ -48,9 +48,25 @@ var version = "dev"
 // console binary elevated would flash a terminal window on screen.
 var windowsGUIBuild = "0"
 
+// buildStamp is the packaging time ("20261029-2252"), injected by pack.ps1.
+// Several builds can share one version number while a release is being
+// prepared, and "which build am I running" then becomes a real question — the
+// About page shows this next to the version so it can be answered at a glance.
+var buildStamp = ""
+
 func runVersionCmd(context.Context, options) error {
 	fmt.Println(resolveVersion())
 	return nil
+}
+
+// versionWithBuild is what the About page shows: the version, plus the build
+// stamp when the binary was packaged by pack.ps1.
+func versionWithBuild() string {
+	v := shortVersion()
+	if buildStamp == "" {
+		return v
+	}
+	return v + " · " + buildStamp
 }
 
 func resolveVersion() string {

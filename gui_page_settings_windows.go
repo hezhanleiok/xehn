@@ -519,7 +519,7 @@ func (u *natUI) paintAbout(c *walk.Canvas, x, y, w float64) {
 	// Row 2 — updates, and the remote-control identity this install carries.
 	y2 := row2
 	cy = u.card(c, x, y2, half, aboutRow2H, tr("客户端更新"))
-	u.kv(c, x, cy, half, tr("当前版本"), shortVersion())
+	u.kv(c, x, cy, half, tr("当前版本"), versionWithBuild())
 	u.kv(c, x, cy+24, half, tr("最新版本"), orEmpty(u.m.updLatest, tr("尚未检查")))
 	u.kv(c, x, cy+48, half, tr("状态"), orEmpty(u.m.updNote, tr("点击下方按钮检查更新")))
 	updID, updLabel := "upd:check", tr("检查更新")

@@ -80,7 +80,7 @@ if (-not $SkipBuild) {
     # ONE program file. The windowsgui subsystem keeps a double-click free of a
     # console window; CLI subcommands dispatch through the same exe and attach
     # to the caller's terminal at startup, so the old console twin is gone.
-    go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$Version -X main.windowsGUIBuild=1" -o $bin .
+    go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$Version -X main.windowsGUIBuild=1 -X main.buildStamp=$stamp" -o $bin .
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "single windowsgui build failed" }
 
     Pop-Location
