@@ -1271,6 +1271,13 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 		Family:    opts.ipFamily(),
 		NoProxy:   opts.noProxy,
 		StartedAt: time.Now().Format(time.RFC3339),
+		// Recorded so a health repair rebuilds the same session, not a default
+		// one: see clientState.ProxyMode.
+		ProxyMode:    opts.proxyMode,
+		DNS:          opts.dns,
+		DNSLeak:      opts.dnsLeak,
+		DomainDirect: strings.Join(opts.domainDirect, ","),
+		DomainProxy:  strings.Join(opts.domainProxy, ","),
 	}
 	state.MeasuredBps = probe.MeasuredBps
 	// The exit descriptor travels in state: health repair rebuilds the session

@@ -116,6 +116,16 @@ type clientState struct {
 	// alone. The health guard must not read "the system proxy is not ours" as
 	// "the session was taken over" for such a session — it never was ours.
 	NoProxy bool `json:"no_proxy,omitempty"`
+	// Routing and DNS belong to the session, not to the process that started
+	// it: the health guard rebuilds a session from state.json alone, and
+	// without these a repair quietly fell back to "everything proxied" and
+	// dropped DNS leak protection — the browser kept working, the split
+	// tunnelling and the tunnelled resolver did not.
+	ProxyMode    string `json:"proxy_mode,omitempty"`
+	DNS          string `json:"dns,omitempty"`
+	DNSLeak      bool   `json:"dns_leak,omitempty"`
+	DomainDirect string `json:"domain_direct,omitempty"`
+	DomainProxy  string `json:"domain_proxy,omitempty"`
 	// Psiphon exit mode (V1): recorded so disconnect can stop the external
 	// Psiphon process and the status loop can surface its state.
 	PsiphonMode      bool `json:"psiphon_mode,omitempty"`

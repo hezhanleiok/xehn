@@ -256,6 +256,16 @@ func optionsFromState(st clientState) options {
 		}
 	}
 	opts.allowLan = st.AllowLan
+	// The preset and the DNS settings are part of what the user asked for, not
+	// per-process defaults: a repair that forgets them turns 绕过大陆 into
+	// "proxy everything" and switches DNS leak protection off.
+	if st.ProxyMode != "" {
+		opts.proxyMode = st.ProxyMode
+	}
+	opts.dns = st.DNS
+	opts.dnsLeak = st.DNSLeak
+	opts.domainDirect = splitStoredList(st.DomainDirect)
+	opts.domainProxy = splitStoredList(st.DomainProxy)
 	// A Psiphon session re-launches its exit with the same region it was
 	// started with, so a repair never swaps the user's chosen country.
 	opts.psiphonRegion = st.PsiphonRegion
@@ -272,6 +282,24 @@ func optionsFromState(st clientState) options {
 		opts.family = famV4
 	}
 	return opts
+}
+
+// splitStoredList turns a comma-separated list stored in state back into its
+// entries. It is deliberately not splitList: that one upper-cases and exits the
+// process on an empty value, which is right for a command-line flag and wrong
+// for a domain list read back from disk.
+func splitStoredList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // endpointIsV6 says whether an "host:port" pair is IPv6 - the same question the
