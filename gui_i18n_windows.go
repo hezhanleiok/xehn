@@ -250,6 +250,8 @@ var enStrings = map[string]string{
 	"内核缺失：当前目录下没有 core 文件夹。请解压整个压缩包后再运行 xehn.exe（不要只把 exe 单独拿出来）。":           "Core missing: there is no core folder next to the program. Extract the whole archive and run xehn.exe from there.",
 	"内核文件 core\\mihomo.exe 是 0 字节（下载或解压中断），请删掉它后用底栏「核心」按钮重新下载。":              "core\\mihomo.exe is 0 bytes (an interrupted download or extraction). Delete it and use the 核心 button to download again.",
 	"内核缺失：core\\mihomo.exe 不存在。多数情况是被杀毒软件隔离，请把 XEHN 目录加入白名单后，用底栏「核心」按钮重新下载。": "Core missing: core\\mihomo.exe does not exist. It is usually quarantined by security software; allowlist the XEHN folder, then use the 核心 button to download it again.",
+	"系统代理：走代理的程序解析经隧道，不走代理的仍会漏":                                              "System proxy: programs that use the proxy resolve through the tunnel; the others still leak",
+	"TUN：全机 53 端口被接管，任何程序都绕不过":                                               "TUN: every port-53 packet on the machine is captured, no program can bypass it",
 	"清理残留的系统代理失败: ":                "Could not clear the leftover system proxy: ",
 	"已清理上次退出残留的系统代理（127.0.0.1:%d）": "Cleared the system proxy a previous session left behind (127.0.0.1:%d)",
 	"；关闭窗口将直接退出程序":                 "; closing the window will quit",

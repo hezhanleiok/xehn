@@ -397,7 +397,13 @@ func (u *natUI) paintSetExit(c *walk.Canvas, x, y, w float64) {
 		tr("不向隧道提供解析器，全部用系统 DNS"), s.DNSOff, true)
 
 	leakOK := !s.DNSOff && s.ProxyMode != modeDirect
-	leakSub := tr("解析请求经隧道发出；TUN 模式拦截全部 53 端口")
+	// The subtitle has to state the coverage, not just the mechanism: in system
+	// proxy mode only the programs that use the proxy are covered, and that
+	// distinction is what users keep asking about.
+	leakSub := tr("系统代理：走代理的程序解析经隧道，不走代理的仍会漏")
+	if s.CaptureMode == captureTun {
+		leakSub = tr("TUN：全机 53 端口被接管，任何程序都绕不过")
+	}
 	if s.DNSOff {
 		leakSub = tr("不下发 DNS 时使用系统解析，无法防泄露")
 	} else if s.ProxyMode == modeDirect {
