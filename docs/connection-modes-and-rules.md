@@ -195,4 +195,43 @@ fd 存在，所以顺序必须是：
   连接时按顺序最多试 5 个候选；
 - 单节点吞吐与稳定性都不如直连 WARP；节点抖动时靠 `needRecover` 看门狗重连；
 - 与 Psiphon 互斥（两者都要求独占最终出口），UI 与引擎都会拦；
-- 系统 tun MTU 用 1400（服务端 tun-mtu 1500，但外层还要经 WARP 封装一次）。
+- 系统 tun MTU 用 **1160**（服务端 tun-mtu 1500，但外层还要经 WARP 封装一次；
+  1400 会被拆成 1240+160 两段，包量与加密次数接近翻倍，见 §2.3 的踩坑记录）。
+
+### 6.6 出口速度优化（2026-11-01，移植自电脑版）
+
+电脑版 `warp-client` 早就把「选节点」从「挑延迟最低的」改成「挑实测吞吐最高的」，
+手机端原先只看 TCP 握手延迟 + 分类（家宽/机房），所以会出现「连上了、每个网页都在爬」。
+这次把能搬的都搬过来了（电脑版：`connect.go` 的 `openvpnSpeedProbe*` / `openvpnMinBps`
+/ `openvpnSpeedRetries`，`vpngate.go` 的 `vpngate-speeds.json` 与 `vpnGateSpeedTier`）：
+
+| 电脑版机制 | 手机端对应 | 状态 |
+|---|---|---|
+| 实测吞吐记忆 `vpngate-speeds.json`，TTL 6h | `NodeSpeedStore`（SharedPreferences，TTL 6h） | ✅ |
+| 排序分档 快 → 未测 → 慢（`vpnGateSpeedTier`） | `pickOpenVPNCandidates` 的块内排序 | ✅ |
+| 连接时用 **512 KiB** 真下载量吞吐（通用门槛 128 KiB 会被慢启动主导） | `measureExitBps`：512 KiB，**8s 预算** | ✅（见下） |
+| 速度地板 **150 KB/s**，低于就换中继 | `OPENVPN_MIN_BPS` + `connectLoop` 换点 | ✅ |
+| 连续 2 个慢中继后接受当前连接（慢总比没有强） | `OPENVPN_SPEED_RETRIES = 2` | ✅ |
+| 手动钉死的节点不因速度换掉 | `connectLoop` 里比对 `openvpnNodeId` | ✅ |
+| 握手预热窗口（mihomo 把握手从 inbound dial 上摘掉，首个请求必失败） | — | ❌ 不适用：我们的引擎在 `DialOpenVPN` 里同步 `Handshake`，建 tun 之前握手已经完成 |
+| TCP 节点优先（UDP 节点最容易被限速） | — | ✅ 间接覆盖：只有 TCP 节点有实测延迟，UDP 节点自然排在后面 |
+| 把 `MeasuredBps` 写进 `state.json` 给界面用 | 只写日志 | ⚠ 见下 |
+
+**为什么测速在 Kotlin 侧、不在 `engine/warp/openvpn.go`**：改引擎要重跑 gomobile
+重新打 `app/libs/engine.aar`（那台机器需要 Go 1.26 + gomobile + NDK），而候选排序本来
+就在 Kotlin（`pickOpenVPNCandidates`），换点又必须重新 `VpnService.Builder.establish()`
+（只能在 Java 侧做）。等引擎下次重建时，`NodeSpeedStore` + 分档规则应该整体搬进
+`engine/warp/vpngate.go`，界面再按 `MeasuredBps` 显示速度。
+
+**和电脑版的两处刻意差异**：
+
+1. 测速**不要求下满**：电脑版 `probeThroughput` 要求 12s 内下满 512 KiB，没下满就
+   算数据面失败（进失败记忆）。手机端改成「预算 8s，按已收到字节算速度」——
+   14 KB/s 的节点下满要 36s，为了证明它慢让用户等半分钟不划算；而且「有一点点
+   流量但很慢」正是要判成慢、而不是判成坏的那种情况。
+2. 测速 0 字节（DNS 关了、或 `speed.cloudflare.com` 不可达）**不换点**：
+   没证据说明它慢，就不该把能用的节点丢掉。电脑版没有这一档，因为它经 mihomo
+   的 DNS 一定可用。
+
+**实际代价**：一次 OpenVPN 连接多 0.3–8s（512 KiB / 实测速度）。测速端点与电脑版
+同一个：`https://speed.cloudflare.com/__down?bytes=524288`，走系统 VPN 出去。

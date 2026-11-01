@@ -84,6 +84,30 @@
 - 引擎侧失败记忆 10 分钟（`freshOpenVPNIDs`），下一轮自然落到更后面的节点；
 - 服务侧最多 3 轮（`OPENVPN_CONNECT_ROUNDS`）。
 
+### 3.4 `e.connect()` 是异步的，`try/catch` 包不住连接失败（2026-11-01）
+
+- **症状**：OpenVPN 出口候选全失败时，日志里只有引擎自己的 5 次尝试，
+  `OPENVPN_CONNECT_ROUNDS` 那 3 轮「自动换下一批」一次都没出现；连接失败也从不进
+  Kotlin 的 catch。
+- **根因**：`Engine.Connect` 只把活儿丢进 goroutine 就 `return nil`。所以
+  `try { e.connect(…) } catch { }` 里永远不会抛，`while` 第一轮就 `break` 了。
+- **正确做法**（`WarpVpnService.connectLoop`）：发起 → 轮询 `statusJSON` 等
+  `connected / error / idle` → 再决定「保留、换一批、还是收手」。顺带两个约束：
+  - 换点前必须 `e.disconnect()` 并**等回 idle**，状态机不允许从 `stopping` 直接连；
+  - 结果要认「哪个节点通的」：引擎一次试 5 个，成功的不一定是首位那个；
+    引擎没把节点 id 报上来（aar 接口），所以用出口 IP 反查节点。
+
+### 3.5 侧滑返回直接退出 App（2026-11-01）
+
+- **症状**：在设置/关于/隐私等子页面里，从屏幕边缘划一下返回，App 直接退到桌面，
+  而不是回到上一页。
+- **根因**：页面只是同一个 Compose 树里的分支（`current == null` 才是首页），
+  系统并不知道「还有上一页」；而全程没有任何 `BackHandler`，没人消费返回事件，
+  系统就按「Activity 到底了」处理 → finish()。
+- **正确做法**（`MainActivity`）：按「进来得越晚越先退」装一个 `BackHandler`：
+  分应用选择 → 抽屉 → 子页面 → 首页；只有首页时 `enabled=false`，才让它退出。
+  弹窗（节点/地区选择）在独立 Dialog 窗口里，自己消费返回，不需要在这里判。
+
 ---
 
 ## 4. 真机调试类（省时间用）
@@ -159,5 +183,6 @@ adb shell run-as com.xiaohe.vpn cp /data/local/tmp/p.xml shared_prefs/xiaohe-set
 | `直连节点`、`dialHostNode`、`reProtect`、`SetOpenVPNUpstream` | 直连优先 / 上游三选（0.2.2 才有，**0.2.3 已移除**；见到这些串说明是旧包） |
 | `CreateNetTUNBuffered`、`netstackx` | gVisor 缓冲实验版 —— **数据面会坏，别拿这版当基线** |
 | `数据面不通（` | 验证失败会带原因的输出 |
+| `出口实测速度`、`中继速度记忆`、`node-speeds` | **0.2.4**：OpenVPN 出口实测吞吐记忆 + 150 KB/s 速度地板换点（移植电脑版） |
 
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

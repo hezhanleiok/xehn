@@ -20,6 +20,15 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
+# Git refuses to work in a repo whose Windows owner SID differs from the current
+# user ("detected dubious ownership"). Fixing that normally means editing the
+# user's global git config; this script instead passes -c safe.directory on every
+# call, so it stays a per-invocation override and touches no config file.
+$safeDir = $repo -replace '\\', '/'
+function Invoke-Git {
+    & git -c "safe.directory=$safeDir" @args
+}
+
 # "备份" written as code points so the script stays pure ASCII.
 $backupDir = Join-Path (Split-Path -Parent $repo) ([string]::Concat([char]0x5907, [char]0x4EFD))
 $stamp = Get-Date -Format 'yyyyMMdd'
@@ -29,31 +38,31 @@ if (-not (Test-Path (Join-Path $repo '.git'))) {
     throw "not a git repository: $repo"
 }
 
-$remotes = (& git remote) 2>$null
+$remotes = (Invoke-Git remote) 2>$null
 if ($remotes) {
     Write-Host "WARNING: repo has remotes ($($remotes -join ', ')). This script will not push." -ForegroundColor Yellow
 }
 
 # 1) commit
-& git add -A
-$dirty = (& git status --porcelain)
+Invoke-Git add -A
+$dirty = (Invoke-Git status --porcelain)
 if ($dirty) {
     $msg = if ($Message) { $Message } else { "baseline: $Name" }
-    & git commit -q -m $msg
+    Invoke-Git commit -q -m $msg
     if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
     Write-Host "committed: $msg"
 } else {
     Write-Host "working tree already clean, nothing to commit"
 }
 
-$head = (& git rev-parse --short HEAD)
+$head = (Invoke-Git rev-parse --short HEAD)
 
 # 2) tag (re-point silently if the name already exists)
-if ((& git tag -l $tag)) {
-    & git tag -f $tag | Out-Null
+if ((Invoke-Git tag -l $tag)) {
+    Invoke-Git tag -f $tag | Out-Null
     Write-Host "tag updated: $tag -> $head"
 } else {
-    & git tag $tag
+    Invoke-Git tag $tag
     Write-Host "tagged: $tag -> $head"
 }
 

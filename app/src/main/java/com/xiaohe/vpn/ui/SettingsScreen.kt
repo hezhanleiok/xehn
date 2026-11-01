@@ -793,10 +793,13 @@ private fun openvpnSubtitle(s: AppSettings, nodes: List<VpnGateNode>): String {
     if (s.mode == "proxy") return "只在「VPN 模式」可用"
     if (!s.openvpn) return "打开后最终出口走 VPN Gate 节点（OpenVPN）"
     val countries = nodes.map { it.cc }.distinct().size
-    val base = if (nodes.isEmpty()) {
-        "节点列表为空，点进去刷新"
-    } else {
-        "${nodes.size} 个节点 · $countries 个国家"
+    // 「已测速」= NodeSpeedStore 里还没过期的实测记录（6 小时）。它只参与排序，
+    // 说清楚这一点，免得用户以为没测过的节点会被排除。
+    val measured = nodes.count { it.measuredBps > 0 }
+    val base = when {
+        nodes.isEmpty() -> "节点列表为空，点进去刷新"
+        measured > 0 -> "${nodes.size} 个节点 · $countries 个国家 · $measured 个已测速（排序优先）"
+        else -> "${nodes.size} 个节点 · $countries 个国家"
     }
     return when {
         s.openvpnNodeId.isNotEmpty() -> {

@@ -6,6 +6,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -108,6 +109,23 @@ class MainActivity : ComponentActivity() {
             val scope = rememberCoroutineScope()
 
             settingsSnapshot = settings
+
+            // 返回键 / 侧滑返回：**逐层退回**，只有真的在首页时才让系统退出 App。
+            //
+            // 之前一次都没拦：页面只是同一个 Compose 树里的分支（`current != null`），
+            // 系统看不到「还有上一页」，于是任何一页划一下返回就直接退到桌面 ——
+            // 这是纯粹的漏实现，不是系统行为。
+            //
+            // 顺序按「进来得越晚越先退」：分应用选择 → 抽屉 → 子页面 → 首页。
+            // 弹窗（节点/地区选择）是独立的 Dialog 窗口，它自己会消费返回，走不到这里。
+            BackHandler(enabled = pickingApps || drawer.isOpen || current != null) {
+                when {
+                    pickingApps -> pickingApps = false
+                    // 抽屉开着时先收抽屉：用的是 3/4 浮层，退回到「刚才那页」才对。
+                    drawer.isOpen -> scope.launch { drawer.close() }
+                    else -> current = null
+                }
+            }
 
             // 启动后自动连接：只在用户打开了这个开关、且当前确实空闲时触发一次。
             LaunchedEffect(settings.autoConnect) {

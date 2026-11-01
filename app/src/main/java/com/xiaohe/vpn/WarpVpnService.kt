@@ -11,7 +11,9 @@ import android.net.VpnService
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import java.io.File
+import java.net.HttpURLConnection
 import java.net.InetAddress
+import java.net.URL
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,6 +22,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 常驻服务：系统 VPN 与会话的主人。
@@ -92,6 +95,44 @@ class WarpVpnService : VpnService() {
 
         /** 候选全失败时自动再来几轮（每轮换下一批节点）。 */
         private const val OPENVPN_CONNECT_ROUNDS = 3
+
+        /**
+         * 出口测速要下载的字节数 —— 与电脑版 `openvpnSpeedProbeBytes` 一致（512 KiB）。
+         *
+         * 电脑版的注释写得很清楚：通用验证那档 128 KiB 会被 TCP 慢启动主导，
+         * 分不出「真的快」和「只是没卡住」。同一个下载顺带喂速度排序。
+         */
+        private const val OPENVPN_SPEED_PROBE_BYTES = 512 * 1024
+
+        /**
+         * 测速的整体预算。超过就按「已经收到的字节 ÷ 实际耗时」算 ——
+         * 150 KB/s 的节点跑完 512 KiB 要 3.4s，而 14 KB/s 的要 36s：不能为了
+         * 量准一个慢节点让用户干等半分钟，8s 内拿到的量已经够分档。
+         */
+        private const val OPENVPN_SPEED_PROBE_BUDGET_MS = 8_000L
+
+        /**
+         * 速度地板：低于它换下一个中继（电脑版 `openvpnMinBps` = 150 KB/s）。
+         * 数值与电脑版一致，理由见 [NodeSpeedStore.MIN_BPS]。
+         */
+        private const val OPENVPN_MIN_BPS = NodeSpeedStore.MIN_BPS
+
+        /**
+         * 连着几个中继都偏慢之后就不再因速度换点（电脑版 `openvpnSpeedRetries`）。
+         *
+         * 慢总比连不上强：换到第 3 个还是慢，说明这段网络里 VPN Gate 就这样，
+         * 再换只是把用户的等待时间翻倍。
+         */
+        private const val OPENVPN_SPEED_RETRIES = 2
+
+        /**
+         * 等一次连接出结果的上限。
+         *
+         * 只是兜底：引擎自己按「每个候选一个预算」收敛，正常 10–60s 内一定有
+         * connected / error 之一。真超时了也不去动引擎（它可能马上就通了），
+         * 只写一行日志。
+         */
+        private const val CONNECT_OUTCOME_TIMEOUT_MS = 6 * 60_000L
     }
 
     private var tunFd = -1
@@ -99,6 +140,15 @@ class WarpVpnService : VpnService() {
     /** 自动重连用的协程作用域（随服务销毁回收）。 */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var watchdog: Job? = null
+
+    /**
+     * 当前这一轮「拨号 + 出口测速/换点」的协程。
+     *
+     * 必须单独持有句柄：`e.connect()` 是异步的（Engine.Connect 起 goroutine 就
+     * 返回），所以连接流程本身是个长任务；用户点断开或看门狗重连时，要把上一轮
+     * 还在等结果的协程取消掉，否则它会接着把刚断开的东西又连回去。
+     */
+    private var connectJob: Job? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -211,74 +261,263 @@ class WarpVpnService : VpnService() {
         e.setRules(s.rulePolicy, s.ruleText)
         val endpointExtra = intent?.getStringExtra(EXTRA_ENDPOINT) ?: ""
 
-        // 3) 选出口节点 + 4) 拨号，放进一个轮次循环里。
+        // 3) 选出口节点 + 4) 拨号 + 5) 出口测速，放进协程里。
         //
-        //    为什么要轮次：引擎单轮只试 5 个节点，而 VPN Gate 实测握手成功率只有四成
-        //    左右 —— 一次失败就报错，等于让用户反复手点。引擎会把失败节点记 10 分钟
-        //    （warpbackend 的失败记忆），下一轮自然落在列表更靠后的节点上；而列表本身
-        //    是按「同国同类 → 同国其他类 → 别的国家」排的，于是用户要的那条
-        //    「家宽挂了换家宽、国内没了换国家」就是这两件事拼出来的。
-        var round = 0
+        //    为什么必须是协程：`e.connect()` 是**异步**的（Engine.Connect 只起
+        //    goroutine 就返回 nil），所以原来这里 `try { e.connect() } catch {}`
+        //    永远走不到第二轮 —— 那三档「自动换下一批」其实从来没生效过。
+        //    现在改成「发起 → 等结果 → 按结果决定」，顺便把「节点通了但太慢」
+        //    也当成一种可轮换的结果（见 connectLoop）。
+        connectJob?.cancel()
+        connectJob = scope.launch {
+            connectLoop(e, s, proto, endpointExtra, psiphon, openvpn)
+            EngineBridge.refresh(e)
+            updateNotification()
+        }
+    }
+
+    /**
+     * 拨号 +（OpenVPN 出口）测速与换点。
+     *
+     * 这一段的规则整份来自电脑版（`connect.go` 的 openvpnSpeedProbe* /
+     * openvpnMinBps / openvpnSpeedRetries，`vpngate.go` 的实测速度记忆）：
+     *
+     *  1. 连上之后**真下载一次**（512 KiB，最多 8s）量出口吞吐 —— 出口 IP 对了
+     *     不代表能用：电脑版实测 VPN Gate 上存在「握手成功、控制通道正常、
+     *     14 KB/s」的节点，旧门槛（≈11 KB/s）拦不住，用户看到的是「连上了、
+     *     每个网页都在爬」；
+     *  2. 低于地板就换下一个中继，最多连着换 [OPENVPN_SPEED_RETRIES] 个，
+     *     之后即便还慢也保持连接（慢总比没有强）；
+     *  3. 用户**钉死的节点不因速度换掉** —— 那是用户的选择，只报告速度；
+     *  4. 每次实测都写进 [NodeSpeedStore]，下次排序「实测快的优先、慢的垫底」。
+     *
+     * 为什么在 Kotlin 侧而不是引擎里：tun 是 VpnService 建的，换点必然要重新
+     * establish()，只能在 Java 侧做；而「等结果」需要的是 Engine 的状态。
+     */
+    private suspend fun connectLoop(
+        e: com.xiaohe.engine.Engine_,
+        s: AppSettings,
+        proto: String,
+        endpointExtra: String,
+        psiphon: Boolean,
+        openvpn: Boolean,
+    ) {
+        if (!openvpn) {
+            // 关的时候必须显式清空，否则上一次选中的节点会留在引擎里，下一次
+            // 「关着 OpenVPN」的连接仍然走节点（最难查的那种残留）。
+            e.setOpenVPNExit("", "", "")
+            e.connect(proto, endpointExtra, psiphon, s.ipv6, s.mtu.toLong())
+            return
+        }
+
+        val pinnedId = s.openvpnNodeId
+        // 本轮已被判「太慢」而放弃的节点。它们仍然在节点列表里，靠这个集合
+        // 把它们排掉，避免换一批又转回同一个慢节点。
+        val tooSlow = LinkedHashSet<String>()
+        var slowRejects = 0
+        var failures = 0
+
         while (true) {
-            round++
-            if (openvpn) {
-                val nodes = EngineBridge.vpnGateNodes(this)
-                val cands = pickOpenVPNCandidates(s, nodes)
-                if (cands.isEmpty()) {
-                    EngineBridge.note(
-                        "[vpn] 没有可用的 OpenVPN 节点（节点列表为空或选中节点已过期），" +
-                            "请到设置 → OpenVPN 出口里刷新节点列表"
-                    )
-                    e.setOpenVPNExit("", "", "")
-                    e.setVPNState(false)
-                    EngineBridge.refresh(e)
-                    stopForegroundCompat()
-                    stopSelf()
+            val nodes = EngineBridge.vpnGateNodes(this)
+            val measured = nodes.count { it.measuredBps > 0 }
+            if (measured > 0) {
+                EngineBridge.note(
+                    "[vpn] 中继速度记忆：$measured 个有实测记录，排序已按实测速度优先"
+                )
+            }
+            val ranked = pickOpenVPNCandidates(s, nodes)
+            // 排掉本轮已判过慢的节点；但如果排完一个都不剩（例如列表里只有一个
+            // 节点），退回完整列表 —— 慢总比连不上强，这也是电脑版的行为。
+            val cands = ranked.filter { it.id !in tooSlow }.ifEmpty {
+                if (ranked.isNotEmpty()) {
+                    EngineBridge.note("[vpn] 能用的候选都被判过慢，退回完整候选列表（慢总比连不上强）")
+                }
+                ranked
+            }
+            if (cands.isEmpty()) {
+                EngineBridge.note(
+                    "[vpn] 没有可用的 OpenVPN 节点（节点列表为空或选中节点已过期），" +
+                        "请到设置 → OpenVPN 出口里刷新节点列表"
+                )
+                e.setOpenVPNExit("", "", "")
+                e.setVPNState(false)
+                EngineBridge.refresh(e)
+                stopForegroundCompat()
+                stopSelf()
+                return
+            }
+            val first = cands.first()
+            EngineBridge.note(
+                "[vpn] OpenVPN 候选 ${cands.size} 个，首选 ${nodeSlotLabel(nodes, first)}" +
+                    "（${first.country} ${first.ip}:${first.port}，${first.classLabel}" +
+                    (if (first.shared) "·共享" else "") + "，" +
+                    (if (first.hasMeasuredLatency) "${first.latencyMs}ms" else "未测") + "，" +
+                    "实测 ${first.measuredText}）"
+            )
+            e.setOpenVPNExit(
+                cands.joinToString(",") { it.id },
+                nodeSlotLabel(nodes, first),
+                first.cc,
+            )
+            e.connect(proto, endpointExtra, psiphon, s.ipv6, s.mtu.toLong())
+
+            val state = awaitConnectOutcome(e)
+            if (state != "connected") {
+                if (state == "idle" || state == "stopping") {
+                    // 用户点了断开（或看门狗/系统撤销）：不要跟用户抢。
+                    EngineBridge.note("[vpn] 连接已取消")
                     return
                 }
-                val first = cands.first()
+                failures++
+                if (failures >= OPENVPN_CONNECT_ROUNDS) {
+                    EngineBridge.note(
+                        "[vpn] OpenVPN 连续 $failures 轮候选都失败，停止重试" +
+                            "（建议刷新节点列表或换出口地区）"
+                    )
+                    return
+                }
                 EngineBridge.note(
-                    "[vpn] OpenVPN 候选 ${cands.size} 个，首选 ${nodeSlotLabel(nodes, first)}" +
-                        "（${first.country} ${first.ip}:${first.port}，${first.classLabel}" +
-                        (if (first.shared) "·共享" else "") + "，" +
-                        (if (first.hasMeasuredLatency) "${first.latencyMs}ms" else "未测") + "）"
+                    "[vpn] 本轮候选都失败，自动换下一批（第 ${failures + 1}/$OPENVPN_CONNECT_ROUNDS 轮，" +
+                        "已失败的节点 10 分钟内不再重试）"
                 )
-                e.setOpenVPNExit(
-                    cands.joinToString(",") { it.id },
-                    nodeSlotLabel(nodes, first),
-                    first.cc,
-                )
-            } else if (round == 1) {
-                // 关掉时必须显式清空，否则上一次选中的节点会留在引擎里，
-                // 下一次「关着 OpenVPN」的连接仍然走节点（最难查的那种残留）。
-                e.setOpenVPNExit("", "", "")
+                continue
             }
-            try {
-                e.connect(proto, endpointExtra, psiphon, s.ipv6, s.mtu.toLong())
-                break
-            } catch (t: Throwable) {
-                EngineBridge.note("[vpn] 连接失败：${t.message ?: t.toString()}")
-                if (!openvpn || round >= OPENVPN_CONNECT_ROUNDS) break
+
+            // 连上了，但**是哪个节点通的**要认准：引擎一次会按顺序试最多 5 个候选，
+            // 成功的不一定是排在首位的那个。引擎没把节点 id 报给上层（那是 aar 的
+            // 接口，改它要重打 gomobile），所以用出口 IP 反查 —— VPN Gate 的出口
+            // 就是节点自己的公网 IP，命中率很高；认不出来就退回首选，并如实记一行。
+            val exitIp = EngineBridge.state.value.exitIp
+            val node = nodes.firstOrNull { it.ip == exitIp } ?: first
+            if (node.id != first.id) {
                 EngineBridge.note(
-                    "[vpn] OpenVPN 第 $round 轮候选都失败，自动换下一批" +
-                        "（最多 $OPENVPN_CONNECT_ROUNDS 轮，已失败的节点 10 分钟内不再重试）"
+                    "[vpn] 实际出口 $exitIp 对应节点 ${nodeSlotLabel(nodes, node)}" +
+                        "（首选是 ${nodeSlotLabel(nodes, first)}）"
                 )
             }
+
+            // 量一次真实下载速度。测不出来（DNS 或端点不可达）返回 0，
+            // 这时**不换点** —— 没证据说明它慢。
+            val bps = measureExitBps()
+            if (bps <= 0) {
+                EngineBridge.note("[vpn] 出口测速没拿到数据（DNS 或测速端点不可达），本次不换点")
+                return
+            }
+            NodeSpeedStore.remember(this, node.id, bps)
+            EngineBridge.note(
+                "[vpn] 出口实测速度 ${NodeSpeedStore.text(bps)}（${nodeSlotLabel(nodes, node)}）"
+            )
+
+            if (bps >= OPENVPN_MIN_BPS) return
+            if (pinnedId.isNotEmpty() && node.id == pinnedId) {
+                EngineBridge.note("[vpn] 当前是手动钉死的节点，速度偏慢也保留（只记录速度）")
+                return
+            }
+            if (slowRejects >= OPENVPN_SPEED_RETRIES) {
+                EngineBridge.note(
+                    "[vpn] 已连续 $slowRejects 个中继偏慢（低于 ${OPENVPN_MIN_BPS / 1024} KB/s），" +
+                        "后续优先保持连接、不再因速度换节点"
+                )
+                return
+            }
+            slowRejects++
+            tooSlow.add(node.id)
+            EngineBridge.note(
+                "[vpn] 出口速度过慢（低于 ${OPENVPN_MIN_BPS / 1024} KB/s），换下一个中继…"
+            )
+            // 换点前必须先断开：引擎会把 tun fd 关掉，系统 VPN 随之消失，
+            // 下一轮再由 TunProvider 用新节点下发的地址重新 establish。
+            e.disconnect()
+            e.setVPNState(false)
+            EngineBridge.refresh(e)
+            awaitIdle(e)
+        }
+    }
+
+    /**
+     * 等引擎给出这一轮的结果：connected / error / idle 之一。
+     *
+     * 为什么轮询而不是回调：引擎没有「连接完成」的挂起 API（gomobile 侧只有
+     * `connect()` + `statusJSON()`），而状态机本身是权威的 —— 轮询 200ms 对
+     * 一次十几秒的连接无所谓，也不会因为漏掉一条日志而永远卡住。
+     */
+    private suspend fun awaitConnectOutcome(e: com.xiaohe.engine.Engine_): String {
+        val deadline = System.currentTimeMillis() + CONNECT_OUTCOME_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            EngineBridge.refresh(e)
+            val st = EngineBridge.state.value.state
+            if (st != "connecting" && st != "stopping") return st
+            delay(200)
         }
         EngineBridge.refresh(e)
-        updateNotification()
+        val st = EngineBridge.state.value.state
+        EngineBridge.note("[vpn] 等连接结果超时（当前状态 $st），交给看门狗继续观察")
+        return st
     }
+
+    /** 等引擎回到 idle/error，才能开始下一次 connect（状态机不允许从 stopping 直接连）。 */
+    private suspend fun awaitIdle(e: com.xiaohe.engine.Engine_) {
+        val deadline = System.currentTimeMillis() + 10_000
+        while (System.currentTimeMillis() < deadline) {
+            EngineBridge.refresh(e)
+            val st = EngineBridge.state.value.state
+            if (st == "idle" || st == "error") return
+            delay(100)
+        }
+    }
+
+    /**
+     * 经系统 VPN 下载一小段数据，返回实测出口吞吐（bps）。0 = 测不出来。
+     *
+     * 走的是普通 `HttpURLConnection`：OpenVPN 出口下整个系统都在 tun 里，所以
+     * 这个请求本来就从节点出去，不需要（也不能）指定代理。电脑版是经 mihomo 的
+     * mixed 端口下同一个 URL（`speed.cloudflare.com/__down`）。
+     *
+     * 关键点是**不追求下满**：预算到点就按已收到的字节算速度。慢节点（14 KB/s）
+     * 下满 512 KiB 要 36 秒，等它下完等于把「换点」本身变成卡顿。
+     */
+    private suspend fun measureExitBps(): Long = withContext(Dispatchers.IO) {
+        val startNs = System.nanoTime()
+        var got = 0L
+        try {
+            val conn = URL("https://speed.cloudflare.com/__down?bytes=$OPENVPN_SPEED_PROBE_BYTES")
+                .openConnection() as HttpURLConnection
+            conn.connectTimeout = 5_000
+            conn.readTimeout = 4_000
+            conn.inputStream.use { ins ->
+                val buf = ByteArray(32 * 1024)
+                while (got < OPENVPN_SPEED_PROBE_BYTES) {
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    got += n
+                    if (elapsedMs(startNs) >= OPENVPN_SPEED_PROBE_BUDGET_MS) break
+                }
+            }
+        } catch (t: Throwable) {
+            // 中途超时/断流都可能已经收到一部分：下面照样按实收字节算，
+            // 「有一点点但很慢」正是要判成慢的那种情况。
+            EngineBridge.note("[vpn] 出口测速中断（已收 ${got / 1024} KB）：${t.message ?: t.toString()}")
+        }
+        val ms = elapsedMs(startNs)
+        if (got <= 0 || ms < 50) 0L else got * 1000 / ms
+    }
+
+    private fun elapsedMs(startNs: Long): Long = (System.nanoTime() - startNs) / 1_000_000
 
     /**
      * 按设置排出候选节点（引擎按这个顺序逐个真握手，单轮最多试 5 个）。
      *
      * 顺序就是用户要的「失效自动切」语义：
      *   1. 手动钉死的节点（若有）
-     *   2. 同国 + 同类别（家宽只切家宽、机房只切机房），延迟升序
-     *   3. 同国 + 其他类别（家宽 > 未知 > 机房），延迟升序
-     *   4. 其他国家 + 同类别，延迟升序
-     *   5. 其他国家 + 其他类别（家宽 > 未知 > 机房）
-     * 自动模式（没钉节点）：家宽 → 未知 → 机房，块内延迟升序。
+     *   2. 同国 + 同类别（家宽只切家宽、机房只切机房），块内按速度档 + 延迟升序
+     *   3. 同国 + 其他类别（家宽 > 未知 > 机房），块内按速度档 + 延迟升序
+     *   4. 其他国家 + 同类别，同上
+     *   5. 其他国家 + 其他类别（家宽 > 未知 > 机房），同上
+     * 自动模式（没钉节点）：家宽 → 未知 → 机房，块内按速度档 + 延迟升序。
+     *
+     * 块内的「速度档」是电脑版的规则（`vpnGateSpeedTier`）：实测够快 → 没测过 →
+     * 实测偏慢。**慢的永远不该排在没测过的前面** —— 否则一个「上次成功过」的慢
+     * 节点会被永久顶到最前，每次连上都只有十几 KB/s（电脑版就是这么被拖慢的）。
      *
      * 为什么要给这么多（24 个）：引擎每轮只试 5 个，失败了服务会自动再来一轮，
      * 「失败记忆」（引擎侧，10 分钟）保证下一轮落在列表更后面的节点上 —— 于是
@@ -308,9 +547,13 @@ class WarpVpnService : VpnService() {
         }
         if (fixed != null) add(fixed)
 
-        // 类别块内顺序：家宽 → 未知 → 机房；同块按延迟升序。
-        fun sortedOf(pool: List<VpnGateNode>): List<VpnGateNode> =
-            pool.sortedWith(compareBy<VpnGateNode> { classRank(it.cls) }.then(byLatency))
+        // 类别块内顺序：家宽 → 未知 → 机房；同块内「实测快 → 没测过 → 实测慢」，
+        // 再按延迟升序（与电脑版 rankVPNGateRelays 的层次一致）。
+        fun sortedOf(pool: List<VpnGateNode>): List<VpnGateNode> = pool.sortedWith(
+            compareBy<VpnGateNode> { classRank(it.cls) }
+                .thenBy { NodeSpeedStore.tier(it.measuredBps) }
+                .then(byLatency)
+        )
 
         val targetCc = fixed?.cc ?: s.openvpnCountry
         val targetCls = fixed?.cls
@@ -708,6 +951,10 @@ class WarpVpnService : VpnService() {
     }
 
     private fun shutdown() {
+        // 先掐掉还在「等连接结果 / 测速」的那一轮，否则它会在断开之后再
+        // 发起一次 connect（表现就是「点了断开又自己连上」）。
+        connectJob?.cancel()
+        connectJob = null
         watchdog?.cancel()
         watchdog = null
         EngineBridge.peek()?.let { engine ->

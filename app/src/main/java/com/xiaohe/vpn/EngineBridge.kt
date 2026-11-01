@@ -162,6 +162,9 @@ object EngineBridge {
     fun vpnGateNodes(context: Context): List<VpnGateNode> = try {
         val o = JSONObject(engineOrCreate(context).vpnGateNodesJSON())
         val arr = o.optJSONArray("nodes") ?: JSONArray()
+        // 实测速度记忆在 Kotlin 侧（见 NodeSpeedStore）：引擎那份节点 JSON 里没有
+        // 这个字段，读的时候按 id 贴上去 —— 排序与界面看到的是同一份数据。
+        val speeds = NodeSpeedStore.snapshot(context)
         buildList {
             for (i in 0 until arr.length()) {
                 val n = arr.optJSONObject(i) ?: continue
@@ -183,6 +186,7 @@ object EngineBridge {
                         shared = n.optBoolean("shared"),
                         isp = n.optString("isp"),
                         asn = n.optString("as"),
+                        measuredBps = speeds[n.optString("id")] ?: 0L,
                     )
                 )
             }
@@ -320,10 +324,19 @@ data class VpnGateNode(
     val shared: Boolean,
     val isp: String,
     val asn: String,
+    /**
+     * 这台设备上一次连上它时实测到的出口吞吐（bps，0 = 没测过）。
+     *
+     * 来自 [NodeSpeedStore]（6 小时过期）。它**只参与排序**：快 → 未测 → 慢，
+     * 不用来决定「能不能用」—— 能用都保留是明确的产品决定。
+     */
+    val measuredBps: Long = 0L,
 ) {
     /** 实测优先；没有实测时退回自报 ping（界面会用不同颜色标注）。 */
     val displayLatencyMs: Int get() = if (latencyMs > 0) latencyMs else pingMs
     val hasMeasuredLatency: Boolean get() = latencyMs > 0
+    /** 实测速度的可读形式（没测过 = "未测"），日志用。 */
+    val measuredText: String get() = if (measuredBps > 0) NodeSpeedStore.text(measuredBps) else "未测"
     val classLabel: String get() = when (cls) {
         "residential" -> "家宽"
         "datacenter" -> "机房"
