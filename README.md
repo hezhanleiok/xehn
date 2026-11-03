@@ -3,6 +3,9 @@
 把 `d:\xhwarp`（Windows 版）的 WARP/Psiphon 能力做成安卓 App。
 **本目录只读参考 `d:\xhwarp`，不修改它。**
 
+- 仓库：<https://github.com/hezhanleiok/xehn/tree/xehn-android>
+- 当前版本：**v0.2.10**（versionCode 12）
+
 详细代码分析见 [`docs/porting-analysis.md`](docs/porting-analysis.md)。
 
 ---
@@ -14,7 +17,7 @@
 | `engine/` Go 引擎（gomobile 打成 `.aar`） | ✅ `go test` / `go vet` 全过，`android/arm64` 交叉编译通过 |
 | `app/libs/engine.aar` | ✅ 已生成（4.38 MB，含 arm64 + arm 的 `libgojni.so`） |
 | `app/` Kotlin + Compose 界面骨架 | ✅ 编译通过 |
-| **`app-debug.apk`** | ✅ **已构建成功（20.91 MB）**，含两个 ABI 的原生库 |
+| **`app-debug.apk`** | ✅ **已构建成功（65.4 MB，v0.2.10）**，含 arm64 + arm 两个 ABI 的原生库 |
 | `WarpVpnService` | ✅ 前台服务 + 通知 + tun fd 接缝（**路由默认关闭**，见下） |
 | 环境（JDK/SDK/NDK/gomobile/Gradle） | ✅ `check-env.ps1` **12 项就绪 / 0 缺失** |
 | **真正建立隧道（P1，已接入）** | ✅ warpscout 引擎搬进 `engine/warp`，能建 WG/AWG 隧道并拿到真实出口 IP |
