@@ -45,21 +45,29 @@ if (-not $ips) { $ips = @('127.0.0.1') }
 # 所以这里主动确认一条只针对本端口的专用网络规则。
 function Ensure-FirewallRule([int]$p) {
     $name = "xhwarp-android APK server ($p)"
+    # 规则必须落在**当前网络所在的配置文件**上。原来写死 -Profile Private，
+    # 而在把 Wi-Fi 标成「公用网络」的机器上（很常见，Win 默认就是 Public），
+    # 加出来的 Private 规则一条都不生效 —— 表现就是「本机自测 200、手机打不开」。
+    $profile = (Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty NetworkCategory -Unique) -join ','
+    $profile = $profile -replace 'DomainAuthenticated', 'Domain'
+    if (-not $profile) { $profile = 'Any' }
+
     if (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) {
-        Write-Host ('  防火墙规则已存在：' + $name) -ForegroundColor DarkGray
+        Write-Host ('  防火墙规则已存在：' + $name + '（当前网络：' + $profile + '）') -ForegroundColor DarkGray
         return
     }
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $admin) {
         Write-Host '  注意：没有防火墙放行规则，手机可能连不上。用管理员 PowerShell 执行一次：' -ForegroundColor Yellow
-        Write-Host ('    New-NetFirewallRule -DisplayName "' + $name + '" -Direction Inbound -Protocol TCP -LocalPort ' + $p + ' -Action Allow -Profile Private') -ForegroundColor Yellow
+        Write-Host ('    New-NetFirewallRule -DisplayName "' + $name + '" -Direction Inbound -Protocol TCP -LocalPort ' + $p + ' -Action Allow -Profile ' + $profile) -ForegroundColor Yellow
         return
     }
     try {
         New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol TCP -LocalPort $p `
-            -Action Allow -Profile Private -ErrorAction Stop | Out-Null
-        Write-Host ('  已添加防火墙放行规则：' + $name + '（仅专用网络、仅 TCP ' + $p + '）') -ForegroundColor DarkGray
+            -Action Allow -Profile $profile -ErrorAction Stop | Out-Null
+        Write-Host ('  已添加防火墙放行规则：' + $name + '（网络 ' + $profile + '、仅 TCP ' + $p + '）') -ForegroundColor DarkGray
         Write-Host ('  不用了可以删： Remove-NetFirewallRule -DisplayName "' + $name + '"') -ForegroundColor DarkGray
     } catch {
         Write-Host ('  添加防火墙规则失败：' + $_.Exception.Message) -ForegroundColor Yellow

@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
@@ -75,7 +76,32 @@ const (
 	// enrolled through the API, and that enrolment is the whole authentication.
 	masqueCertLifetime = 24 * time.Hour
 	// Headroom over the MTU so an oversized frame is read rather than truncated.
-	masqueReadBuf = tunnelMTU + 128
+	masqueReadBuf = tunnelMTU + 256
+
+	// MASQUE 的 tun MTU 上限。
+	//
+	// 2026-11-03 真机反馈：同一个手机、同一个网络，官方客户端下行 100+ Mb/s，
+	// 这里只有十几兆。根因在「一个 IP 包 = 一个 QUIC DATAGRAM」这条链路上：
+	//
+	//	tun MTU 1280 的包 → +4 字节 contextID → QUIC DATAGRAM 帧 → QUIC 头
+	//	→ UDP 8 → IPv6 40 / IPv4 20
+	//
+	// 外层走 IPv6 边缘（日志里就是 [2606:4700:103::1]:443，v6 路径 MTU 就是
+	// 1280）时，1280 的内层包封装后约 1340 字节，**直接超过路径 MTU**。超限的
+	// datagram 被 quic-go 以 DatagramTooLargeError 拒掉，而我们的泵把这个错误
+	// （以及本该回写给内核的 ICMP）当成"这包算了"丢掉 —— 内层 TCP 只看到丢包，
+	// 反复重传 + 拥塞窗口塌陷，实测就稳定在十几兆。
+	//
+	// 1200 是官方客户端的量级，留给外层 80 字节封装余量，任何 v6 路径都塞得下。
+	masqueMaxTunMTU = 1200
+
+	// 每个 IP 包前要留出的空间：CONNECT-IP 的 context ID（0 编码为 1 字节）。
+	// 这样写包时可以原地复用读缓冲，不必每包再 alloc + copy（见 pumpOut）。
+	masqueCtxRoom = 8
+
+	// 接收侧并发读的条数。单条 goroutine 在千兆下行（≈1 万包/秒）时，
+	// 「一次 ReceiveDatagram + 一次 tun write」两处 syscall 就是上限。
+	masquePumpReaders = 2
 	// The same endpoint with the same SNI answers on one attempt and times out on
 	// the next, so a single failure says nothing. Measured on a filtered network,
 	// same endpoints and same SNI: one try scored 1-3 of 14 working, three tries
@@ -140,11 +166,18 @@ var masqueCredsFile string
 
 // masqueMTU 与系统 tun 用同一个 MTU：Kotlin 的 VpnService.Builder 和引擎
 // 必须是同一个值，否则内核会按错误尺寸切包。
+//
+// 上限压到 masqueMaxTunMTU（1200）：超过这个值，封装成 CONNECT-IP DATAGRAM 后
+// 会超出 v6 路径 MTU 被静默丢弃 —— 那是"下行只有十几兆"的根因，见常量注释。
 func masqueMTU() int {
+	mtu := tunnelMTU
 	if tunMTU > 0 {
-		return tunMTU
+		mtu = tunMTU
 	}
-	return tunnelMTU
+	if mtu > masqueMaxTunMTU {
+		mtu = masqueMaxTunMTU
+	}
+	return mtu
 }
 
 // -masque-sni overrides this. The endpoint never matches the SNI anyway and the
@@ -377,6 +410,12 @@ type masqueTunnel struct {
 	mtu     int
 	tlsCfg  *tls.Config
 	h2      bool
+	report  func(string)
+
+	// 超出外层可发送尺寸、只能回 ICMP 让内核降 MSS 的包数。用来在真机日志里
+	// 直接看出「是不是 MTU 封装不下」——这一条以前是完全静默的。
+	tooLarge atomic.Int64
+	reported atomic.Bool
 
 	mu   sync.Mutex
 	conn *connectip.Conn
@@ -424,7 +463,10 @@ func newMasqueTunnel(h2 bool, mtu int, report func(string)) (*masqueTunnel, erro
 		report("MASQUE 数据面 = 进程内 netstack")
 	}
 
-	t := &masqueTunnel{ipStack: stack, dev: dev, counter: counter, mtu: mtu, tlsCfg: tlsCfg, h2: h2}
+	t := &masqueTunnel{
+		ipStack: stack, dev: dev, counter: counter, mtu: mtu,
+		tlsCfg: tlsCfg, h2: h2, report: report,
+	}
 	go t.pumpOut()
 	return t, nil
 }
@@ -466,33 +508,58 @@ func (t *masqueTunnel) currentConn() *connectip.Conn {
 // One reader for the whole tunnel: the device is reused across peers, so a
 // per-peer reader would be left blocked in dev.Read after a swap.
 func (t *masqueTunnel) pumpOut() {
-	buf := make([]byte, masqueReadBuf)
+	// 前面留 masqueCtxRoom 字节：WritePacketBuffer 直接把 contextID 写在包前面，
+	// 高包速时省掉每包一次 make+copy（quic-go 的 SendDatagram 自己还会再拷一次）。
+	buf := make([]byte, masqueReadBuf+masqueCtxRoom)
 	bufs := [][]byte{buf}
 	sizes := []int{0}
 	for {
-		if _, err := t.dev.Read(bufs, sizes, 0); err != nil {
+		if _, err := t.dev.Read(bufs, sizes, masqueCtxRoom); err != nil {
 			return
 		}
 		conn := t.currentConn()
 		if conn == nil {
 			continue
 		}
-		if _, err := conn.WritePacket(buf[:sizes[0]]); err != nil {
+		icmp, err := conn.WritePacketBuffer(buf, masqueCtxRoom, sizes[0])
+		if err != nil {
 			continue
+		}
+		if len(icmp) > 0 {
+			// CONNECT-IP 用 ICMP「包太大」告诉我们这个包封不下。**必须写回 tun**：
+			// 内核收到才会把 MSS 调小重发；丢掉的话内层 TCP 只会一直重传同一个
+			// 超限包，吞吐被死死压住（这就是下行只有十几兆的那一半原因）。
+			if _, werr := t.dev.Write([][]byte{icmp}, 0); werr != nil {
+				return
+			}
+			if t.tooLarge.Add(1) == 1 {
+				// 第一次就写一行日志：这一版把 MTU 压到 1200 了，如果还能看到
+				// 这条，说明外层路径比 1200 还窄，得继续往下调。
+				t.reportOnce(fmt.Sprintf(
+					"MASQUE：有包超出外层可发送尺寸，已回写 ICMP 让内核降 MSS（当前 tun MTU %d）", t.mtu))
+			}
 		}
 	}
 }
 
 func (t *masqueTunnel) pumpIn(ctx context.Context, conn *connectip.Conn) {
-	buf := make([]byte, masqueReadBuf)
 	for ctx.Err() == nil {
-		n, err := conn.ReadPacket(buf, true)
+		// 零拷贝：包直接引用接收缓冲，省掉每包一次 1280 字节的复制。
+		// 生命周期到下一次 ReadPacketZeroCopy，而这里的 dev.Write 是同步的。
+		pkt, err := conn.ReadPacketZeroCopy(true)
 		if err != nil {
 			return
 		}
-		if _, err := t.dev.Write([][]byte{buf[:n]}, 0); err != nil {
+		if _, err := t.dev.Write([][]byte{pkt}, 0); err != nil {
 			return
 		}
+	}
+}
+
+// reportOnce 让「只报一次」的日志不用在调用点写一堆 if。
+func (t *masqueTunnel) reportOnce(msg string) {
+	if t.reported.CompareAndSwap(false, true) && t.report != nil {
+		t.report(msg)
 	}
 }
 
@@ -577,6 +644,15 @@ func protectedUDPConn(ctx context.Context, v6 bool) (*net.UDPConn, error) {
 		_ = pc.Close()
 		return nil, fmt.Errorf("udp listen 返回了 %T", pc)
 	}
+	// 内核 UDP 缓冲：QUIC 在千兆级下行时每秒几百个包，默认 208 KB 的 rmem
+	// 一满就丢包，丢了就触发拥塞退避 —— 这也是"下行上不去"的常见原因之一。
+	// 非 root 只能设到 net.core.rmem_max，设不上就按系统上限跑，不报错。
+	for _, sz := range []int{8 << 20, 4 << 20, 1 << 20} {
+		if err := uc.SetReadBuffer(sz); err == nil {
+			break
+		}
+	}
+	_ = uc.SetWriteBuffer(4 << 20)
 	return uc, nil
 }
 
@@ -673,7 +749,12 @@ func (d *masqueDial) close() {
 // 串行与竞速两条路都走它，保证行为一致。
 func (t *masqueTunnel) adoptDial(d *masqueDial) {
 	pumpCtx, cancelPump := context.WithCancel(context.Background())
-	go t.pumpIn(pumpCtx, d.conn)
+	// 接收侧开两条：一条 goroutine 每包一次 ReadPacket + 一次 tun 写 syscall，
+	// 千兆下行时单条会成为瓶颈（quic-go 的接收队列是加锁的，多个读者安全；
+	// 取出的包各自持有独立缓冲）。乱序交给内核的 TCP 处理，本来就是网络常态。
+	for i := 0; i < masquePumpReaders; i++ {
+		go t.pumpIn(pumpCtx, d.conn)
+	}
 
 	t.mu.Lock()
 	t.conn = d.conn

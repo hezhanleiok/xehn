@@ -252,6 +252,47 @@ func (e *Engine) SetOpenVPNExit(idsCSV, label, country string) {
 	e.sess.logf("[engine] OpenVPN 出口 = %s（%s），候选 %d 个", label, country, len(kept))
 }
 
+// TestOpenVPNNodes runs a REAL OpenVPN handshake against each given node and
+// returns them with the measured handshake time.
+//
+// Why not the latency already in the node list: that number is the TCP connect
+// time to the api endpoint, which says nothing about whether the node answers
+// an OpenVPN handshake. On 2026-11-01 real devices, three US nodes shown at
+// 193-214ms all failed (two silent, one handshook but forwarded nothing).
+//
+// BLOCKING: one node takes up to ~12s, 3 run concurrently, so ~40 nodes ≈ 2min.
+// Call it from a background thread, never from the UI thread.
+//
+// Returns JSON: {"ok":true,"results":[{"id":"..","ms":123,"ok":true,"error":""}]}
+func (e *Engine) TestOpenVPNNodes(idsCSV string) string {
+	wb := e.warpBackendOf()
+	if wb == nil {
+		return `{"ok":false,"error":"引擎未安装"}`
+	}
+	ids := splitCSV(idsCSV)
+	if len(ids) == 0 {
+		return `{"ok":false,"error":"没有要测试的节点"}`
+	}
+	// 一个都测不完时也别让界面永远转：留一点余量给 40 个节点 × 12s / 3 并发。
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	e.sess.logf("[engine] 开始真实握手测速：%d 个节点（只握手，不建系统 VPN）", len(ids))
+	probes, err := wb.TestOpenVPNNodes(ctx, ids, "", 0, func(s string) {
+		e.sess.logf("[probe] %s", s)
+	})
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+		e.sess.logf("[engine] 握手测速失败：%v", err)
+		return string(b)
+	}
+	payload := map[string]any{"ok": true, "results": probes}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return `{"ok":false,"error":"结果编码失败"}`
+	}
+	return string(b)
+}
+
 // splitCSV 是 idsCSV 的解析：去空白、去空项、去重（顺序保持）。
 func splitCSV(s string) []string {
 	parts := strings.Split(s, ",")

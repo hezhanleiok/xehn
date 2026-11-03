@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -321,6 +322,122 @@ func (b *warpBackend) freshOpenVPNIDs(ids []string, report func(string)) []strin
 		report(fmt.Sprintf("跳过 %d 个最近失败过的节点（%v 内不重试）", skipped, openvpnFailTTL))
 	}
 	return fresh
+}
+
+// OpenVPNProbe 是一次「真握手测延迟」的结果。
+type OpenVPNProbe struct {
+	ID    string `json:"id"`
+	MS    int64  `json:"ms"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// TestOpenVPNNodes 对一组节点做**真实 OpenVPN 握手**测试：只握手，不建系统 VPN、
+// 不验证数据面、不动当前连接。
+//
+// 为什么需要它：列表里显示的「延迟」是 api/iphone 同域名的 TCP 连接时间，
+// 跟这个节点能不能握手、握手多久基本无关。2026-11-01 用户实测：列表显示
+// 193~214ms 的三个美国节点全部连不上（两个控制通道无响应、一个握手成功但
+// 不转发流量），而 JP/KR 节点多的国家能连上 —— 只有真握手才分得清。
+//
+// 一条 WARP 上游复用到所有节点上（见 warp.OpenUnderlay）：重拨一次要扫 28 个
+// 端点、最多 60s，为每个节点各拨一次完全没必要。
+//
+// 结果同时记账：握手失败的进 10 分钟失败记忆，连接时直接跳过；成功的清掉记忆。
+func (b *warpBackend) TestOpenVPNNodes(
+	ctx context.Context, ids []string, proto string,
+	handshake time.Duration, report func(string),
+) ([]OpenVPNProbe, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("没有要测试的节点")
+	}
+	cfgByID := make(map[string]string, len(ids))
+	order := make([]string, 0, len(ids))
+	for _, id := range ids {
+		cfg := b.VPNGateNodeConfig(id)
+		if cfg == "" {
+			continue
+		}
+		cfgByID[id] = cfg
+		order = append(order, id)
+	}
+	if len(order) == 0 {
+		return nil, errors.New("这些节点的配置都不在缓存里，先刷新节点列表")
+	}
+	if handshake <= 0 {
+		handshake = defaultHandshakeTimeout
+	}
+	report(fmt.Sprintf("准备测 %d 个节点的真实握手（先建一条 WARP 上游，随后复用）…", len(order)))
+	under, err := warp.OpenUnderlay(ctx, warp.OpenVPNOptions{
+		UnderlayProto:    proto,
+		UnderlayPrefer:   b.preferEndpoint(proto),
+		HandshakeTimeout: handshake,
+		VerifyTimeout:    8 * time.Second,
+		Budget:           60 * time.Second,
+		Report:           report,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer under.Close()
+
+	// 并发 6、单节点 10s：真机实测好看的节点握手 2.8–4.9s，10s 足够分辨；
+	// 而「控制通道无响应」的节点一定要等满超时，所以并发数直接决定总时长 ——
+	// 98 个节点最坏 98×10/6 ≈ 2.7 分钟，实际大多在 1 分钟内。
+	const probeTimeout = 10 * time.Second
+	const workers = 6
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	done := 0
+	results := make(map[string]OpenVPNProbe, len(order))
+	for _, id := range order {
+		id, cfg := id, cfgByID[id]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			d, perr := warp.ProbeOpenVPNHandshake(ctx, under, cfg, probeTimeout)
+			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), OK: perr == nil}
+			if perr != nil {
+				p.Error = perr.Error()
+				b.markOpenVPNFailed(id)
+			} else {
+				b.clearOpenVPNFailure(id)
+			}
+			mu.Lock()
+			results[id] = p
+			done++
+			n := done
+			mu.Unlock()
+			report(fmt.Sprintf("握手测试 %d/%d：%s %s", n, len(order), id, probeSummary(p)))
+		}()
+	}
+	wg.Wait()
+
+	out := make([]OpenVPNProbe, 0, len(order))
+	for _, id := range order {
+		if p, ok := results[id]; ok {
+			out = append(out, p)
+		}
+	}
+	okCount := 0
+	for _, p := range out {
+		if p.OK {
+			okCount++
+		}
+	}
+	report(fmt.Sprintf("握手测试完成：%d 个节点里 %d 个能握手", len(out), okCount))
+	return out, nil
+}
+
+// probeSummary 是日志里每个节点的一句话结果。
+func probeSummary(p OpenVPNProbe) string {
+	if p.OK {
+		return fmt.Sprintf("握手成功 %dms", p.MS)
+	}
+	return "失败：" + p.Error
 }
 
 // lastGoodPath 是「上次成功端点」缓存文件。放在 App 私有目录，随 App 卸载消失。

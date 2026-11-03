@@ -21,8 +21,11 @@ import (
 // the DNS servers are all decided in the VpnService.Builder. So this device does
 // no ioctl at all - it is purely the data path, exactly like wireguard-android's
 // tun.CreateTUNFromFile wrapper.
+//
+// fd 的所有权：**VpnService 的 ParcelFileDescriptor 拥有它，本设备只借用**。
+// Close 不会关闭 fd（原因见 pktfile_android.go 的 fdsan 记录）。
 type fdTunDevice struct {
-	file   *os.File
+	file   *packetFile
 	mtu    int
 	events chan tun.Event
 
@@ -43,12 +46,8 @@ func newFdTunDevice(fd, mtu int) (tun.Device, tunCounter, error) {
 	if mtu <= 0 {
 		mtu = tunnelMTU
 	}
-	f := os.NewFile(uintptr(fd), fdTunName)
-	if f == nil {
-		return nil, nil, fmt.Errorf("fd %d 无法包装成文件", fd)
-	}
 	d := &fdTunDevice{
-		file:   f,
+		file:   newPacketFile(fd),
 		mtu:    mtu,
 		events: make(chan tun.Event, 4),
 	}
@@ -57,12 +56,12 @@ func newFdTunDevice(fd, mtu int) (tun.Device, tunCounter, error) {
 	// sending, and without it the handshake never leaves the phone - which
 	// looks exactly like "connected but no traffic".
 	d.events <- tun.EventUp
-	// 从这里开始，这个 fd 的生死归本设备（Close 会 file.Close）—— 见 tunfd.go。
-	ClaimTunFD()
 	return d, d, nil
 }
 
-func (d *fdTunDevice) File() *os.File { return d.file }
+// File 恒为 nil：tun 接口要求这个方法，但这里的 fd 属于 VpnService 的
+// ParcelFileDescriptor，引擎不持有、也不应该把它交出去（谁拿到谁就可能 close）。
+func (d *fdTunDevice) File() *os.File { return nil }
 
 // BatchSize is 1: a phone has one queue and little memory, and batching buys
 // nothing on a link whose packets are encrypted one by one anyway.

@@ -29,7 +29,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -259,7 +258,8 @@ func (o *OpenVPNOptions) report(msg string) {
 // openvpnExit 是一条已经跑起来的 OpenVPN 数据面。
 type openvpnExit struct {
 	client *ovpn.Client
-	file   *os.File
+	// file 只借用 tun fd，不拥有、不关闭（关闭权在 Kotlin 的 ParcelFileDescriptor）。
+	file   *packetFile
 	cancel context.CancelFunc
 	once   sync.Once
 
@@ -431,14 +431,11 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	}
 
 	// ④ 起泵。
-	f := os.NewFile(uintptr(fd), "ovpn-tun")
-	if f == nil {
-		_ = closeFD(fd)
-		_ = client.Close()
-		return nil, fmt.Errorf("tun fd %d 无法包装成文件", fd)
-	}
-	// 这个 fd 由本文件的 exit 关闭：标记为已接管，失败/断开路径不要重复关。
-	ClaimTunFD()
+	//
+	// fd 归 Kotlin 的 ParcelFileDescriptor 所有，这里只借用（见 pktfile_android.go
+	// 的 fdsan 记录）。以前是 os.NewFile + file.Close，Go 关一次、Java 侧对象还
+	// 认为自己是 owner —— 换点几次后必然撞上 fdsan abort（真机 SIGABRT 闪退）。
+	f := newPacketFile(fd)
 	ex := &openvpnExit{client: client, file: f}
 	ex.startPump(context.Background())
 
@@ -466,6 +463,101 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	return sess, nil
 }
 
+// OpenUnderlay 起一条「只当外层载体」的 WARP 隧道（系统 tun fd 不参与）。
+//
+// 单独抽出来是因为「真延迟测试」要复用同一条上游去握手几十个节点：
+// 每测一个节点就重拨一次 WARP（28 个端点 × 60s 预算）既慢又没必要 ——
+// 一条上游本来就是纯用户态 netstack，谁都能往上拨。
+//
+// 调用方负责 Close 返回的 Session。
+func OpenUnderlay(ctx context.Context, o OpenVPNOptions) (*Session, error) {
+	if o.UnderlayProto == "" {
+		o.UnderlayProto = protoAWG
+	}
+	savedTunFD := tunFD
+	tunFD = 0
+	sess, err := Dial(ctx, Options{
+		Proto:            o.UnderlayProto,
+		Endpoint:         o.UnderlayEndpoint,
+		Prefer:           o.UnderlayPrefer,
+		IPv6:             o.IPv6,
+		Sample:           2,
+		HandshakeTimeout: o.HandshakeTimeout,
+		VerifyTimeout:    o.VerifyTimeout,
+		Budget:           o.Budget,
+		NoHedge:          true,
+		Report:           o.Report,
+	})
+	tunFD = savedTunFD
+	if err != nil {
+		return nil, fmt.Errorf("WARP 上游（%s）建立失败: %w", o.UnderlayProto, err)
+	}
+	if sess.tn.stack() == nil {
+		sess.Close()
+		return nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
+	}
+	o.report(fmt.Sprintf("上游就绪（%s 出口 %s），经 WARP 拨节点…", o.UnderlayProto, sess.ExitIP))
+	return sess, nil
+}
+
+// ProbeOpenVPNHandshake 只做「经已有上游拨节点 + OpenVPN 握手」，返回握手耗时。
+//
+// 与 DialOpenVPN 的区别只有一个：**握手成功后立刻关掉，不建系统 tun、不验证数据面**。
+// 这正是「延迟」两个字的正确含义 —— 列表里原来那个延迟是同域名 TCP 连接时间，
+// 跟这个节点能不能握手、握手多久几乎没有关系（2026-11-01 实测：显示 193~214ms 的
+// 美国节点三个全死）。
+//
+// 注意它证明不了「能转发流量」：握手成功但一个字节都不转的节点在 VPN Gate 上很常见，
+// 所以这只是**筛掉死的**，真正能不能用还得靠连接时的出口验证。
+func ProbeOpenVPNHandshake(ctx context.Context, under *Session, configText string, timeout time.Duration) (time.Duration, error) {
+	if under == nil {
+		return 0, errors.New("没有上游隧道")
+	}
+	stack := under.tn.stack()
+	if stack == nil {
+		return 0, errors.New("上游没有 netstack（内部错误）")
+	}
+	cfgText, err := ParseOpenVPNConfig(configText)
+	if err != nil {
+		return 0, err
+	}
+	clientCfg, err := cfgText.clientConfig()
+	if err != nil {
+		return 0, fmt.Errorf("ovpn 配置不受支持: %w", err)
+	}
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
+	nodeAddr := net.JoinHostPort(cfgText.RemoteHost, strconv.Itoa(cfgText.RemotePort))
+	conn, err := dialThroughStack(ctx, stack, cfgText.Proto, nodeAddr, timeout)
+	if err != nil {
+		return 0, fmt.Errorf("经 WARP 连接节点失败: %w", err)
+	}
+	packetIO := ovpn.NewDatagramPacketIO(conn)
+	if cfgText.Proto == ovpn.ProtoTCP {
+		packetIO = ovpn.NewTCPPacketIO(conn)
+	}
+	client, err := ovpn.NewClient(clientCfg, packetIO)
+	if err != nil {
+		_ = conn.Close()
+		return 0, fmt.Errorf("OpenVPN 客户端初始化失败: %w", err)
+	}
+	defer client.Close()
+
+	hsCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	push, err := client.Handshake(hsCtx)
+	elapsed := time.Since(start)
+	if err != nil {
+		return elapsed, fmt.Errorf("OpenVPN 握手失败: %w", err)
+	}
+	if push == nil || len(push.Prefixes) == 0 {
+		return elapsed, errors.New("握手成功但服务器没有下发 ifconfig 地址")
+	}
+	return elapsed, nil
+}
+
 // dialOpenVPNUpstream 起 WARP 上游 → 经它拨节点 → 完成 OpenVPN 握手。
 //
 // 上游**只有这一条**：不进 WARP 的「直连节点」模式在 0.2.3 被删掉了 ——
@@ -482,30 +574,15 @@ func dialOpenVPNUpstream(
 	nodeAddr string,
 ) (under *Session, client *ovpn.Client, push *ovpn.PushReply, err error) {
 	// 系统 tun fd 这一轮归 OpenVPN 的包泵，基础协议退成 netstack。
-	savedTunFD := tunFD
-	tunFD = 0
-	under, err = Dial(ctx, Options{
-		Proto:            o.UnderlayProto,
-		Endpoint:         o.UnderlayEndpoint,
-		Prefer:           o.UnderlayPrefer,
-		IPv6:             o.IPv6,
-		Sample:           2,
-		HandshakeTimeout: o.HandshakeTimeout,
-		VerifyTimeout:    o.VerifyTimeout,
-		Budget:           o.Budget,
-		NoHedge:          true,
-		Report:           o.Report,
-	})
-	tunFD = savedTunFD
+	under, err = OpenUnderlay(ctx, o)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("WARP 上游（%s）建立失败: %w", o.UnderlayProto, err)
+		return nil, nil, nil, err
 	}
 	stack := under.tn.stack()
 	if stack == nil {
 		under.Close()
 		return nil, nil, nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
 	}
-	o.report(fmt.Sprintf("上游就绪（%s 出口 %s），经 WARP 拨节点…", o.UnderlayProto, under.ExitIP))
 
 	// TCP/UDP 都走 gVisor，系统的路由表完全不参与，所以这一步在系统 VPN
 	// 建起来之前就能完成。

@@ -63,10 +63,12 @@ if (-not $env:JAVA_TOOL_OPTIONS) { $env:JAVA_TOOL_OPTIONS = '-Dfile.encoding=UTF
 Write-Host ('JAVA_TOOL_OPTIONS = ' + $env:JAVA_TOOL_OPTIONS) -ForegroundColor DarkGray
 
 # Psiphon 的 psiphon-tls 在 init 里用反射校验 crypto/tls.ConnectionState 的字段
-# 布局，Go 1.27 给它加了一个字段 —— 用本机 1.27 构建出来的包一 import 就 panic
+# 布局，Go 1.27 给它加了一个字段 —— 用 1.27 构建出来的包一 import 就 panic
 # （"struct field count mismatch: 18 vs 17"）。引擎因此固定在 go1.26 上构建：
-# go.mod 的 go 指令已经是 1.26.3，这里再把工具链钉到 1.26.8（本机没有会自动下载）。
-if (-not $env:GOTOOLCHAIN) { $env:GOTOOLCHAIN = 'go1.26.8' }
+# go.mod 的 go 指令已经是 1.26.3，这里再把工具链钉到 1.26 系列的最新补丁
+# （本机没装会自动下载，落在 GOMODCACHE 里，不会污染 PATH 上的最新版 Go）。
+# 2026-11-01 实测：本机装的是最新稳定版 go1.27.3，用 go1.26.10 打 aar 一切正常。
+if (-not $env:GOTOOLCHAIN) { $env:GOTOOLCHAIN = 'go1.26.10' }
 Write-Host ('GOTOOLCHAIN = ' + $env:GOTOOLCHAIN) -ForegroundColor DarkGray
 
 # Go 1.24+ 的 gomobile 要求模块依赖图里有 golang.org/x/mobile，否则直接拒绝：
@@ -94,8 +96,13 @@ try {
     # 参数必须放进数组再用 @ 展开：Windows PowerShell 5.1 会把
     # `-target=$Target` 这种 token 原样传给原生 exe，变量不展开，
     # gomobile 于是报 `unsupported platform: "$Target"`。
+    # -ldflags=-w 去掉 DWARF 调试信息：每个 ABI 的 libgojni.so 会从 ~43 MB 降到 ~20 MB。
+    # APK 里的 .so 是**不压缩存放**的（targetSdk 24+ 的默认），所以这里省多少，APK 就小多少
+    # （2026-11-01 实测：不 strip 时 APK 145 MB）。只加 -w 不加 -s：保留符号表，
+    # 原生崩溃的 tombstone 仍然能解析出函数名，正是排查闪退要用的东西。
     $bindArgs = @('bind', "-javapkg=$JavaPkg", "-target=$Target",
-                  "-androidapi=$AndroidAPI", '-o', $out, '.\')
+                  "-androidapi=$AndroidAPI", '-ldflags=-w',
+                  '-o', $out, '.\')
     $bindLog = & gomobile @bindArgs 2>&1
     $bindLog | ForEach-Object { Write-Host "  $_" }
     if ($LASTEXITCODE -ne 0) { throw 'gomobile bind 失败（看上面的报错；缺 SDK/NDK/javac 最常见）' }

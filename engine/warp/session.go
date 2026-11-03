@@ -412,19 +412,15 @@ func (s *Session) Close() {
 		s.psiphon.stop()
 		s.psiphon = nil
 	}
-	// OpenVPN：泵自己握着 tun fd（os.File），Close 里已经关掉了它；这里只需
-	// 把 Session 的记账清零，别让下面的 closeFD 二次关闭一个已经回收的 fd 号。
+	// OpenVPN：泵只借用 tun fd，Close 不会关它。
 	if s.ovpn != nil {
 		s.ovpn.close()
 		s.ovpn = nil
-		s.tunFD = 0
 	}
-	// Psiphon 只关掉了它自己 dup 出来的那份；原 fd 还在我们手上，必须自己关，
-	// 否则系统 VPN 会一直挂着（见字段注释）。
-	if s.tunFD > 0 {
-		_ = closeFD(s.tunFD)
-		s.tunFD = 0
-	}
+	// 系统 tun fd **不在这里关**：它归 Kotlin 的 ParcelFileDescriptor 所有，
+	// 由 WarpVpnService.closeTun() 统一关闭（见 tunfd_owner.go 的 fdsan 记录）。
+	// 引擎这边关一次、Java 那边再关一次正是闪退的根源。
+	s.tunFD = 0
 	if s.tn != nil {
 		s.tn.Close()
 		s.tn = nil

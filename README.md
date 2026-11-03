@@ -110,7 +110,7 @@ d:\xhwarp-android\
 
 ---
 
-## 3. 环境（已装好，2026-10-09）
+## 3. 环境（已装好，2026-11-01 全部更新到最新稳定版）
 
 一键复核：
 
@@ -118,18 +118,31 @@ d:\xhwarp-android\
 powershell -ExecutionPolicy Bypass -File .\tools\check-env.ps1
 ```
 
+**安装位置规则：所有开发软件一律装在 `D:\soft` 下**（不装 C 盘、不装 `C:\Program Files`）。
+
 | 组件 | 版本 / 位置 |
 |---|---|
-| Go | 1.27.0（官方安装包，支持 `android/arm64`） |
-| JDK | Microsoft Build of OpenJDK **17.0.20.1** → `C:\Program Files\Microsoft\jdk-17.0.20.101-hotspot`（`JAVA_HOME` 已设 User + Machine） |
-| Android SDK | `D:\Android\Sdk`（`ANDROID_HOME` 已设） |
+| Go | **1.27.3**（最新稳定版）→ `D:\soft\go`；`GOPATH`/`GOBIN` = `D:\soft\gopath`（含 `bin`） |
+| Go（打引擎用的工具链） | **1.26.10** —— 由 `GOTOOLCHAIN` 自动下载到 `D:\soft\gopath\pkg\mod\golang.org\toolchain@*`，见下方注意点 |
+| JDK | Microsoft Build of OpenJDK **17.0.20.1** → `C:\Program Files\Microsoft\jdk-17.0.20.101-hotspot`（`JAVA_HOME` 已设） |
+| Android SDK | `D:\soft\Android\Sdk`（`ANDROID_HOME` 已设） |
 | — platform-tools | 37.0.1（含 adb） |
 | — platforms | android-35 |
 | — build-tools | 35.0.0（AGP 后来自己又补装了 34.0.0） |
-| — NDK | 27.0.12077973（`ANDROID_NDK_HOME` 已设） |
-| Gradle | 8.9（Wrapper；发行包走 `mirrors.cloud.tencent.com`） |
-| gomobile / gobind | `golang.org/x/mobile` 最新（装在 `%USERPROFILE%\go\bin`） |
+| — NDK | **30.0.16248370**（最新稳定版）→ `D:\soft\Android\Sdk\ndk\30.0.16248370`（`ANDROID_NDK_HOME` 已设） |
+| Gradle | 8.9（Wrapper）；缓存 `GRADLE_USER_HOME=D:\soft\gradle-cache`，发行包走 `mirrors.cloud.tencent.com` |
+| gomobile / gobind | `golang.org/x/mobile` 最新（`v0.0.0-20261011…`）→ `D:\soft\gopath\bin` |
 | Android Studio | 未装（非必须） |
+
+**NDK 30 的安装方式**：`cmdline-tools` 里的 `sdkmanager` 已废弃，被新的 Android CLI 接管，
+不再认 `ndk;<版本>` 这种写法（会报 `Package ndk not found`）。所以直接下官方包
+`https://dl.google.com/android/repository/android-ndk-r30-windows.zip`（694 MB），
+解压到 `D:\soft\Android\Sdk\ndk\` 后把目录名改成版本号即可 —— `source.properties` 里有
+`Pkg.Revision = 30.0.16248370`，AGP / gomobile 都按这个路径识别。
+
+**打包体积**：`build-engine.ps1` 给 `gomobile bind` 加了 `-ldflags=-w`（去 DWARF、保符号表）。
+不加时每个 ABI 的 `libgojni.so` 是 43 MB，而 APK 里的 `.so` 是不压缩存放的 ——
+实测 APK 会到 **145 MB**；加上 `-w` 后 25 MB / 24 MB，APK 回落到 **109 MB**。
 
 **这台机器的网络注意点**（都已处理并写进配置）：
 - `github.com` / `services.gradle.org` / `proxy.golang.org` 连不上 → Gradle 发行包走腾讯镜像，
@@ -263,8 +276,10 @@ powershell -ExecutionPolicy Bypass -File .\tools\build-apk.ps1 -Install   # 之�
    一个字段 —— 直接以 1.27 构建出来的包一 import 就 panic
    （`struct field count mismatch: 18 vs 17`），而且是**启动即崩**。
    `engine/go.mod` 的 go 指令写成 `1.26.3`（依赖里最高的那一个），
-   `tools/build-engine.ps1` 再把 `GOTOOLCHAIN` 钉成 `go1.26.8`（本机没有会自动下载）。
-   手动跑引擎命令时记得带：`$env:GOTOOLCHAIN='go1.26.8'`。
+   `tools/build-engine.ps1` 再把 `GOTOOLCHAIN` 钉成 `go1.26.10`（1.26 系列最新补丁，
+   本机没有会自动下载）。
+   手动跑引擎命令时记得带：`$env:GOTOOLCHAIN='go1.26.10'`。
+   **装最新版 Go 不受影响**：PATH 上的是 go1.27.3，只有引擎这一步临时切到 1.26.10。
 20. **Psiphon 与 MASQUE 各用一个 quic-go fork，而它们的 qpack API 不兼容。**
    官方 quic-go（MASQUE 走它）要 qpack v0.6 的 `NewDecoder()` + `Decode`；Psiphon 的
    fork 要 qpack v0.5 的 `NewDecoder(cb)` + `DecodeFull`。同一个模块路径只能有一个版本，

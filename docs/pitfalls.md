@@ -62,6 +62,28 @@
 - **处理**：0.2.3 起删除直连分支（`dialHostNode` / `reProtect` / `直接上游` / 设置里的「连节点方式」全部移除），上游只剩「先进 WARP 再从隧道里拨节点」。
 - **教训**：**先证伪再实现**。这条路只有在网络允许直连 VPN Gate 时才有意义，而实测一次都没成功过，却贡献了整晚的失败日志。
 
+### 2.5 MASQUE 下行只有十几兆：包封不下，不是带宽不够（2026-11-03）
+
+- **症状**：同一手机、同一网络，官方客户端下行 100+ Mb/s，本 App 的 MASQUE 只有
+  十几兆；不是断，就是慢。
+- **根因**：MASQUE 走 CONNECT-IP，**一个 IP 包 = 一个 QUIC DATAGRAM**。系统 tun
+  MTU 是 1280，封装后 = 1280 + contextID 4 + DATAGRAM 帧头 + QUIC 头 + UDP 8 +
+  IPv6 40 ≈ **1340 字节**；而日志里选中的边缘是 `[2606:4700:103::1]:443`，
+  **v6 路径 MTU 就是 1280**。超限的 datagram 被 quic-go 以 `DatagramTooLargeError`
+  拒掉，而我们的泵把这个错误（以及本该回写给内核的 ICMP「包太大」）直接丢弃 ——
+  内层 TCP 只看到丢包，反复重传、拥塞窗口塌陷，实测就稳定在十几兆。
+- **修法（0.2.9）**：
+  1. MASQUE 的 tun MTU 压到 **1200**（`MASQUE_TUN_MTU` / `masqueMaxTunMTU`，两边
+     必须同值），留给外层 ~80 字节封装余量；
+  2. `WritePacket` 返回的 ICMP 必须**写回 tun**，让内核自己把 MSS 调小；
+  3. 第一次触发时记一行日志（`tooLarge` 计数），下次真机上还慢就能直接看出是不是
+     这个原因，不用再猜；
+  4. 顺带：UDP 读写缓冲提到 4–8 MB（默认 208 KB，高带宽下会丢包）、接收侧用零拷贝
+     `ReadPacketZeroCopy`、发送侧用 `WritePacketBuffer` 原地封装、接收侧两条
+     goroutine 并发读。
+- **教训**：这类"能用但慢"的问题，先看**封装后尺寸 vs 路径 MTU**，再看带宽。
+  把"静默丢弃"改成"计数 + 回写 ICMP"，比继续调参数有用。
+
 ---
 
 ## 3. 配置与状态类
@@ -107,6 +129,92 @@
 - **正确做法**（`MainActivity`）：按「进来得越晚越先退」装一个 `BackHandler`：
   分应用选择 → 抽屉 → 子页面 → 首页；只有首页时 `enabled=false`，才让它退出。
   弹窗（节点/地区选择）在独立 Dialog 窗口里，自己消费返回，不需要在这里判。
+
+### 3.6 闪退之后日志一起消失（2026-11-01）
+
+- **症状**：点连接后 App 直接闪退；重新打开，日志面板是空的 —— 现场没了，
+  只剩用户手快复制出来的一段。
+- **根因**：日志只活在 `EngineBridge._state`（内存 StateFlow）里。进程一死，
+  缓冲跟着消失；而且没有任何未捕获异常兜底，Java 层崩溃连堆栈都不留。
+- **正确做法**（`VpnLog` / `CrashGuard`）：
+  - 每一行**立刻 append + flush** 到 `filesDir/logs/vpn.log`，进程启动时读回界面；
+  - **不做任何自动清理**（退出、重启、重连都不删），只有设置页「清空日志」删；
+  - `Thread.setDefaultUncaughtExceptionHandler` 把堆栈写进同一份日志 + `crash.log`；
+  - 每次启动写 `[app] 启动 x.y.z(code)`，若上一行没有 `[app] 正常退出` 就明确写
+    「上次进程没有正常结束（崩溃或被系统杀掉）」——闪退自己不会说话，得让它留痕。
+  - 边界：Go 侧原生崩溃（SIGSEGV/abort）不会被这个处理器抓到，只能靠最后一行的位置定位。
+- **同批加的定位点**：OpenVPN 建 tun 前写「第 N 次 establish（地址/MTU/分流）」。
+  真机上第 5 次 establish 之后就没了进程，因此 `N` 本身是关键证据。
+
+### 3.7 一次连接里连建 3~5 次系统 VPN，进程就没了（2026-11-01）
+
+- **症状**：`0.2.4` 在本次连接第 5 次 `establish()` 之后、`0.2.5` 在第 4 次和第 3 次
+  之后，进程直接消失；日志最后一行都是「OpenVPN 系统 VPN 已启用」。同一批日志里
+  韩国节点连上后一切正常（实测 83 KB/s），说明数据面本身没坏。
+- **当时的触发条件**：引擎一次 connect 会按候选列表连试 5 个节点，每个节点握手成功
+  就 `Builder.establish()` 一次系统 VPN；失败后关闭 tun fd，再试下一个。
+- **处理**：
+  1. 一次 connect 只给引擎 **1 个节点**，Kotlin 侧循环换点，单次点击上限 3 个
+     （`OPENVPN_MAX_TRIES`）——先把「反复 establish」这个变量摘掉；
+  2. 启动时读 `ApplicationExitInfo`（`getHistoricalProcessExitReasons(包名, 0, 5)`），
+     把上次退出原因写进日志：LMK / Java 崩溃 / **原生崩溃 + tombstone 摘要** / ANR。
+     方法名很容易记错（没有 `getHistoricalProcessExitInfos`，只有 `...ExitReasons`）。
+- **仍未定论**：到底是反复 establish、还是内存被 LMK、还是引擎里原生崩溃，要看
+  0.2.6 那行「上次退出原因」。如果是原生崩溃，就必须改引擎（§6.1 的 aar 重建）。
+
+### 3.8 §3.7 结案：tun fd 被两边各关一次 → fdsan SIGABRT（2026-11-03）
+
+- **证据**（0.2.8 真机日志，`ApplicationExitInfo` 抓到的 tombstone 摘要）：
+
+  ```
+  signal SIGABRT (SI_QUEUE)
+  fdsan: failed to exchange ownership of file descriptor: fd 193 is owned by
+  unique_fd 0x7ad8acf33c, was expected to be unowned
+  ```
+
+  两次崩溃报的都是**上一次 establish 的 fd 号**（193、211），而崩溃前最后一行是
+  「OpenVPN 系统 VPN 已启用（fd=220）」—— 说明新的 tun 刚建好，旧的 fd 号被内核
+  复用，然后某个 ParcelFileDescriptor 操作发现这个号"已经有主了"。
+- **根因**：tun fd 的**所有权被记了两份**。Kotlin 侧 `pfd.detachFd()` 把裸 fd 的
+  fdsan tag 清成 unowned 交给 Go，Go 用 `os.NewFile` 包起来、Close 时 `syscall.Close`；
+  而 Java 的 `ParcelFileDescriptor`（带 fdsan tag）还活在这个进程里。换点几次之后
+  就一定撞上「fd 号已复用 + tag 不一致」→ `__libc_fatal` → SIGABRT。
+  **Java 层 try/catch 抓不到**，所以只能从所有权上根治。
+- **修法（0.2.9）**：所有权只留一份 —— **`ParcelFileDescriptor` 持有并关闭**
+  （`WarpVpnService.closeTun()`），引擎侧全部改成"只借用、绝不 close"
+  （`engine/warp/pktfile_android.go`，用裸 `syscall.Read/Write`，Close 只置标志）。
+  `ClaimTunFD` / `ReleaseTunFD` 退役成 no-op。
+- **另一条同类闪退**（同一次日志里还有一条 Java 崩溃）：
+  `go.Universe$proxyerror: session: 状态 connecting 不能转到 connecting` ——
+  `scope.launch` 跑在 `Dispatchers.Main.immediate` 上，引擎状态机拒绝重复 connect
+  时抛的 RuntimeException 直接冒到 main 线程。修法：`connectSafely()` 先等 idle
+  再调、并接住异常；整个 `connectLoop` 外面再包一层 catch。
+
+### 3.9 速度地板不能照搬电脑版（2026-11-03）
+
+- **症状**：OpenVPN 出口「连接成功立刻就断开」，反复闪一下「已连接」。
+- **原因**：`OPENVPN_MIN_BPS` 沿用电脑版的 150 KB/s，而真机实测的 KR 家宽节点是
+  94 / 79 / 72 KB/s —— **每一个都低于地板**，于是每连上一个就立刻断开换下一个，
+  每次换点又 establish 一次系统 VPN（正好踩在 §3.8 的崩溃路径上）。
+- **修法**：地板与排序分档线统一到 `NodeSpeedStore.MIN_BPS` = **100 KB/s**
+  （0.2.9 先降到 40 只是止血；40 太低，58 KB/s 的节点会被当成"够快"留下来，
+  用户看到的就是 0.x 兆）。
+
+### 3.10 「自动选最快」不能只按握手延迟猜（2026-11-03）
+
+- **症状**：用户选「日本自动」，连上的节点只有 0.x 兆；换一个还是 0.x 兆。
+- **原因**（0.2.9 的排序顺序）：`家宽 → 握手 → **吞吐档** → 延迟`。因为地板
+  150 KB/s 谁都过不了，**所有实测过的节点都进「慢」档**，于是「没测过」的节点
+  永远排在它们前面 —— 自动模式一路去赌没测过的节点，而赌的结果只有 58 KB/s。
+  日志证据：`JP家宽01（254ms，实测 未测）` 被选中，测速 58 KB/s。
+- **修法（0.2.10）**：
+  1. 排序改成 `家宽 → 能握手 → 吞吐档 → **实测速度降序** → 握手耗时 → 延迟`：
+     测过的快的排最前，没测过的排它后面，最后才是测过但慢的；
+  2. 分档线与换点地板同源（都是 100 KB/s），不会出现"排序说它慢、连接却留着"；
+  3. 测速改成 **4 条并发流**：单流在 200ms RTT 的线路上被慢启动压到几十 KB/s，
+     读数只有真实能力的一小部分，按那个读数挑节点等于瞎挑；
+  4. 节点列表行里直接显示实测速度（`握手 254ms · ≈58 KB/s`），用户能看出到底
+     测没测、测出来多少。
 
 ---
 

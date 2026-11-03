@@ -1,0 +1,160 @@
+<div style="max-width:820px;margin:0 auto;padding:4px 2px;font-family:-apple-system,'Segoe UI',Roboto,'Helvetica Neue','PingFang SC','Microsoft YaHei',sans-serif;font-size:15px;line-height:1.78;color:#1f2933;word-break:break-word;">
+
+<h1 style="font-size:26px;line-height:1.4;margin:0 0 10px;color:#0f172a;font-weight:700;">xiaohe VPN 安卓版：现在能做什么，还差什么</h1>
+
+<p style="margin:0 0 4px;color:#64748b;font-size:13px;">v0.2.8 · 2026-11-03 · Android 8.0（API 24）及以上 · arm64 / arm 真机</p>
+
+<div style="background:#f1f6fd;border-left:4px solid #2563eb;border-radius:6px;padding:14px 16px;margin:18px 0 26px;color:#243b53;">
+这个 App 只做一件事：把手机的流量塞进 Cloudflare WARP，需要时再在 WARP 后面叠一层「最终出口」——Psiphon 或 VPN Gate 的免费 OpenVPN 节点。所有链路都强制以 WARP 为前置，没有「直连」兜底分支。
+</div>
+
+<h2 style="font-size:20px;margin:30px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0;color:#0f172a;">一、已经做好的</h2>
+
+<h3 style="font-size:16px;margin:22px 0 8px;color:#1d4ed8;">1. 连接：两种模式、五种协议</h3>
+<ul style="margin:0;padding-left:22px;">
+<li style="margin:6px 0;"><b>VPN 模式</b>：建系统 VPN，把 tun 的文件描述符交给引擎当数据面，全机（或分应用名单）流量都进隧道。状态栏会有 VPN 钥匙，界面会明确写「系统 VPN 已启用 / 未启用」，不会出现「显示已连接但流量根本没走」。</li>
+<li style="margin:6px 0;"><b>仅代理模式</b>：不建 VPN、不弹授权，引擎跑一个本地 SOCKS5（默认 <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:13px;">127.0.0.1:1080</code>，可改成监听 <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:13px;">0.0.0.0</code> 给同 Wi-Fi 的其它设备用）。</li>
+<li style="margin:6px 0;"><b>五种基础协议</b>：WireGuard、AmneziaWG、MASQUE（HTTP/3）、MASQUE（HTTP/2）、WARP-in-WARP，首页下拉直接切，连接中置灰防止中途换协议。</li>
+<li style="margin:6px 0;"><b>启动后自动连接</b>、单端点握手超时 1–15 秒（默认 3 秒）、每次连接都重新从端点池抽样。</li>
+<li style="margin:6px 0;"><b>出口验证</b>：隧道建好后真的经隧道发一次 HTTPS 请求确认出口 IP 与给用户看的一致，拿不到就报错收摊，不做「端口开了就算成功」。</li>
+</ul>
+
+<h3 style="font-size:16px;margin:22px 0 8px;color:#1d4ed8;">2. 第二跳出口：Psiphon 与 VPN Gate</h3>
+<ul style="margin:0;padding-left:22px;">
+<li style="margin:6px 0;"><b>Psiphon 出口</b>：进程内跑官方 tunnel-core，tun 交给它的 packet tunnel，基础协议退成上游载体；出口地区从 Psiphon 自己上报的可落地列表里选，选它不去的地区会立刻失败并给出可选值。</li>
+<li style="margin:6px 0;"><b>OpenVPN 出口（VPN Gate）</b>：链路是「WARP 前置 → 节点 TCP → OpenVPN 握手 → 再建系统 VPN」，节点列表自动抓取，按家宽 / 未知 / 机房分类，可按国家选、可钉死某一个节点、可交给自动排序。</li>
+<li style="margin:6px 0;">两个出口<b>互斥</b>：打开一个会自动关掉另一个，避免两个「最终出口」抢同一个 tun。</li>
+</ul>
+
+<h3 style="font-size:16px;margin:22px 0 8px;color:#1d4ed8;">3. 挑节点：只信实测</h3>
+<ul style="margin:0;padding-left:22px;">
+<li style="margin:6px 0;"><b>真实握手测延迟</b>：列表里的延迟数字不可信（那只是同域名的 TCP 连接时间），所以出口弹窗里有「测延迟」——在一条 WARP 上游上对每个节点真做一次 OpenVPN 握手。成功显示「握手 xxx ms」，失败标红「握手失败」，并在 30 分钟内不再进候选；结果保存 6 小时。</li>
+<li style="margin:6px 0;"><b>出口实测速度</b>：连上后真的下载 512 KB 算吞吐。偏慢就自动换下一个候选；用户亲手钉死的节点只报告速度、不擅自换掉。</li>
+<li style="margin:6px 0;"><b>排序</b>：家宽 &gt; 未知 &gt; 机房；同一类里「能握手（按耗时）」&gt;「没测过」&gt;「握手失败」。VPN Gate 自报的 Speed 列完全不参与排序——实测是假的（有节点自报 127 MB/s）。</li>
+<li style="margin:6px 0;">一次点击最多试 3 个节点：真机日志显示同一次连接里反复建 3~5 次系统 VPN 会把进程搞死。</li>
+</ul>
+
+<h3 style="font-size:16px;margin:22px 0 8px;color:#1d4ed8;">4. 分流</h3>
+<ul style="margin:0;padding-left:22px;">
+<li style="margin:6px 0;"><b>三种策略</b>：全局 / 绕过大陆 / 黑名单。</li>
+<li style="margin:6px 0;"><b>自定义规则</b>：一行一条 <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:13px;">direct,example.com</code> 或 <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:13px;">proxy,1.2.3.0/24</code>，首个命中即停；写错的行只记日志，绝不阻断连接。</li>
+<li style="margin:6px 0;"><b>大陆路由表运行时拉取</b>（两个数据源依次试），缓存 7 天过期，设置页能看到条数和时间，也能手动更新；VPN 模式用路由表达（Android 13+ 走 <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:13px;">excludeRoute</code>，更老的版本算前缀补集）。</li>
+<li style="margin:6px 0;"><b>分应用</b>：关闭 / 仅代理所选 / 所选直连，用系统原生白黑名单，内核层生效，只在 VPN 模式可用。</li>
+<li style="margin:6px 0;">能力边界写在设置页里：<b>域名规则只有「仅代理」模式能生效</b>，VPN 模式只看得到 IP。</li>
+</ul>
+
+<h3 style="font-size:16px;margin:22px 0 8px;color:#1d4ed8;">5. 断线处理与可观测性</h3>
+<ul style="margin:0;padding-left:22px;">
+<li style="margin:6px 0;"><b>出口看门狗</b>：每 5 秒看一次，出口连续探测失败且 tun 上确实没有数据流动，才判定断开 → 自动重连；5 分钟内最多 3 次，超了就停手并把原因写进日志，不无限重连耗电。</li>
+<li style="margin:6px 0;"><b>日志落盘</b>：界面日志与文件同时写，退出、被杀、崩溃重启都还在；可一键复制、分享、清空（全 App 只有清空这一处会删日志）。</li>
+<li style="margin:6px 0;"><b>首页</b>：连接状态、连接时长、本机/出口 IP + 国旗 + 国家名、上下行实时速率与累计流量、隧道延迟、系统 VPN 是否真的起来、以及「最终出口是 Psiphon 还是 OpenVPN 节点」。</li>
+<li style="margin:6px 0;"><b>其它设置</b>：IPv6、MTU（默认 1280）、自定义 DNS、不下发 DNS、浅色/深色/跟随系统主题、日志自动滚动；「关于」里能看到 App 与引擎版本、内置账号状态、数据目录、日志路径。</li>
+</ul>
+
+<h2 style="font-size:20px;margin:34px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0;color:#0f172a;">二、还没做的</h2>
+
+<table style="width:100%;border-collapse:collapse;font-size:14px;margin:6px 0 4px;">
+<thead>
+<tr>
+<th style="text-align:left;padding:9px 10px;background:#f1f5f9;border:1px solid #e2e8f0;color:#334155;font-weight:600;">功能</th>
+<th style="text-align:left;padding:9px 10px;background:#f1f5f9;border:1px solid #e2e8f0;color:#334155;font-weight:600;">现在的状态</th>
+<th style="text-align:left;padding:9px 10px;background:#f1f5f9;border:1px solid #e2e8f0;color:#334155;font-weight:600;">为什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">VPN 模式下按域名分流</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">未做</span> 只能到 IP / CIDR 级</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">系统 VPN 只交出 IP 包，看不到域名；要做就得在 App 里做用户态 TCP 终止，QUIC/UDP 还是无解</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">桌面版那三档「全局 / 规则 / 直连」</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">未做</span> 安卓只有两档，「直连」等于断开</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">Android 上只有「建系统 VPN」或「不接管」两种接管方式，没有第三个 tun</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">规则 UI 增强（逐条增删、拖动排序、导入导出）</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#92400e;font-size:12px;">部分</span> 只有一个多行文本框</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">规则引擎已就绪，缺的是编辑界面</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">导出配置（.conf / mihomo YAML）</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">未做</span></td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">需要一个分享入口，暂时没排期</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">界面中英切换</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">未做</span> 只有中文</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">i18n 表还没建</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">健康守护 / 自动修复</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#92400e;font-size:12px;">部分</span> 只有服务内看门狗</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">桌面版靠独立守护进程，手机上会耗电、也会被系统杀，暂不做</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">开机自启</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">未做</span></td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">国产 ROM 对开机广播限制很多，收益不明显</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">系统全局 HTTP 代理</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#f1f5f9;color:#475569;font-size:12px;">故意不做</span></td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">要 <code style="background:#f1f5f9;padding:1px 4px;border-radius:3px;font-size:12px;">WRITE_SECURE_SETTINGS</code>（adb 授权），装完不能直接用</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">局域网代理的访问认证</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">未做</span></td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">SOCKS5 无认证，公共 Wi-Fi 下不要开</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">x86_64 / 模拟器</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:12px;">不支持</span></td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">包内只打了 arm64 + arm 的原生库</td>
+</tr>
+<tr>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">桌面专有项（开机自启、混合/API 端口、外部内核路径）</td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;"><span style="display:inline-block;padding:1px 8px;border-radius:999px;background:#f1f5f9;color:#475569;font-size:12px;">无对应物</span></td>
+<td style="padding:9px 10px;border:1px solid #e2e8f0;vertical-align:top;">这些是桌面上「多进程 + 独立内核」才需要的开关</td>
+</tr>
+</tbody>
+</table>
+
+<h2 style="font-size:20px;margin:34px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0;color:#0f172a;">三、用之前要知道的边界</h2>
+<ul style="margin:0;padding-left:22px;">
+<li style="margin:6px 0;"><b>VPN Gate 是志愿者节点</b>：实测只有约四成能完成握手，还有一批「握手成功但一个字节都不转发」的。所以连接时仍然要做出口验证，换点也仍然可能失败。</li>
+<li style="margin:6px 0;"><b>自报数据一概不信</b>：节点自报的速度、列表里的「延迟」都不作为判据，只信本机实测的握手耗时和下载吞吐。</li>
+<li style="margin:6px 0;"><b>仅代理模式不叠第二跳</b>：Psiphon 与 OpenVPN 出口都需要一个 tun fd，仅代理模式下这两项会置灰并写明原因。</li>
+<li style="margin:6px 0;"><b>「仅代理」的连接成功只是本地就绪</b>：代表端口在监听、出口可用，不代表别的 App 真的在用这个端口。</li>
+<li style="margin:6px 0;"><b>MTU</b>：普通模式 1280；OpenVPN 出口用 1160（外层还要被 WARP 封一次，1400 会拆包、翻倍加密开销）。</li>
+</ul>
+
+<h2 style="font-size:20px;margin:34px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0;color:#0f172a;">四、技术构成</h2>
+<p style="margin:0 0 8px;">界面是 Kotlin + Jetpack Compose（单 Activity、无第三方 UI 库）；网络部分是 Go 引擎编译成 AAR 塞进 APK：gVisor netstack 做用户态网络栈，wireguard-go 做 WireGuard / AmneziaWG，quic-go 做 MASQUE，psiphon-tunnel-core 做 Psiphon，再自带一个 OpenVPN 客户端。APK 约 65 MB，纯本地运行，没有账号系统、没有后台服务端。</p>
+
+<h2 style="font-size:20px;margin:34px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0;color:#0f172a;">五、下载与源码</h2>
+
+<!-- 发布前替换三处占位符：下载地址一 / 下载地址二 / github项目地址（href 与显示文字各一处） -->
+
+<table style="width:100%;border-collapse:collapse;font-size:14px;margin:6px 0 18px;">
+<tbody>
+<tr>
+<td style="width:34%;padding:11px 12px;border:1px solid #e2e8f0;background:#f8fafc;color:#334155;"><b>下载地址一</b><br><span style="font-size:12px;color:#94a3b8;">主下载</span></td>
+<td style="padding:11px 12px;border:1px solid #e2e8f0;"><a href="下载地址一" style="color:#1d4ed8;text-decoration:none;font-weight:600;word-break:break-all;">下载地址一</a></td>
+</tr>
+<tr>
+<td style="padding:11px 12px;border:1px solid #e2e8f0;background:#f8fafc;color:#334155;"><b>下载地址二</b><br><span style="font-size:12px;color:#94a3b8;">备用下载</span></td>
+<td style="padding:11px 12px;border:1px solid #e2e8f0;"><a href="下载地址二" style="color:#1d4ed8;text-decoration:none;font-weight:600;word-break:break-all;">下载地址二</a></td>
+</tr>
+<tr>
+<td style="padding:11px 12px;border:1px solid #e2e8f0;background:#f8fafc;color:#334155;"><b>GitHub</b><br><span style="font-size:12px;color:#94a3b8;">源码 / 更新</span></td>
+<td style="padding:11px 12px;border:1px solid #e2e8f0;"><a href="github项目地址" style="color:#1d4ed8;text-decoration:none;font-weight:600;word-break:break-all;">github项目地址</a></td>
+</tr>
+</tbody>
+</table>
+
+<p style="margin:0 0 6px;">安装包只打了 arm64 与 arm 的原生库，Android 8.0 及以上可用；安装时系统会要求允许「安装未知应用」。遇到连不上，先把日志页的内容复制出来，日志里连每一次尝试的节点 IP 和失败原因都写着。</p>
+
+<p style="margin:22px 0 0;padding-top:14px;border-top:1px solid #e2e8f0;color:#64748b;font-size:13px;">当前版本 v0.2.8。功能以设置页实际显示为准，未实现的项目在 App 里也照实标注了，不会放一个点了没反应的开关。</p>
+
+</div>

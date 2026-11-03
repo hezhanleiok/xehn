@@ -69,9 +69,9 @@ func Apply(c Config) {
 	// 「这条是内层隧道」，把普通会话的 UDP 塞进早已关闭的 netstack。
 	outer = nil
 	outerAcct = nil
-	// 新一次连接拿到的是新的 tun fd，接管标记必须归零：否则上一次的
-	// 「已被接管」会让这次的失败路径不敢关 fd，系统 VPN 又挂住。见 tunfd.go。
-	tunFDAdopted.Store(false)
+	// 系统 tun fd 的所有权已经统一交给 Kotlin 的 ParcelFileDescriptor（见
+	// tunfd_owner.go）：引擎不再持有「谁该关这个 fd」的状态，也就不需要在这里
+	// 重置任何标记。
 
 	if len(c.Ports) > 0 {
 		warpPorts = c.Ports

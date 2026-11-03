@@ -39,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.xiaohe.vpn.AppSettings
 import com.xiaohe.vpn.EngineBridge
+import com.xiaohe.vpn.NodeSpeedStore
 import com.xiaohe.vpn.PROTOCOLS
 import com.xiaohe.vpn.ProtoOption
 import com.xiaohe.vpn.R
@@ -61,6 +63,7 @@ import com.xiaohe.vpn.VpnGateNode
 import com.xiaohe.vpn.VpnState
 import com.xiaohe.vpn.countryDisplayName
 import com.xiaohe.vpn.flagEmoji
+import com.xiaohe.vpn.vpnGateNodeOrder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -241,6 +244,7 @@ fun SettingsScreen(
         var nodePicker by remember { mutableStateOf(false) }
         var nodeVersion by remember { mutableStateOf(0) }
         var refreshing by remember { mutableStateOf(false) }
+        var probing by remember { mutableStateOf(false) }
         val ovpnScope = rememberCoroutineScope()
         // nodeVersion 作为 key：刷新完成后强制重新读一次 JSON（节点列表在 Go 侧缓存里）。
         val nodes = remember(settings.openvpn, nodeVersion) {
@@ -253,11 +257,49 @@ fun SettingsScreen(
 
 
         if (nodePicker) {
+            // 探测进度：引擎每测完一个节点报一行「握手测试 37/98：…」，取最后一条显示。
+            // 一百个节点要一两分钟，只写「测试中…」会让人以为卡死了。
+            val engineState by EngineBridge.state.collectAsState()
+            val probeProgress = if (probing) {
+                engineState.logs.lastOrNull { it.contains("握手测试 ") }
+            } else null
             OpenVpnNodePicker(
                 nodes = nodes,
                 selectedCountry = settings.openvpnCountry,
                 selectedNodeId = settings.openvpnNodeId,
                 refreshing = refreshing,
+                probing = probing,
+                progress = probeProgress?.let { line ->
+                    val n = line.substringAfter("握手测试 ", "").substringBefore("：", "")
+                    if (n.isEmpty()) "" else "已测 $n"
+                } ?: "",
+                onProbe = {
+                    if (!probing) {
+                        probing = true
+                        ovpnScope.launch {
+                            val cc = settings.openvpnCountry
+                            // 当前范围内的**全部**节点都要测：原来只取前 40 个，剩下
+                            // 的既没结果也不显示状态，界面就退回写「自报」或裸延迟 ——
+                            // 用户看到的「一百来个节点里一大半没测」正是这个原因。
+                            // 引擎侧并发 6、单节点 10s：98 个最坏约 2.7 分钟，实际大多 1 分钟。
+                            val ids = nodes
+                                .sortedWith(vpnGateNodeOrder)
+                                .filter { cc.isEmpty() || it.cc == cc }
+                                .map { it.id }
+                            EngineBridge.note(
+                                "[ui] 开始测真实握手延迟：${ids.size} 个节点" +
+                                    (if (cc.isEmpty()) "（自动模式，测全部）" else "（地区 $cc）") +
+                                    "；只握手、不建系统 VPN，可能要 1–3 分钟"
+                            )
+                            withContext(Dispatchers.IO) {
+                                EngineBridge.testOpenVpnNodes(ctx, ids)
+                            }
+                            probing = false
+                            // 重读节点：新测到的延迟已并入排序与编号（家宽/机房仍分块）。
+                            nodeVersion++
+                        }
+                    }
+                },
                 onRefresh = {
                     if (!refreshing) {
                         refreshing = true
@@ -411,9 +453,12 @@ fun SettingsScreen(
         InfoRow("引擎", state.version.ifBlank { "—" })
         InfoRow("内置账号", if (state.accountBuiltIn) "已导入（assets/account.json）" else "未导入（连接时需联网注册）")
         InfoRow("数据目录", ctx.filesDir.absolutePath + "/engine")
+        // 日志一直写在这里，退出/崩溃/重启都不删；闪退后重开界面会把它读回来。
+        // 要排查问题直接取这个文件，比在界面上滚动复制完整。
+        InfoRow("日志文件", EngineBridge.logPath(ctx))
         InfoRow("系统 VPN", if (state.vpnUp) "已启用" else "未启用")
         Spacer(Modifier.height(8.dp))
-        ActionRow("清空日志", "只清界面上的日志，不影响连接") { onClearLogs() }
+        ActionRow("清空日志", "删除界面日志与日志文件（全 App 只有这一处会删）") { onClearLogs() }
 
         // ---------------- 分流规则 ----------------
         //
@@ -844,8 +889,10 @@ private fun slotOf(nodes: List<VpnGateNode>, node: VpnGateNode): String {
  * 节点选择器：国家一级、节点二级（点国家展开）。
  *
  * 「能用都保留」是明确的产品决定：不按家宽/机房过滤，也不用共享代理标记隐藏节点；
- * 标记只用于展示与排序（家宽 > 未知 > 机房）。延迟是实测 TCP 握手耗时，
- * 没测到（UDP 节点/超时）时显示自报 ping 并加“自报”字样，不假装是实测值。
+ * 标记只用于展示与排序（家宽 > 未知 > 机房）。每行显示的是「测延迟」测出的
+ * **真实 OpenVPN 握手**结果（握手 NNNms / 握手失败）；没测过就写「未测」，
+ * 不回退到列表里那个 TCP 连接时间或节点自报 ping —— 它们跟能不能握手无关，
+ * 写出来反而让人分不清「没测」和「测了不行」。
  */
 @Composable
 private fun OpenVpnNodePicker(
@@ -853,7 +900,11 @@ private fun OpenVpnNodePicker(
     selectedCountry: String,
     selectedNodeId: String,
     refreshing: Boolean,
+    probing: Boolean,
+    /** 探测进度（如「37/98」）；空 = 还没有进度可显示。 */
+    progress: String,
     onRefresh: () -> Unit,
+    onProbe: () -> Unit,
     onPickAuto: () -> Unit,
     onPickCountry: (String) -> Unit,
     onPickNode: (VpnGateNode, String) -> Unit,
@@ -861,8 +912,12 @@ private fun OpenVpnNodePicker(
 ) {
     var expanded by remember { mutableStateOf(selectedCountry) }
     val groups = remember(nodes) {
-        nodes.groupBy { it.cc }.entries
-            .sortedBy { e -> e.value.minOf { it.displayLatencyMs.takeIf { l -> l > 0 } ?: 999_999 } }
+        nodes.groupBy { it.cc }.entries.sortedBy { e ->
+            // 排在最前的是「真能握手、而且最快」的国家；没测过的按老办法（TCP 时间）
+            // 排在后面 —— 测过之后列表顺序才跟「实际能连」对得上。
+            e.value.filter { it.hasProbe && it.handshakeOk }.minOfOrNull { it.handshakeMs }
+                ?: (999_999 + e.value.minOf { it.displayLatencyMs.takeIf { l -> l > 0 } ?: 999_999 })
+        }
     }
 
     AlertDialog(
@@ -870,7 +925,13 @@ private fun OpenVpnNodePicker(
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("出口地区", modifier = Modifier.weight(1f))
-                TextButton(onClick = onRefresh, enabled = !refreshing) {
+                // 「测延迟」= 对节点做一次**真实 OpenVPN 握手**（只握手，不建系统 VPN）。
+                // 列表里那个延迟只是 api 域名的 TCP 连接时间，节点多得国家看着都快、
+                // 实际握不上 —— 这个按钮就是为了把这种假延迟筛掉。
+                TextButton(onClick = onProbe, enabled = !probing && !refreshing && nodes.isNotEmpty()) {
+                    Text(if (probing) "测试中…" else "测延迟")
+                }
+                TextButton(onClick = onRefresh, enabled = !refreshing && !probing) {
                     Text(if (refreshing) "刷新中…" else "刷新")
                 }
             }
@@ -881,6 +942,15 @@ private fun OpenVpnNodePicker(
                     .heightIn(max = 460.dp)
                     .verticalScroll(rememberScrollState())
             ) {
+                if (probing) {
+                    Text(
+                        "正在测真实握手（只握手、不建 VPN）：" + progress.ifEmpty { "建 WARP 上游…" } +
+                            "；测完会按握手耗时重排，期间可以关掉这个窗口",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 4.dp),
+                    )
+                }
                 RegionRow("自动选择（按延迟/可用性）", if (selectedCountry.isEmpty()) "✓" else "") {
                     onPickAuto()
                 }
@@ -894,6 +964,10 @@ private fun OpenVpnNodePicker(
                 }
                 groups.forEach { (cc, list) ->
                     val open = expanded == cc
+                    // 国家行的小结也要说人话：测过就报「几个能握手」，没测过才退回
+                    // 「几个有响应」（那个只是 api 域名的 TCP 时间，不代表节点活着）。
+                    val shakeOk = list.count { it.hasProbe && it.handshakeOk }
+                    val probed = list.count { it.hasProbe }
                     val responded = list.count { it.latencyMs > 0 }
                     Row(
                         Modifier
@@ -909,7 +983,11 @@ private fun OpenVpnNodePicker(
                         )
                         Text(
                             "${list.size} 个" +
-                                (if (responded > 0) " · $responded 有响应" else "") +
+                                when {
+                                    probed > 0 -> " · $shakeOk 能握手"
+                                    responded > 0 -> " · $responded 有响应"
+                                    else -> ""
+                                } +
                                 (if (cc == selectedCountry && selectedNodeId.isEmpty()) " ✓" else ""),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -927,13 +1005,9 @@ private fun OpenVpnNodePicker(
                         // 变成 JP未知01、JP家宽01、JP未知02 这种读不懂的序列。类别优先级
                         // 与产品口径一致（家宽 > 未知 > 机房），块内仍是最快在前。
                         val slots = HashMap<String, Int>()
-                        list.sortedWith(
-                            compareBy(
-                                { classRankOf(it.cls) },
-                                { if (it.hasMeasuredLatency) 0 else 1 },
-                                { it.latencyMs.takeIf { l -> l > 0 } ?: it.pingMs },
-                            )
-                        ).forEach { n ->
+                        // 与连接时的候选顺序、编号算法共用同一套排序（vpnGateNodeOrder）：
+                        // 各自写一套的话，用户看到的「JP家宽03」就不是他实际连的那个。
+                        list.sortedWith(vpnGateNodeOrder).forEach { n ->
                             val cls = classKeyOf(n.cls)
                             val next = (slots[cls] ?: 0) + 1
                             slots[cls] = next
@@ -975,14 +1049,34 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
             },
         )
         Spacer(Modifier.weight(1f))
+        // 只显示真握手结果（用户要的就是「真延迟」），没测过就写「未测」。
+        // 握手失败的标红 —— 那种节点端口是开的、看着有延迟，实际连不上。
+        val probeLabel: String
+        val probeColor: androidx.compose.ui.graphics.Color
+        when {
+            n.hasProbe && n.handshakeOk -> {
+                // 实测过的速度也写在行里：用户问过「到底有没有测速」，光有握手
+                // 耗时看不出「这个节点连上能跑多快」，而那正是选节点最关心的事。
+                probeLabel = "握手 ${n.handshakeMs}ms" +
+                    if (n.measuredBps > 0) " · ${NodeSpeedStore.text(n.measuredBps)}" else ""
+                probeColor = MaterialTheme.colorScheme.onSurface
+            }
+            n.hasProbe -> {
+                probeLabel = "握手失败"
+                probeColor = MaterialTheme.colorScheme.error
+            }
+            // 没测过就写「未测」：不再回退到那个 TCP 时间或节点自报的 ping。
+            // 它们跟能不能握手无关（实测 193ms 的美国节点三个全死），写出来只会
+            // 让人以为「看着挺快却没结果」，分不清到底是没测还是测了不行。
+            else -> {
+                probeLabel = "未测"
+                probeColor = MaterialTheme.colorScheme.onSurfaceVariant
+            }
+        }
         Text(
-            when {
-                n.latencyMs > 0 -> "${n.latencyMs}ms"
-                n.pingMs > 0 -> "${n.pingMs}ms 自报"
-                else -> "未测"
-            },
+            probeLabel,
             style = MaterialTheme.typography.labelSmall,
-            color = if (n.latencyMs > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+            color = probeColor,
         )
         if (selected) {
             Text(

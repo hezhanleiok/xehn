@@ -93,7 +93,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         // 引擎要在 UI 出现前就建好，否则首帧拿不到 version / 日志。
+        // engineOrCreate 里顺带装上「日志落盘 + 未捕获异常兜底」。
         EngineBridge.engineOrCreate(this)
+        // 启动标记：不只是方便对照版本，更重要是判断「上次是不是被崩溃/系统杀掉的」
+        // —— 闪退本身不留痕迹，这条日志是唯一能自己开口的证据。
+        CrashGuard.markStart(this, "UI")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             requestNotifications.launch(android.Manifest.permission.POST_NOTIFICATIONS)

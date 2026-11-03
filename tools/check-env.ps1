@@ -29,10 +29,20 @@ function EnvVal([string]$name) {
 # gomobile 装在 GOPATH\bin 下，那个目录常常不在 PATH 里。
 function ResolveTool([string]$name) {
     if (Have $name) { return (Get-Command $name).Source }
+    # $gobin 可能是空串（没装 go），Join-Path 空路径会抛参数校验错，
+    # 把整段检查打成一串红色报错 —— 先判空再拼。
+    $dirs = @()
     $gobin = ''
     if (Have go) { $gobin = (& go env GOPATH) + '\bin' }
-    foreach ($cand in @((Join-Path $gobin "$name.exe"), (Join-Path $env:USERPROFILE "go\bin\$name.exe"))) {
-        if ($cand -and (Test-Path $cand)) { return $cand }
+    if ($gobin) { $dirs += $gobin }
+    # GOPATH 也可能被指到别处（本项目用 D:\soft\gopath），三种都试一遍。
+    foreach ($g in @((EnvVal 'GOBIN'), (EnvVal 'GOPATH'))) {
+        if ($g) { $dirs += (Join-Path $g 'bin') }
+    }
+    if ($env:USERPROFILE) { $dirs += (Join-Path $env:USERPROFILE 'go\bin') }
+    foreach ($d in $dirs) {
+        $cand = Join-Path $d "$name.exe"
+        if (Test-Path $cand) { return $cand }
     }
     return ''
 }

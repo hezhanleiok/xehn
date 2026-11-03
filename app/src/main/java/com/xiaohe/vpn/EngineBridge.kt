@@ -34,11 +34,21 @@ object EngineBridge {
 
     private var engine: Engine_? = null
 
+    /** 进程级 Application Context，只给日志落盘用（不要拿它做别的事）。 */
+    @Volatile
+    private var appCtx: Context? = null
+
     private val _state = MutableStateFlow(VpnState())
     val state: StateFlow<VpnState> = _state.asStateFlow()
 
     fun engineOrCreate(context: Context): Engine_ {
         engine?.let { return it }
+        val appCtx = context.applicationContext
+        this.appCtx = appCtx
+        // 落盘日志 + 崩溃兜底必须在引擎产出第一行日志之前装好：引擎一构造就会
+        // 开始写 conn/session 日志，晚一步就丢掉开头（而开头往往才是关键）。
+        VpnLog.file(appCtx)
+        CrashGuard.install(appCtx)
         val dir = File(context.filesDir, "engine").apply { mkdirs() }
         val e = Engine_(dir.absolutePath)
         // 内置账号（assets/account.json）：有它就不必联网注册。在
@@ -63,6 +73,7 @@ object EngineBridge {
 
         e.setLogSink(object : LogSink {
             override fun onLog(line: String) {
+                VpnLog.append(appCtx, line)
                 _state.value = _state.value.copy(logs = (_state.value.logs + line).takeLast(LOG_KEEP))
                 refresh(e)
             }
@@ -72,6 +83,10 @@ object EngineBridge {
             version = e.versionString(),
             mtu = e.mtu().toInt(),
             accountBuiltIn = builtIn,
+            // 上次运行留下的日志直接灌回界面：崩溃/被杀之后重开，能看的就是这份。
+            // 只有用户点「清空日志」才会删文件（见 clearLogs），代码里没有任何
+            // 自动清理路径 —— 这是明确要求。
+            logs = VpnLog.readLast(appCtx, LOG_KEEP),
         )
         return e
     }
@@ -165,6 +180,7 @@ object EngineBridge {
         // 实测速度记忆在 Kotlin 侧（见 NodeSpeedStore）：引擎那份节点 JSON 里没有
         // 这个字段，读的时候按 id 贴上去 —— 排序与界面看到的是同一份数据。
         val speeds = NodeSpeedStore.snapshot(context)
+        val probes = NodeProbeStore.snapshot(context)
         buildList {
             for (i in 0 until arr.length()) {
                 val n = arr.optJSONObject(i) ?: continue
@@ -187,6 +203,9 @@ object EngineBridge {
                         isp = n.optString("isp"),
                         asn = n.optString("as"),
                         measuredBps = speeds[n.optString("id")] ?: 0L,
+                        handshakeMs = probes[n.optString("id")]?.ms ?: 0,
+                        handshakeOk = probes[n.optString("id")]?.ok ?: false,
+                        hasProbe = probes.containsKey(n.optString("id")),
                     )
                 )
             }
@@ -209,6 +228,59 @@ object EngineBridge {
         "刷新失败：${t.message}"
     }
 
+    /** 一条「真实 OpenVPN 握手」测试结果。 */
+    data class NodeProbeResult(val id: String, val ms: Int, val ok: Boolean, val error: String)
+
+    /**
+     * 对给定节点做**真实 OpenVPN 握手**测试并把结果落盘（阻塞，几秒到两三分钟）。
+     *
+     * 为什么要专门测：列表里显示的延迟是 api 域名的 TCP 连接时间，跟这个节点
+     * 能不能握手、握手多久无关。2026-11-01 真机：显示 193~214ms 的三个美国节点
+     * 全部连不上，而 JP/KR 节点多的国家能连上 —— 只有真握手能分辨。
+     *
+     * 必须在 IO 线程调用；引擎侧并发 6，单个节点最多 10 秒（100 个最坏约 3 分钟）。
+     */
+    fun testOpenVpnNodes(context: Context, ids: List<String>): List<NodeProbeResult> {
+        if (ids.isEmpty()) return emptyList()
+        val raw = try {
+            engineOrCreate(context).testOpenVPNNodes(ids.joinToString(","))
+        } catch (t: Throwable) {
+            note("[ui] 握手测速调用失败：${t.message}")
+            return emptyList()
+        }
+        val out = ArrayList<NodeProbeResult>(ids.size)
+        try {
+            val o = JSONObject(raw)
+            if (!o.optBoolean("ok", false)) {
+                note("[ui] 握手测速失败：${o.optString("error", "未知原因")}")
+                return emptyList()
+            }
+            val arr = o.optJSONArray("results") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                out.add(
+                    NodeProbeResult(
+                        id = r.optString("id"),
+                        ms = r.optInt("ms", 0),
+                        ok = r.optBoolean("ok", false),
+                        error = r.optString("error"),
+                    )
+                )
+            }
+        } catch (t: Throwable) {
+            note("[ui] 握手测速结果解析失败：${t.message}")
+            return emptyList()
+        }
+        val now = System.currentTimeMillis()
+        NodeProbeStore.rememberAll(
+            context,
+            out.map { it.id to NodeProbeStore.Probe(it.ms, it.ok, now) },
+        )
+        val ok = out.count { it.ok }
+        note("[ui] 握手测速完成：${out.size} 个节点里 $ok 个能握手（结果已用于排序）")
+        return out
+    }
+
     /**
      * 选择出口候选节点（按尝试顺序，逗号分隔的 ID）。
      *
@@ -220,15 +292,26 @@ object EngineBridge {
     }
 
 
-    /** UI 侧记录一行日志，与引擎日志同一条流。 */
+    /** UI 侧记录一行日志，与引擎日志同一条流（同样落盘）。 */
     fun note(line: String) {
+        appCtx?.let { VpnLog.append(it, line) }
         _state.value = _state.value.copy(logs = (_state.value.logs + line).takeLast(LOG_KEEP))
     }
 
-    /** 清空日志面板。 */
+    /**
+     * 清空日志：面板 + 磁盘文件一起删。
+     *
+     * 这是**唯一**会删日志的入口（用户手点）。退出 App、断开重连、重新启动进程
+     * 都不删 —— 闪退后重开还能看到上一条连接到底走到哪一步。
+     */
     fun clearLogs() {
+        appCtx?.let { VpnLog.clear(it) }
         _state.value = _state.value.copy(logs = emptyList())
+        appCtx?.let { VpnLog.append(it, "[ui] 日志已手动清空") }
     }
+
+    /** 日志文件路径：出错时让用户直接把这个文件发出来。 */
+    fun logPath(context: Context): String = VpnLog.file(context).absolutePath
 
     /** 复制一份日志给用户贴给别人排查（引擎 + UI 混在一起，正是要看的东西）。 */
     fun logsText(): String = _state.value.logs.joinToString("\n")
@@ -331,6 +414,15 @@ data class VpnGateNode(
      * 不用来决定「能不能用」—— 能用都保留是明确的产品决定。
      */
     val measuredBps: Long = 0L,
+    /**
+     * **真实 OpenVPN 握手**耗时（ms，0 = 没测过）。来自「测延迟」按钮，
+     * 见 [NodeProbeStore]。列表里那个 `pingMs` 只是 TCP 连接时间，不代表能握手。
+     */
+    val handshakeMs: Int = 0,
+    /** 上一次真实握手是否成功（配合 [hasProbe] 使用）。 */
+    val handshakeOk: Boolean = false,
+    /** 是否有过真实握手记录（成功或失败都算）。 */
+    val hasProbe: Boolean = false,
 ) {
     /** 实测优先；没有实测时退回自报 ping（界面会用不同颜色标注）。 */
     val displayLatencyMs: Int get() = if (latencyMs > 0) latencyMs else pingMs
@@ -343,6 +435,44 @@ data class VpnGateNode(
         else -> "未知"
     }
 }
+
+/** 节点排序里「真握手」的分档：通 < 没测过 < 失败。 */
+private fun probeRankOf(n: VpnGateNode): Int = when {
+    !n.hasProbe -> 1
+    n.handshakeOk -> 0
+    else -> 2
+}
+
+/**
+ * 节点排序的**唯一来源**：连接时的候选顺序、设置页的编号（JP家宽03）都用它。
+ *
+ * 拆出来是因为两处必须完全一致：编号是按「排好序的列表」数出来的，如果连接时
+ * 换了另一套顺序，用户看到的「JP家宽03」就不是他实际连的那个。
+ *
+ * 层次：家宽 → 未知 → 机房；真握手通 → 没测过 → 握手失败；
+ * **实测吞吐档（快 → 没测过 → 慢）**，同档内按实测速度降序；
+ * 最后才用握手指耗时与列表里那个 TCP 延迟兜底。
+ *
+ * 为什么吞吐要排在握手耗时前面：握手只证明「能连」，不证明「能跑」。
+ * 0.2.9 把吞吐排在最后，结果所有实测过的节点都进了「慢」档（地板 150 KB/s
+ * 谁都过不了），排序反而把**没测过的**节点顶到前面 —— 用户选「日本自动」，
+ * 系统就一路去赌没测过的节点，连上只有 0.x 兆。用户的要求很明确：
+ * 自动的时候优先选最快的那个，而不是「看起来最近的那个」。
+ */
+internal val vpnGateNodeOrder: Comparator<VpnGateNode> =
+    compareBy<VpnGateNode> {
+        when (it.cls) {
+            "residential" -> 0
+            "unknown", "degraded" -> 1
+            else -> 2
+        }
+    }
+        .thenBy { probeRankOf(it) }
+        .thenBy { NodeSpeedStore.tier(it.measuredBps) }
+        .thenByDescending { it.measuredBps }
+        .thenBy { if (it.hasProbe && it.handshakeOk) it.handshakeMs else 0 }
+        .thenBy { if (it.hasMeasuredLatency) 0 else 1 }
+        .thenBy { it.latencyMs.takeIf { l -> l > 0 } ?: it.pingMs }
 
 /** 从 assets 读一个文本文件；不存在或读失败都返回 null（不抛）。 */
 private fun readAsset(context: Context, name: String): String? = try {
