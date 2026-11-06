@@ -39,9 +39,34 @@ func (b *deviceBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		return nil, 0, err
 	}
 	c := pc.(*net.UDPConn)
+	tuneUDPBuffers(c)
 	b.conn = c
 	actual := uint16(c.LocalAddr().(*net.UDPAddr).Port)
 	return []conn.ReceiveFunc{b.receive}, actual, nil
+}
+
+// tuneUDPBuffers 把隧道 UDP socket 的内核收发缓冲拉大。
+//
+// 这是 WG/AWG 下行吞吐最便宜的一处提升：Android 给 UDP socket 的默认 rmem 只有
+// 200 KB 量级，而这条 socket 要同时装「下行的全部密文包」。手机基带突发下行
+// （几百 Mbps 的瞬时 burst）几百毫秒就能把它填满，之后内核直接丢包 —— 丢了就是
+// wireguard-go 看到的重传，走的是 TCP 拥塞退避，用户看到的是「速度上不去、还抖」。
+// 缓冲设大以后同一段突发能先存住再慢慢处理。
+//
+// 拿不到更大值时不报错：非 root 最多只能到 net.core.rmem_max，按系统上限跑即可。
+func tuneUDPBuffers(c *net.UDPConn) {
+	const want = 8 << 20
+	for _, sz := range []int{want, 4 << 20, 1 << 20} {
+		if err := c.SetReadBuffer(sz); err == nil {
+			break
+		}
+	}
+	// 发送侧不需要那么大（上行突发小得多），但 4 MB 足够吸收积压。
+	for _, sz := range []int{4 << 20, 1 << 20} {
+		if err := c.SetWriteBuffer(sz); err == nil {
+			break
+		}
+	}
 }
 
 func (b *deviceBind) receive(bufs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {

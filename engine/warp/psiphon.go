@@ -37,10 +37,18 @@ import (
 // Psiphon 自己的 socket 被 BindingToDevice 排除出系统 VPN 后连到 127.0.0.1，
 // 环回不进 tun，所以不会绕回自己。
 
-// psiphonUnderlaySocks 是基础协议隧道为 Psiphon 暴露的本地 SOCKS 端口。
-// 不能用 1080：那是（netstack 模式下）给用户自测用的常规入口，而且 Psiphon
-// 自己也会占用一个端口，两个监听撞一起会让「谁是谁」彻底说不清。
-const psiphonUnderlaySocks = "127.0.0.1:1081"
+// psiphonUnderlayListen 是基础协议隧道为 Psiphon 暴露的本地 SOCKS 地址。
+//
+// 端口必须写 0，让内核分配一个空闲端口。以前钉死 1081，结果是一整类「赛风
+// 连不上」的现场：上一次会话的监听还没收干净（或者别的进程正好占着 1081）时，
+// bind 失败只写一行日志就继续，于是 Psiphon 的 UpstreamProxyURL 指向一个
+// 没有监听（或指向别人的监听）的端口，tunnel-core 就一遍遍地拨它、一遍遍地
+// 失败 —— 日志里只有一堆 meek/TLS 错误，看不出根因是本地端口。
+// 每次拨号都开新的临时端口，这类冲突就彻底消失了。
+//
+// 不用 1080：那是（netstack 模式下）给用户自测用的常规入口，两个监听撞一起
+// 会让「谁是谁」彻底说不清。
+const psiphonUnderlayListen = "127.0.0.1:0"
 
 // psiphonNetworkID 是给 tunnel-core 的「当前网络标识」。官方接口要求必须始终
 // 返回一个值（取不到就 "UNKNOWN"），因为用它的逻辑（含 tactics）无论如何都要
@@ -500,6 +508,23 @@ func startPsiphon(ctx context.Context, o PsiphonOptions, underlaySocks string, r
 	return ex, nil
 }
 
+// underlayProtos 给出 Psiphon 上游要按顺序试的协议。
+//
+// 用户选的协议先试；它没建起来就自动退到 AmneziaWG —— 这台网络里唯一
+// 「加了混淆、能过 DPI」的传输。真机日志里的典型现场：wg 的 6 个端点全部
+// 「握手成功但数据面不通」（握手能过、数据一到就被掐），Psiphon 因此一个隧道
+// 都起不来，而同一时刻 awg 是通的。不自动退的话，用户看到的就是「赛风永远连
+// 不上」，还得自己去猜要换协议 —— 这不该由用户来猜。
+func underlayProtos(proto string) []string {
+	if proto == "" {
+		proto = protoAWG
+	}
+	if proto == protoAWG {
+		return []string{protoAWG}
+	}
+	return []string{proto, protoAWG}
+}
+
 // DialPsiphon establishes "underlay tunnel + in-process Psiphon exit" and makes
 // one real exit measurement through the Psiphon SOCKS.
 //
@@ -509,39 +534,54 @@ func DialPsiphon(ctx context.Context, o PsiphonOptions) (*Session, error) {
 		o.UnderlayProto = protoAWG
 	}
 	deadline := time.Now().Add(psiphonTotalBudget)
-	skip := ""
-	tried := 0
+	protos := underlayProtos(o.UnderlayProto)
 	var lastErr error
-	for attempt := 1; attempt <= psiphonMaxAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	tried := 0
+	for pi, proto := range protos {
+		o.UnderlayProto = proto
+		skip := ""
+		perProto := 0
+		for attempt := 1; attempt <= psiphonMaxAttempts; attempt++ {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			tried++
+			perProto++
+			sess, used, err := dialPsiphonOnce(ctx, o, skip, remaining)
+			if err == nil {
+				return sess, nil
+			}
+			lastErr = err
+			// 只有「上游不稳」值得换端点重试。地区不提供、缺 client.config、
+			// Psiphon 服务器一个都连不上 —— 换端点不会有任何区别。
+			if !errors.Is(err, errUnderlayUnstable) {
+				break
+			}
+			// 下一次跳过刚死掉的端点：同一个端点再试，大概率还是一样。
+			skip = used
+			if attempt == psiphonMaxAttempts {
+				break
+			}
+			o.report(fmt.Sprintf("第 %d 次叠加没稳住，换一个上游端点再试…", perProto))
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
+		if lastErr != nil && !errors.Is(lastErr, errUnderlayUnstable) {
+			// 硬错误（缺 client.config、地区不提供、Psiphon 侧起不来）：换协议
+			// 不会有任何区别，别再白等一轮。
+			return nil, fmt.Errorf("（共试了 %d 次上游）%w", tried, lastErr)
 		}
-		tried++
-		sess, used, err := dialPsiphonOnce(ctx, o, skip, remaining)
-		if err == nil {
-			return sess, nil
+		if pi+1 < len(protos) {
+			o.report(fmt.Sprintf("Psiphon 上游（%s）没建起来：%v；改用 %s 再试…",
+				proto, lastErr, protos[pi+1]))
 		}
-		lastErr = err
-		// 只有「上游不稳」值得换端点重试。地区不提供、缺 client.config、
-		// Psiphon 服务器一个都连不上 —— 换端点不会有任何区别，直接报。
-		if !errors.Is(err, errUnderlayUnstable) {
-			return nil, err
-		}
-		// 下一次跳过刚死掉的端点：同一个端点再试，大概率还是一样。
-		skip = used
-		if attempt == psiphonMaxAttempts {
-			break
-		}
-		o.report(fmt.Sprintf("第 %d 次叠加没稳住，换一个上游端点再试…", attempt))
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("预算 %s 内没等到可用的上游", psiphonTotalBudget)
 	}
-	return nil, fmt.Errorf("%w（共试了 %d 个上游端点）%s", lastErr, tried, underlayHint(o.UnderlayProto))
+	return nil, fmt.Errorf("%w（共试了 %d 次上游）%s", lastErr, tried, underlayHint(o.UnderlayProto))
 }
 
 // dialPsiphonOnce 是一次完整的「拨上游 → 叠加 Psiphon → 出口实测」。
@@ -556,6 +596,11 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	// 这里必须走 Dial 而不是直接调某个具体拨号函数：Dial 才做协议分派，也才会
 	// 调 Options.fill() 补默认值。踩过：直接调 dialWGTunnel 时 Ports 是空的，
 	// 一个候选都不试就报「0 次尝试都没握手成功」——Psiphon 开着时连 WG 都连不上。
+	// 单次尝试不能吃掉全部预算：外面还有「换端点 / 换协议」的重试（见 DialPsiphon）。
+	budget := o.Budget
+	if budget <= 0 || (remaining > 0 && remaining < budget) {
+		budget = remaining
+	}
 	savedTunFD := tunFD
 	tunFD = 0 // 系统 tun fd 这一轮归 Psiphon 的 packet tunnel，上游退成 netstack
 	under, err := Dial(ctx, Options{
@@ -567,18 +612,31 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 		Sample:           2,
 		HandshakeTimeout: o.HandshakeTimeout,
 		VerifyTimeout:    o.VerifyTimeout,
-		Budget:           o.Budget,
-		SocksListen:      psiphonUnderlaySocks,
+		Budget:           budget,
+		SocksListen:      psiphonUnderlayListen,
+		// 这个端口是 Psiphon 唯一的上游入口：bind 失败必须让整次尝试失败，
+		// 否则隧道看起来通了、Psiphon 却一个字节也发不出去。
+		SocksRequired: true,
 		// 上游只有一个本地 SOCKS 端口，不能并发拨号（见 Options.NoHedge）。
 		NoHedge: true,
 		Report:  o.Report,
 	})
 	tunFD = savedTunFD
 	if err != nil {
-		return nil, "", fmt.Errorf("Psiphon 上游（%s）建立失败: %w", underlayProto, err)
+		// 上游建不起来大多是「这个端点 / 这个协议在这张网里过不去」，值得换端点
+		// 甚至换协议再试 —— 这正是「赛风一直连不上」最常见的根因。
+		return nil, "", fmt.Errorf("%w: Psiphon 上游（%s）建立失败: %v",
+			errUnderlayUnstable, underlayProto, err)
 	}
 	used := under.Endpoint
-	o.report(fmt.Sprintf("上游就绪（%s 出口 %s），叠加 Psiphon…", underlayProto, under.ExitIP))
+	upSocks := under.SocksAddr()
+	if upSocks == "" {
+		under.Close()
+		return nil, used, fmt.Errorf("%w: 上游隧道握手成功但本地 SOCKS 端口没起来（Psiphon 没有可用载体）",
+			errUnderlayUnstable)
+	}
+	o.report(fmt.Sprintf("上游就绪（%s 出口 %s，本地 SOCKS %s），叠加 Psiphon…",
+		underlayProto, under.ExitIP, upSocks))
 
 	// 上游看门狗：这是 WG + Psiphon「等很久才失败」的根因。
 	//
@@ -589,7 +647,6 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	//
 	// 这里每 6s 经上游自己的 SOCKS 探一次；连续 2 次不通就中止叠加，并把原因
 	// 直接写进错误里。成功路径零代价（探测在后台，不阻塞 Psiphon 启动）。
-	upSocks := under.SocksAddr()
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
 	var underlayDead atomic.Bool

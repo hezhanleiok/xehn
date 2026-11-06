@@ -362,8 +362,11 @@ class WarpVpnService : VpnService() {
                     e.disconnect()
                     e.setVPNState(false)
                 }
-                closeTun()
                 EngineBridge.refresh(e)
+                // 异常路径同样要把 tun 关掉，否则系统 VPN 会一直挂着。
+                closeTun()
+                stopForegroundCompat()
+                stopSelf()
             }
             updateNotification()
         }
@@ -402,7 +405,21 @@ class WarpVpnService : VpnService() {
             // 关的时候必须显式清空，否则上一次选中的节点会留在引擎里，下一次
             // 「关着 OpenVPN」的连接仍然走节点（最难查的那种残留）。
             e.setOpenVPNExit("", "", "")
-            connectSafely(e, proto, endpointExtra, psiphon, s)
+            if (!connectSafely(e, proto, endpointExtra, psiphon, s)) {
+                teardownAfterFailure("引擎拒绝这次连接（状态未就绪）")
+                return
+            }
+            // 这条路（psiphon / masque / wwarp / wg / awg）的系统 VPN 是**连接前**
+            // 就建好的（见 startConnect 的第 2 步），所以失败时也必须在这里收掉：
+            // 引擎只会把状态打成 error，它碰不到 tun fd（fd 归 ParcelFileDescriptor），
+            // 不收的表现就是「界面显示连接失败，系统 VPN 图标却一直亮着」。
+            val state = awaitConnectOutcome(e)
+            if (state == "connected") return
+            if (state == "idle" || state == "stopping") {
+                EngineBridge.note("[vpn] 连接已取消")
+                return
+            }
+            teardownAfterFailure("连接失败（引擎状态 $state）")
             return
         }
 
@@ -425,31 +442,27 @@ class WarpVpnService : VpnService() {
             }
             val ranked = pickOpenVPNCandidates(s, nodes)
             if (ranked.isEmpty()) {
-                EngineBridge.note(
-                    "[vpn] 没有可用的 OpenVPN 节点（节点列表为空、地区无节点或选中节点已失效），" +
+                e.setOpenVPNExit("", "", "")
+                teardownAfterFailure(
+                    "没有可用的 OpenVPN 节点（节点列表为空、地区无节点或选中节点已失效），" +
                         "请到设置 → OpenVPN 出口里刷新或重选"
                 )
-                e.setOpenVPNExit("", "", "")
-                e.setVPNState(false)
-                EngineBridge.refresh(e)
-                stopForegroundCompat()
-                stopSelf()
                 return
             }
             val first = ranked.firstOrNull { it.id !in tried }
             if (first == null) {
-                EngineBridge.note(
+                teardownAfterFailure(
                     if (pinnedId.isNotEmpty()) {
-                        "[vpn] 固定节点连接失败，本次不再自动换别的节点（你可以换一个固定节点或改回自动）"
+                        "固定节点连接失败，本次不再自动换别的节点（你可以换一个固定节点或改回自动）"
                     } else {
-                        "[vpn] 本次试过的 ${tried.size} 个节点都失败了，停止重试（失败的节点 10 分钟内不再尝试）"
+                        "本次试过的 ${tried.size} 个节点都失败了，停止重试（失败的节点 10 分钟内不再尝试）"
                     }
                 )
                 return
             }
             if (attempts >= OPENVPN_MAX_TRIES) {
-                EngineBridge.note(
-                    "[vpn] 本次已试 $attempts 个节点都没成功，先停在这里" +
+                teardownAfterFailure(
+                    "本次已试 $attempts 个节点都没成功，先停在这里" +
                         "（每次点击最多试 $OPENVPN_MAX_TRIES 个，避免反复建系统 VPN 把进程搞死）"
                 )
                 return
@@ -481,6 +494,10 @@ class WarpVpnService : VpnService() {
                     return
                 }
                 EngineBridge.note("[vpn] 这个节点没连上，换下一个…")
+                // 上一次可能已经 establish 过（握手成功、随后掉线）：先把 tun 关掉，
+                // 再让下一次的 TunProvider 用新地址重新建，别让旧 tun 挂着。
+                EngineBridge.peek()?.let { runCatching { it.setVPNState(false) } }
+                closeTun()
                 continue
             }
 
@@ -1111,8 +1128,10 @@ class WarpVpnService : VpnService() {
                     attempts = 0
                 }
                 if (attempts >= RECOVER_MAX) {
-                    EngineBridge.note(
-                        "[vpn] 5 分钟内已自动重连 $attempts 次仍不稳定，停止自动重试" +
+                    // 停止重试 = 放弃这条连接：系统 VPN 也必须一起收掉，
+                    // 否则留下一个「图标亮着、一个包都不通」的假连接。
+                    teardownAfterFailure(
+                        "5 分钟内已自动重连 $attempts 次仍不稳定，停止自动重试" +
                             "（建议手动断开后重连，或把协议换成 AmneziaWG）"
                     )
                     break
@@ -1138,6 +1157,30 @@ class WarpVpnService : VpnService() {
                 )
             }
         }
+    }
+
+    /**
+     * 连接失败的收尾：断开引擎 → 关 tun（= 系统 VPN 消失）→ 停前台服务。
+     *
+     * 为什么必须这么做：VPN 模式（psiphon / masque / wwarp / wg / awg）的系统 VPN 是
+     * 在 `connect()` **之前**建立的，而引擎只把会话状态打成 `error` —— 它碰不到
+     * tun fd（fd 归 Kotlin 的 ParcelFileDescriptor）。不在这里收，用户看到的就是
+     * 「连接失败，系统 VPN 却一直连着」，所有流量继续流进一个没人读的 tun。
+     *
+     * 与 [shutdown] 的区别：这里**不取消** connectJob（调用点就在这个协程里，
+     * 取消自己会在下一个挂起点抛 CancellationException），也不写「正常退出」标记。
+     */
+    private fun teardownAfterFailure(reason: String) {
+        EngineBridge.note("[vpn] $reason；关闭系统 VPN（失败不留残留）")
+        EngineBridge.peek()?.let { engine ->
+            runCatching { engine.disconnect() }
+            runCatching { engine.setVPNState(false) }
+            EngineBridge.refresh(engine)
+        }
+        closeTun()
+        updateNotification()
+        stopForegroundCompat()
+        stopSelf()
     }
 
     private fun shutdown() {

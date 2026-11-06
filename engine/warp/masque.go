@@ -573,7 +573,7 @@ func (t *masqueTunnel) reportOnce(msg string) {
 // 依赖的，两边都是自己的代码路径，没有多引入任何东西）。
 //
 // HTTP/3：UDP + quic-go。HTTP/2：TCP + TLS + http2，两者都是 Cloudflare 的正式传输。
-func dialConnectIP(ctx context.Context, tlsCfg *tls.Config, quicCfg *quic.Config, endpoint string, h2 bool) (*net.UDPConn, *http3.Transport, *connectip.Conn, error) {
+func dialConnectIP(ctx context.Context, tlsCfg *tls.Config, quicCfg *quic.Config, endpoint string, h2 bool) (net.PacketConn, *http3.Transport, *connectip.Conn, error) {
 	template := uritemplate.MustNew(masqueConnectURI)
 	headers := http.Header{"User-Agent": []string{""}}
 
@@ -599,7 +599,10 @@ func dialConnectIP(ctx context.Context, tlsCfg *tls.Config, quicCfg *quic.Config
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	udpConn, err := protectedUDPConn(ctx, remote.IP.To4() == nil)
+	// 单层：主机上开一个被 protect 排除出系统 VPN 的 UDP socket。
+	// 嵌套（MASQUEX2）：同一个 socket 开在**外层隧道的 netstack 里**，于是内层的
+	// QUIC 包就成了外层隧道里的普通 UDP 传输（见 masque_nest.go）。
+	udpConn, err := masqueUDPConn(ctx, remote)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -654,6 +657,17 @@ func protectedUDPConn(ctx context.Context, v6 bool) (*net.UDPConn, error) {
 	}
 	_ = uc.SetWriteBuffer(4 << 20)
 	return uc, nil
+}
+
+// masqueUDPConn 给这条 QUIC 连接开传输 socket。
+//
+// 默认在主机上开（单层 MASQUE）；masqueNest 非空时改开在**外层隧道的 netstack
+// 里** —— 这就是 MASQUEX2 的全部机制：内层 QUIC 的 UDP 包进外层 CONNECT-IP 隧道。
+func masqueUDPConn(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error) {
+	if n := masqueNest.Load(); n != nil {
+		return n.dialUDP(remote)
+	}
+	return protectedUDPConn(ctx, remote.IP.To4() == nil)
 }
 
 // protectedHTTP2Client 与 usque 的 newHTTP2Client 同构，区别只有一处：拨号用的是
@@ -731,10 +745,12 @@ func (t *masqueTunnel) quicConfig(timeout time.Duration) *quic.Config {
 // 长请求，取消它等于断流，所以只能由 drop（或竞速的输家）来调。
 type masqueDial struct {
 	endpoint string
-	udp      *net.UDPConn
-	tr       *http3.Transport
-	conn     *connectip.Conn
-	cancel   context.CancelFunc
+	// udp 是这条 QUIC 连接的传输 socket：单层是主机 UDP，嵌套时是外层隧道
+	// netstack 里的 UDP（见 masqueUDPConn）。
+	udp    net.PacketConn
+	tr     *http3.Transport
+	conn   *connectip.Conn
+	cancel context.CancelFunc
 }
 
 func (d *masqueDial) close() {
@@ -839,7 +855,7 @@ func (t *masqueTunnel) dialRace(ctx context.Context, endpoints []string, timeout
 	return nil, errs
 }
 
-func closeMasqueTransport(udpConn *net.UDPConn, tr *http3.Transport, conn *connectip.Conn) {
+func closeMasqueTransport(udpConn net.PacketConn, tr *http3.Transport, conn *connectip.Conn) {
 	if conn != nil {
 		conn.Close()
 	}
@@ -951,6 +967,11 @@ func min(a, b int) int {
 // 第一个「能握手且能过真实数据」的胜出 —— 只是候选来自 MASQUE 自己的实测池，
 // 而且两端点之间要重换 CONNECT-IP 会话（桌面版的 handshake 已经处理了这件事）。
 func dialMasque(ctx context.Context, o Options) (*Session, error) {
+	// MASQUEX2（MASQUE H3 套 MASQUE H3）是「两条普通 MASQUE 串起来」，
+	// 所以先在这里分派，下面的单层逻辑一行都不用改。
+	if o.Proto == protoMASQUEX2 {
+		return dialMasqueX2(ctx, o)
+	}
 	acct, err := ensureMasqueAccount(ctx, o.report)
 	if err != nil {
 		return nil, err
@@ -958,6 +979,10 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 	masqueAcct = acct
 
 	mtu := masqueMTU()
+	if o.MTU > 0 {
+		// 只有嵌套的外层会用到：外层必须装得下内层 1200 字节的 QUIC 初始包。
+		mtu = o.MTU
+	}
 	h2 := o.Proto == protoMASQUEH2
 	tn, err := newMasqueTunnel(h2, mtu, o.report)
 	if err != nil {
@@ -1064,7 +1089,9 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 			o.report(fmt.Sprintf("出口 %s (%s)", s.ExitIP, s.Country))
 		}
 		if o.SocksListen != "" && tn.stack() != nil {
-			s.startSocks(ctx, o.SocksListen, o.report, o.Rules)
+			if !s.startSocks(ctx, o.SocksListen, o.report, o.Rules) && o.SocksRequired {
+				return nil, fmt.Errorf("本地 SOCKS 端口 %s 起不来，而它这次是必需的（后续流程要连它）", o.SocksListen)
+			}
 		}
 		ok = true
 		return s, nil

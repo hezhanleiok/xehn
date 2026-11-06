@@ -153,6 +153,7 @@ const (
 	kindAWG
 	kindMASQUE
 	kindMASQUEH2
+	kindMASQUEX2
 )
 
 type protoRun struct {
@@ -165,6 +166,10 @@ const (
 	protoAWG      = "awg"
 	protoMASQUE   = "masque"
 	protoMASQUEH2 = "masque-h2"
+	// protoMASQUEX2 是「MASQUE(HTTP/3) 套 MASQUE(HTTP/3)」：外层用独立登记的
+	// 第二套设备建一条普通 MASQUE，内层 QUIC 的 UDP 走在外层隧道里。
+	// 拨号入口见 masque_nest.go 的 dialMasqueX2。
+	protoMASQUEX2 = "masque-x2"
 )
 
 func (r protoRun) isAWG() bool { return r.kind == kindAWG }
@@ -172,14 +177,18 @@ func (r protoRun) isAWG() bool { return r.kind == kindAWG }
 // Both MASQUE kinds run the same CONNECT-IP tunnel and differ only in the
 // transport underneath it, so everything that branches on "is this MASQUE"
 // stays one branch and only the transport asks isH2.
-func (r protoRun) isMASQUE() bool { return r.kind == kindMASQUE || r.kind == kindMASQUEH2 }
-func (r protoRun) isH2() bool     { return r.kind == kindMASQUEH2 }
+// masque-x2 也是同一套 CONNECT-IP 流程，只是外面再套一条（所以这里也算 MASQUE）。
+func (r protoRun) isMASQUE() bool {
+	return r.kind == kindMASQUE || r.kind == kindMASQUEH2 || r.kind == kindMASQUEX2
+}
+func (r protoRun) isH2() bool { return r.kind == kindMASQUEH2 }
 
 var protoRuns = []protoRun{
 	{kindWG, protoWG},
 	{kindAWG, protoAWG},
 	{kindMASQUE, protoMASQUE},
 	{kindMASQUEH2, protoMASQUEH2},
+	{kindMASQUEX2, protoMASQUEX2},
 }
 
 func parseProto(p string) (protoRun, error) {
@@ -188,5 +197,5 @@ func parseProto(p string) (protoRun, error) {
 			return r, nil
 		}
 	}
-	return protoRun{}, fmt.Errorf("invalid -proto %q: use wg, awg, masque or masque-h2", p)
+	return protoRun{}, fmt.Errorf("invalid -proto %q: use wg, awg, masque, masque-h2 or masque-x2", p)
 }

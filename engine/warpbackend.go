@@ -815,7 +815,10 @@ func (b *warpBackend) Connect(ctx context.Context, req Request, report func(stri
 		TunFD:           backendTunFD,
 		MTU:             mtu,
 		MasqueCredsPath: filepath.Join(b.workDir, "masque.json"),
-		OuterCredsPath:  filepath.Join(b.workDir, "outer.json"),
+		// MASQUEX2 的外层还要第三套设备（masque 家族的第二台）。和 outer.json
+		// 分开存：那一份是 WARP( curve25519 ) 设备，不能拿去登 MASQUE。
+		MasqueOuterCredsPath: filepath.Join(b.workDir, "masque-outer.json"),
+		OuterCredsPath:       filepath.Join(b.workDir, "outer.json"),
 	})
 	if req.Psiphon {
 		return b.connectPsiphon(ctx, req, report, handshake, tunFD)

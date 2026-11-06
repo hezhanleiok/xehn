@@ -39,6 +39,10 @@ type Config struct {
 	// MASQUE 专用凭据的存放路径。必须与 WG 账号分开：登记会把设备改成
 	// secp256r1/masque，同一账号里原来的 curve25519 私钥就作废了。
 	MasqueCredsPath string
+	// MASQUEX2 外层 MASQUE 设备的凭据路径。和 WARP-in-WARP 的外层一样，这里也
+	// 需要**另一套**设备：Cloudflare 会丢掉「同一设备嵌套自己」的流量。
+	// 为空则不缓存（每次现登记一台，费一次注册请求但功能正常）。
+	MasqueOuterCredsPath string
 	// WARP-in-WARP 外层设备的凭据存放路径。同样要分开存：外层是**另一台**
 	// WARP 设备（Cloudflare 会丢掉「同一设备嵌套自己」的流量）。
 	OuterCredsPath string
@@ -56,7 +60,11 @@ func Apply(c Config) {
 	tunFD = c.TunFD
 	tunMTU = c.MTU
 	masqueCredsFile = c.MasqueCredsPath
+	masqueOuterCredsFile = c.MasqueOuterCredsPath
 	outerCredsFile = c.OuterCredsPath
+	// 上一次会话如果死在嵌套拨号里，hook 可能还指着一条已经关掉的 netstack：
+	// 留着它会让下一次单层 MASQUE 把 socket 开进一个死隧道。
+	masqueNest.Store(nil)
 
 	// 每个会话都必须重置的东西。
 	// metaAddr / pingAddr 是包级 atomic 缓存，跨会话不清会把上一次的出口元数据

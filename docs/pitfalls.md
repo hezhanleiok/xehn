@@ -292,5 +292,55 @@ adb shell run-as com.xiaohe.vpn cp /data/local/tmp/p.xml shared_prefs/xiaohe-set
 | `CreateNetTUNBuffered`、`netstackx` | gVisor 缓冲实验版 —— **数据面会坏，别拿这版当基线** |
 | `数据面不通（` | 验证失败会带原因的输出 |
 | `出口实测速度`、`中继速度记忆`、`node-speeds` | **0.2.4**：OpenVPN 出口实测吞吐记忆 + 150 KB/s 速度地板换点（移植电脑版） |
+| `关闭系统 VPN（失败不留残留）`、`收掉系统 VPN` | **0.2.11**：连接失败/看门狗放弃时关 tun + 停服务（失败不再留残余 VPN） |
+| `改用 amneziawg 再试`、`本地 SOCKS %s` | **0.2.11**：Psiphon 上游临时端口 + 失败自动换协议 |
+| `masque-x2`、`MASQUEX2`、`masque-outer.json` | **0.2.11**：MASQUE(HTTP/3) 套 MASQUE(HTTP/3) |
+
+---
+
+## 7. 0.2.11：三个真机现场
+
+### 7.1 连接失败，系统 VPN 一直连着
+
+现象：日志最后是 `[session] connecting -> error`，之后没有一行收尾，状态栏的 VPN 钥匙
+一直亮着，只能杀进程。
+
+根因：VPN 模式（wg / awg / masque / wwarp / psiphon）的系统 VPN 是在 `connect()` **之前**
+由 `VpnService.Builder.establish()` 建好的；引擎失败时只把会话状态打成 `error`，而
+`Session.Close()` 刻意**不关** tun fd（fd 归 Kotlin 的 `ParcelFileDescriptor`，见
+`engine/warp/tunfd_owner.go` —— 引擎关它会触发 fdsan abort）。于是谁都不关：
+`warpbackend.Connect` 里的 `releaseLeftoverTunFD` 自 2026-11-03 起是 no-op，
+Kotlin 侧原来也只在用户点「断开」时才 `closeTun()`。
+
+修法：`WarpVpnService.teardownAfterFailure()`（断开引擎 → `closeTun()` → 停前台服务），
+在以下位置调用：非 OpenVPN 分支等不到 `connected`、OpenVPN 分支的三种终止失败、
+看门狗放弃自动重连、连接协程抛异常。
+
+> 判别：`grep 关闭系统 VPN` 命中就是修好的包。
+
+### 7.2 赛风（Psiphon）反复连不上
+
+两个独立原因，都在「上游」这一层：
+
+1. **本地 SOCKS 端口钉死 1081**。上一个监听没收拾干净（或别的进程占着）时，bind 失败
+   只写一行日志就继续，Psiphon 的 `UpstreamProxyURL` 于是指向一个没人监听（或指向别人）
+   的端口，tunnel-core 一遍遍拨它、一遍遍失败，日志里只剩 meek/TLS 错误。
+   改成 `127.0.0.1:0`（内核分配）+ `Options.SocksRequired`：bind 失败直接让这次尝试失败，
+   下一次是全新端口。
+2. **上游选了 wg，而 wg 在这张网里只有握手能过**。日志证据：
+   `8.6.112.74:2408 握手成功，验证出口…` → `数据面不通（隧道内请求超时）`，连续 6 个端点
+   一样，最后 `在 1m0s 内没有找到可用端点`。同一时刻 awg 是通的。
+   改成 `underlayProtos()`：用户选的协议先试，建不起来自动退到 AmneziaWG 再试一轮；
+   每次尝试的 budget 按剩余预算收敛，总预算仍是 150s。
+
+### 7.3 WG/AWG 吞吐与 MASQUEX2
+
+- WG/AWG：`deviceBind.Open` 里把隧道 UDP socket 的收发缓冲拉到 8 MB/4 MB
+  （`tuneUDPBuffers`）。默认 rmem 只有 200 KB 量级，手机下行突发几百毫秒就能灌满，
+  满了就是内核丢包 → wireguard-go 重传 → 拥塞退避，表现为「速度上不去还抖」。
+- MASQUEX2（`masque-x2`）：外层一条普通 MASQUE(HTTP/3)（**第二套设备**，`masque-outer.json`），
+  内层 QUIC 的 UDP socket 开在外层隧道的 netstack 里（`netstackPacketConn`）。
+  外层 MTU 必须设 1400：QUIC 规定客户端 Initial 包至少 1200 字节，内层写进外层的 IP 包
+  约 1228 字节，外层若还是 1200 的 tun MTU 就必然超限被静默丢弃。
 
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

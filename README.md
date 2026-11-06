@@ -4,7 +4,7 @@
 **本目录只读参考 `d:\xhwarp`，不修改它。**
 
 - 仓库：<https://github.com/hezhanleiok/xehn/tree/xehn-android>
-- 当前版本：**v0.2.10**（versionCode 12）
+- 当前版本：**v0.2.11**（versionCode 13）
 
 详细代码分析见 [`docs/porting-analysis.md`](docs/porting-analysis.md)。
 
@@ -15,15 +15,16 @@
 | 部分 | 状态 |
 |---|---|
 | `engine/` Go 引擎（gomobile 打成 `.aar`） | ✅ `go test` / `go vet` 全过，`android/arm64` 交叉编译通过 |
-| `app/libs/engine.aar` | ✅ 已生成（4.38 MB，含 arm64 + arm 的 `libgojni.so`） |
+| `app/libs/engine.aar` | ✅ 已生成（17.8 MB，含 arm64 + arm 的 `libgojni.so`） |
 | `app/` Kotlin + Compose 界面骨架 | ✅ 编译通过 |
-| **`app-debug.apk`** | ✅ **已构建成功（65.4 MB，v0.2.10）**，含 arm64 + arm 两个 ABI 的原生库 |
+| **`app-debug.apk`** | ✅ **已构建成功（90.6 MB，v0.2.11）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.8 MB） |
 | `WarpVpnService` | ✅ 前台服务 + 通知 + tun fd 接缝（**路由默认关闭**，见下） |
 | 环境（JDK/SDK/NDK/gomobile/Gradle） | ✅ `check-env.ps1` **12 项就绪 / 0 缺失** |
 | **真正建立隧道（P1，已接入）** | ✅ warpscout 引擎搬进 `engine/warp`，能建 WG/AWG 隧道并拿到真实出口 IP |
 | **系统 VPN / 全机路由（P2，已接入）** | ✅ `VpnService.establish()` 的 fd 交给引擎当数据面（自写 `tun_android.go` 的等价物），出口验证走真实系统网络；`VpnService.protect` 已接，避免隧道抓自己的包 |
 | **UI 重做 + 设置页（P3，已接入）** | ✅ 浅色主题；首页显示本机 IP / 出口 IP / 国旗 / 国家 / 延迟 / 上下行速率，协议改为下拉；Psiphon 开关与电脑版设置搬进设置页 |
 | **四种传输全接通（2026-10-10）** | ✅ `Dial` 统一分派：WG / AWG、MASQUE（HTTP/3 与 HTTP/2）、WARP-in-WARP（`wwarp`，`nest.go`）都有实现，设置页五种协议全部可选（真机待验） |
+| **MASQUEX2 + 失败收尾（0.2.11）** | ✅ MASQUE(HTTP/3) 套 MASQUE(HTTP/3)（`masque-x2`，`masque_nest.go`）；连接失败/看门狗放弃时关 tun + 停服务；Psiphon 上游改临时端口 + 自动退 AWG；WG/AWG 隧道 UDP 收发缓冲拉到 8 MB |
 | 装机运行 | ⏳ 需要一台开了 USB 调试的手机或模拟器（当前 `adb devices` 为空） |
 
 > P2 的意义：在这之前只有进程内的 gVisor 隧道，系统 VPN 根本没起来 ——

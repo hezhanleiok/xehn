@@ -19,8 +19,11 @@ import (
 const protoWWARP = "wwarp"
 
 // isMasqueProto 判断是否走 MASQUE（CONNECT-IP；h3 与 h2 只是底层传输不同，
-// 上层隧道与拨号流程完全一样）。
-func isMasqueProto(p string) bool { return p == protoMASQUE || p == protoMASQUEH2 }
+// 上层隧道与拨号流程完全一样）。masque-x2（H3 套 H3）也在这里分派，它的内外
+// 两层用的都是同一套 CONNECT-IP 流程，见 masque_nest.go。
+func isMasqueProto(p string) bool {
+	return p == protoMASQUE || p == protoMASQUEH2 || p == protoMASQUEX2
+}
 
 // protoRunFor 只放行库里真的实现了的两种协议。默认 awg：WARP 的 AZWG/混淆参数
 // 在受限网络里比裸 WG 更容易出去，桌面版也是这个默认。
@@ -68,7 +71,21 @@ type Options struct {
 	// 端口尝试顺序；空则用 2408 → 500 → 1701 → 4500。
 	Ports []int
 	// 本地 SOCKS5 监听地址，例如 "127.0.0.1:1080"；空则不监听。
+	// 端口写 0（"127.0.0.1:0"）就是让内核选一个空闲端口，实际端口用
+	// Session.SocksAddr() 读回来 —— 固定端口在「上一个监听还没收干净」时
+	// 会 bind 失败，而这正是 Psiphon 上游反复连不上端口的那类现场。
 	SocksListen string
+	// SocksRequired 表示「这个本地 SOCKS 是后续流程的必经之路」：bind 失败时
+	// 整个拨号必须失败，而不是像仅代理模式那样写一行日志继续。
+	//
+	// Psiphon 的上游就是这种：它的 UpstreamProxyURL 指向这个端口，端口没开
+	// 或者开在别人手里，tunnel-core 只会一遍遍拨一个死端口，最后报「隧道一个
+	// 都建立不起来」，看不出真正原因是本地端口。
+	SocksRequired bool
+	// MTU 覆盖这次拨号的隧道 MTU（0 = 按协议默认）。
+	// 只有 MASQUEX2 的外层用它：外层要装得下内层 1200 字节的 QUIC 初始包，
+	// 必须比内层大，见 masque_nest.go 的 masqueX2OuterMTU。
+	MTU int
 	// NoHedge 关掉「并发拨号竞速」（目前只有 MASQUE 用）。
 	//
 	// Psiphon 的上游必须关：它只有一个本地 SOCKS 端口，同时拨三个端点等于让
@@ -227,7 +244,11 @@ func dialWGTunnel(ctx context.Context, o Options, run protoRun) (*Session, error
 			// 需要一个本地入口。fd 模式下整个系统已经走隧道了，再开一个端口
 			// 只是多一个没人用的监听。
 			if o.SocksListen != "" && tn.stack() != nil {
-				s.startSocks(ctx, o.SocksListen, o.report, o.Rules)
+				if !s.startSocks(ctx, o.SocksListen, o.report, o.Rules) && o.SocksRequired {
+					// 端口是后续流程的必经之路（Psiphon 上游）：不能静默降级，
+					// 否则调用方会拿到一条「隧道通了、但没人能用」的会话。
+					return nil, fmt.Errorf("本地 SOCKS 端口 %s 起不来，而它这次是必需的（后续流程要连它）", o.SocksListen)
+				}
 			}
 			ok = true
 			return s, nil
@@ -361,11 +382,13 @@ func (s *Session) applyMeta(body string) {
 //
 // 注意：没有 VpnService 之前，这只有 App 自己能连（别的应用不走它），
 // 它的价值是「证明隧道真的能过真实流量」，以及给下一步 VpnService 复用。
-func (s *Session) startSocks(ctx context.Context, listen string, report func(string), rules *RuleSet) {
+// 返回 false 表示监听没起来（端口被占、地址不可用）。调用方按 SocksRequired
+// 决定是「只写日志继续」还是「整次拨号失败」。
+func (s *Session) startSocks(ctx context.Context, listen string, report func(string), rules *RuleSet) bool {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
-		report(fmt.Sprintf("本地 SOCKS 监听失败（%v），隧道仍然可用", err))
-		return
+		report(fmt.Sprintf("本地 SOCKS 监听失败（%s：%v），隧道仍然可用", listen, err))
+		return false
 	}
 	s.ln = ln
 	report("本地 SOCKS5 已监听 " + ln.Addr().String())
@@ -381,6 +404,7 @@ func (s *Session) startSocks(ctx context.Context, listen string, report func(str
 			go serveSOCKS(ctx, conn, s.tn.stack().tnet, rules)
 		}
 	}()
+	return true
 }
 
 // SocksAddr 返回本地 SOCKS 监听地址（没开则为空）。
