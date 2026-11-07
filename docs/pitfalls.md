@@ -295,6 +295,7 @@ adb shell run-as com.xiaohe.vpn cp /data/local/tmp/p.xml shared_prefs/xiaohe-set
 | `关闭系统 VPN（失败不留残留）`、`收掉系统 VPN` | **0.2.11**：连接失败/看门狗放弃时关 tun + 停服务（失败不再留残余 VPN） |
 | `改用 amneziawg 再试`、`本地 SOCKS %s` | **0.2.11**：Psiphon 上游临时端口 + 失败自动换协议 |
 | `masque-x2`、`MASQUEX2`、`masque-outer.json` | **0.2.11**：MASQUE(HTTP/3) 套 MASQUE(HTTP/3) |
+| `改用 HTTP/3 再试一轮`、`按流分发`、`上行并行` | **0.2.12**：h2 回退 h3 + MASQUE 上行三条会话并行 |
 
 ---
 
@@ -340,7 +341,68 @@ Kotlin 侧原来也只在用户点「断开」时才 `closeTun()`。
   满了就是内核丢包 → wireguard-go 重传 → 拥塞退避，表现为「速度上不去还抖」。
 - MASQUEX2（`masque-x2`）：外层一条普通 MASQUE(HTTP/3)（**第二套设备**，`masque-outer.json`），
   内层 QUIC 的 UDP socket 开在外层隧道的 netstack 里（`netstackPacketConn`）。
-  外层 MTU 必须设 1400：QUIC 规定客户端 Initial 包至少 1200 字节，内层写进外层的 IP 包
-  约 1228 字节，外层若还是 1200 的 tun MTU 就必然超限被静默丢弃。
+  外层 MTU 取 1300（0.2.12 修正）：QUIC 规定客户端 Initial 包至少 1200 字节，内层写进
+  外层的 IP 包约 1228 字节，所以外层不能是 1200；但也不能太大 —— 0.2.11 用的 1400
+  封装后约 1460，已经压到很多移动网络的 1400 路径 MTU 之上，真机 8 个外层候选全部
+  「已建立 CONNECT-IP、数据面不通」。1300 两头都留了余量（Aether 用 1350）。
+
+---
+
+## 8. 0.2.12：h2 / OpenVPN / X2 / 上行四件事
+
+### 8.1 MASQUE(HTTP/2) 连不上
+
+日志里 h2 从来没有成功记录，只有一句 `拨号失败：...`。修了三处：
+
+1. **CONNECT 的 `:authority` 试两种**：先端点自己（`https://<ip>:<port>`，Aether 的
+   `connect_ip_request(authority=端点)` 就是这条），再退 `cloudflareaccess.com`
+   （usque / connect-ip-go 的默认）。两条在 CF 的不同边缘上都出现过。
+2. **补 `capsule-protocol: ?1`**（RFC 9297 声明）。h3 由 connect-ip-go 自己加，h2 这条路
+   不加，边缘可能直接拒。
+3. **h2 全灭自动回退 h3**：`Dial` 里在 h2 失败后改协议再试 30s。用户要的是能上网，
+   不是协议执念。
+4. 失败时把 HTTP 状态码 + 响应体前 160 字节写进日志（`httpRespSnippet`），下次能直接
+   看出是 401/404 还是 GOAWAY。
+
+### 8.2 OpenVPN「连上马上断」
+
+三个独立原因叠在一起：
+
+1. **出口验证预算 8s 太短**。日志：`出口验证未通过（2 轮：Get "https://1.1.1.1/cdn-cgi/trace": context deadline exceeded）`
+   —— 8s 只够跑 2 轮，而这个节点其实能用（用户实测有下载）。这里要付的是
+   TCP(OpenVPN over WARP netstack) + TLS 的完整往返，改成至少 20s。
+2. **同节点不重试**。98 个节点里 36 个是 `hard reset response` / `EOF` 这类瞬时失败，
+   同一个节点下一次就过。现在握手失败会重试一次。
+3. **为速度换点换到「没测过」的节点**。日志：65 KB/s 的节点被换掉 → 117 KB/s → 第三个
+   直接握手失败。改成只换「**有实测记录、且比当前快 1.5 倍**」的候选，没有就留着
+   （慢总比连不上强）。固定节点仍然不因速度换。
+
+### 8.3 MASQUEX2 连不上
+
+日志证据：外层 8 轮全是 `[2606:4700:103::1]:443 已建立 CONNECT-IP` → `数据面不通`。
+
+- 外层候选里混进了 **v6 边缘**：v6 路径 MTU 1280，装不下「内层 1228 的 IP 包 + 外层
+  封装」。现在外层 `IPv6=false`（只 v4），预算也只给一半。
+- 外层 MTU 1400 → 1300（见 7.3）。
+
+### 8.4 MASQUE 上行只有十几 Mb/s（下行正常）
+
+机理：**一条 QUIC 连接的上行受它自己的拥塞窗口限制**。我们是发送方，Cubic 在手机网络
+的上行丢包率下会把单连接卡在十几 Mb/s；下行不受这个限制（我们是接收方，只有对端的
+cwnd 在管），所以「下行满速、上行很慢」是必然的不对称。WG/AWG 没有拥塞控制，所以
+上行也是满的 —— 这和观测完全一致。
+
+Aether（Rust + quiche）同样是 Cubic、同样没有 BBR，它的优势不在拥塞控制。
+
+0.2.12 做两件事：
+
+1. **上行 3 条 CONNECT-IP 会话并行**（`masqueUploadConns`）：第一条握手时建，其余在
+   后台补齐（`growConns`，不拖慢「连上」）。上行按 **IP 五元组哈希** 分发
+   （`flowIndex`）—— 同一条流固定走同一条会话，不同的流才分散。实测同一账号所有
+   隧道出口都是同一个 104.28.x.x，所以即便会话数变化也不会换源 IP。
+2. **MTU 按传输族分档**：v4 → 1300，v6 → 1160（原来一律 1200）。包数少 8%，
+   配合 `quic.Config.InitialPacketSize` 直接按该尺寸起步，省掉 DPLPMTUD 的爬坡。
+
+> 验证点：日志里应出现 `上行并行：3 条 CONNECT-IP 会话就绪（按流分发）`。
 
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

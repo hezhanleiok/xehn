@@ -69,17 +69,27 @@ class WarpVpnService : VpnService() {
         private const val PSIPHON_TUN_MTU = 1500
 
         /**
-         * MASQUE（CONNECT-IP）的系统 tun MTU。
+         * MASQUE（CONNECT-IP）的系统 tun MTU，按**传输地址族**分开。
          *
          * 每个 IP 包封装成一个 QUIC DATAGRAM：内层包 + contextID + DATAGRAM 帧头 +
-         * QUIC 头 + UDP + IP。tun 用 1280 时封装后约 1340 字节，**超过 v6 路径
-         * MTU 1280**，超限包被 quic-go 拒绝、内层 TCP 一直重传 —— 实测下行只剩
-         * 十几兆（官方客户端同环境 100+ Mb/s）。1200 留足外层余量。
+         * QUIC 头 + UDP + IP。路径 MTU 决定了上限：
          *
-         * 引擎侧的 masqueMaxTunMTU 是同一个值，两边必须一致（内核按 Builder 的
-         * MTU 切包，引擎按自己的 MTU 封装）。
+         *   v4 路径 MTU 1500 → tun 1300，封装后约 1368，留 130 字节余量；
+         *   v6 路径 MTU 1280 → tun 1160，封装后约 1228，留 50 字节余量。
+         *
+         * 以前一律 1200（按 v6 的最坏情况取），白白丢掉 8% 载荷 —— 在「一个包
+         * 一次 syscall + 一次加密」的链路上，包数少 8% 就是实打实的 8%。Aether
+         * （Rust + quiche）对应的取值是 1200…1350，同一量级。
+         *
+         * 引擎侧 masqueMTU() 的上限是同一组数（masqueMaxTunMTU / masqueMaxTunMTUV6），
+         * 两边必须一致：内核按 Builder 的 MTU 切包，引擎按自己的 MTU 封装。
          */
-        private const val MASQUE_TUN_MTU = 1200
+        private const val MASQUE_TUN_MTU_V4 = 1300
+        private const val MASQUE_TUN_MTU_V6 = 1160
+
+        /** 当前设置下 MASQUE 该用哪个 tun MTU（v6 传输要留出 1280 的路径 MTU）。 */
+        private fun masqueTunMtu(s: AppSettings): Int =
+            if (s.ipv6) MASQUE_TUN_MTU_V6 else MASQUE_TUN_MTU_V4
 
         /**
          * OpenVPN 出口的系统 tun MTU。
@@ -324,7 +334,7 @@ class WarpVpnService : VpnService() {
                 "[vpn] 系统 VPN 已启用（tun fd=$fd, MTU=" +
                     when {
                         psiphon -> PSIPHON_TUN_MTU
-                        proto.startsWith("masque") -> MASQUE_TUN_MTU
+                        proto.startsWith("masque") -> masqueTunMtu(s)
                         else -> s.mtu
                     } + "）"
             )
@@ -431,6 +441,8 @@ class WarpVpnService : VpnService() {
         val tried = LinkedHashSet<String>()
         var slowRejects = 0
         var attempts = 0
+        /** 因速度被指定换过去的节点（见下面 faster 的判定）。 */
+        var preferId: String? = null
 
         while (true) {
             val nodes = EngineBridge.vpnGateNodes(this)
@@ -449,7 +461,12 @@ class WarpVpnService : VpnService() {
                 )
                 return
             }
-            val first = ranked.firstOrNull { it.id !in tried }
+            // preferId 是「因速度被判定该换过去」的那个节点：它已经排在候选里，
+            // 但如果按「第一个没试过的」挑，会挑到排在前面的未知节点 —— 那是在赌。
+            val first = preferId
+                ?.let { id -> ranked.firstOrNull { it.id == id } }
+                ?.also { preferId = null }
+                ?: ranked.firstOrNull { it.id !in tried }
             if (first == null) {
                 teardownAfterFailure(
                     if (pinnedId.isNotEmpty()) {
@@ -537,18 +554,28 @@ class WarpVpnService : VpnService() {
                 )
                 return
             }
-            // 没有下一个可试的了就别换：断开去试一个不存在的候选 = 把用户唯一的
-            // 可用连接也丢掉（慢总比连不上强）。
-            if (ranked.none { it.id !in tried } || attempts >= OPENVPN_MAX_TRIES) {
+            // 只换「有实测记录、且明显更快」的候选。
+            //
+            // 以前是「只要还有没试过的节点就换」，而没试过的节点恰恰是最不确定的：
+            // 真机日志（2026-11-07）里 65 KB/s 的节点被换掉，接着试的两个一个是
+            // 117 KB/s、另一个直接握手失败 —— 用户看到的就是「连上马上就断」。
+            // 没证据说明别的更快，就不该拿唯一可用的连接去赌。
+            val faster = ranked
+                .filter { it.id !in tried && it.id != node.id && it.measuredBps > bps * 3 / 2 }
+                .maxByOrNull { it.measuredBps }
+            if (faster == null || attempts >= OPENVPN_MAX_TRIES) {
                 EngineBridge.note(
-                    "[vpn] 出口偏慢（${NodeSpeedStore.text(bps)}），但本次没有别的候选可换，保持当前连接"
+                    "[vpn] 出口偏慢（${NodeSpeedStore.text(bps)}，低于 ${OPENVPN_MIN_BPS / 1024} KB/s），" +
+                        "但没有实测更快的候选，保持当前连接（慢总比连不上强）"
                 )
                 return
             }
             slowRejects++
             tried.add(node.id)
+            preferId = faster.id
             EngineBridge.note(
-                "[vpn] 出口速度过慢（低于 ${OPENVPN_MIN_BPS / 1024} KB/s），换下一个中继…"
+                "[vpn] 出口速度过慢（低于 ${OPENVPN_MIN_BPS / 1024} KB/s），" +
+                    "换到实测更快的 ${nodeSlotLabel(nodes, faster)}（${faster.measuredText}）…"
             )
             // 换点前必须先断开：引擎会话收掉，系统 VPN 随之消失，
             // 下一轮再由 TunProvider 用新节点下发的地址重新 establish。
@@ -584,7 +611,7 @@ class WarpVpnService : VpnService() {
         }
         val mtu = when {
             psiphon -> PSIPHON_TUN_MTU
-            proto.startsWith("masque") -> MASQUE_TUN_MTU
+            proto.startsWith("masque") -> masqueTunMtu(s)
             else -> s.mtu
         }
         return try {
@@ -880,7 +907,7 @@ class WarpVpnService : VpnService() {
         // 路径上直接超限被丢 —— 见 engine/warp/masque.go 的 masqueMaxTunMTU。
         val mtu = when {
             psiphon -> PSIPHON_TUN_MTU
-            proto.startsWith("masque") -> MASQUE_TUN_MTU
+            proto.startsWith("masque") -> masqueTunMtu(s)
             else -> s.mtu
         }
         val b = Builder()

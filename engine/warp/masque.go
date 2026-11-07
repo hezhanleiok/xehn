@@ -92,8 +92,25 @@ const (
 	// （以及本该回写给内核的 ICMP）当成"这包算了"丢掉 —— 内层 TCP 只看到丢包，
 	// 反复重传 + 拥塞窗口塌陷，实测就稳定在十几兆。
 	//
-	// 1200 是官方客户端的量级，留给外层 80 字节封装余量，任何 v6 路径都塞得下。
-	masqueMaxTunMTU = 1200
+	// 现在按**传输地址族**分开：
+	//   v4 路径 MTU 1500 → tun 1300，wire ≈1368，留 130 字节余量；
+	//   v6 路径 MTU 1280 → tun 1160，wire ≈1228，留 50 字节余量。
+	// 比原来一律 1200 多 8%，更重要的是包数减少 8%（每包一次 syscall/加密）。
+	// Aether（Rust + quiche）的对应取值是 1200…1350，和这里同一量级。
+	masqueMaxTunMTU = 1350
+	// v6 传输下的上限：1280 的路径 MTU 装不下更大的封装。
+	masqueMaxTunMTUV6 = 1160
+
+	// 上行并行的 CONNECT-IP 会话条数。
+	//
+	// 这是上行速度的关键：一条 QUIC 连接的上行受**它自己的拥塞窗口**限制，
+	// 而手机网络的上行丢包率天生高于下行 —— Cubic 会把单连接卡在十几 Mb/s
+	// （下行不受这个限制，因为我们是接收方，所以「下行满速、上行很慢」）。
+	// 官方客户端同样是多条隧道并行。
+	//
+	// 必须**按流分发**（见 flowIndex）：同一条 TCP 流的所有包走同一条会话，
+	// 否则同一条流会从不同出口出去，服务端看到源地址变化直接 RST。
+	masqueUploadConns = 3
 
 	// 每个 IP 包前要留出的空间：CONNECT-IP 的 context ID（0 编码为 1 字节）。
 	// 这样写包时可以原地复用读缓冲，不必每包再 alloc + copy（见 pumpOut）。
@@ -167,15 +184,19 @@ var masqueCredsFile string
 // masqueMTU 与系统 tun 用同一个 MTU：Kotlin 的 VpnService.Builder 和引擎
 // 必须是同一个值，否则内核会按错误尺寸切包。
 //
-// 上限压到 masqueMaxTunMTU（1200）：超过这个值，封装成 CONNECT-IP DATAGRAM 后
-// 会超出 v6 路径 MTU 被静默丢弃 —— 那是"下行只有十几兆"的根因，见常量注释。
-func masqueMTU() int {
+// 上限按传输族分两档（v4 1300 / v6 1160）：超过这个值，封装成 CONNECT-IP
+// DATAGRAM 后会超出路径 MTU 被静默丢弃 —— 那是"下行只有十几兆"的根因，见常量注释。
+func masqueMTU(v6 bool) int {
+	limit := masqueMaxTunMTU
+	if v6 {
+		limit = masqueMaxTunMTUV6
+	}
 	mtu := tunnelMTU
 	if tunMTU > 0 {
 		mtu = tunMTU
 	}
-	if mtu > masqueMaxTunMTU {
-		mtu = masqueMaxTunMTU
+	if mtu > limit {
+		mtu = limit
 	}
 	return mtu
 }
@@ -417,9 +438,15 @@ type masqueTunnel struct {
 	tooLarge atomic.Int64
 	reported atomic.Bool
 
-	mu   sync.Mutex
-	conn *connectip.Conn
-	drop func()
+	// 上行并行：conns 是同时在跑的 CONNECT-IP 会话（第一条是握手时建的主会话，
+	// 其余由 growConns 后台补齐）。所有会话共用同一个 tun 设备与同一个 netstack，
+	// 上行包**按流**分发（见 flowIndex），下行各条会话各自写回 tun。
+	mu         sync.Mutex
+	conns      []*connectip.Conn
+	dials      []*masqueDial
+	pumpCtx    context.Context
+	cancelPump context.CancelFunc
+	closed     atomic.Bool
 }
 
 // quic-go and connect-ip-go write straight to the standard logger - a receive
@@ -483,6 +510,7 @@ func (t *masqueTunnel) counters() (uint64, uint64) {
 }
 
 func (t *masqueTunnel) Close() {
+	t.closed.Store(true)
 	t.dropPeer()
 	if t.dev != nil {
 		_ = t.dev.Close()
@@ -491,18 +519,32 @@ func (t *masqueTunnel) Close() {
 
 func (t *masqueTunnel) dropPeer() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.drop != nil {
-		t.drop()
-		t.drop = nil
+	cancel := t.cancelPump
+	dials := t.dials
+	t.cancelPump = nil
+	t.pumpCtx = nil
+	t.dials = nil
+	t.conns = nil
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	t.conn = nil
+	// 每条会话都有自己的 cancel（h3 的 CONNECT 请求活在它上面），必须逐条关。
+	for _, d := range dials {
+		d.close()
+	}
 }
 
-func (t *masqueTunnel) currentConn() *connectip.Conn {
+// currentConns 返回当前可用会话的快照（调用方只读）。
+func (t *masqueTunnel) currentConns() []*connectip.Conn {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.conn
+	if len(t.conns) == 0 {
+		return nil
+	}
+	out := make([]*connectip.Conn, len(t.conns))
+	copy(out, t.conns)
+	return out
 }
 
 // One reader for the whole tunnel: the device is reused across peers, so a
@@ -517,11 +559,18 @@ func (t *masqueTunnel) pumpOut() {
 		if _, err := t.dev.Read(bufs, sizes, masqueCtxRoom); err != nil {
 			return
 		}
-		conn := t.currentConn()
-		if conn == nil {
+		conns := t.currentConns()
+		if len(conns) == 0 {
 			continue
 		}
-		icmp, err := conn.WritePacketBuffer(buf, masqueCtxRoom, sizes[0])
+		// 按流分发：同一条 TCP/UDP 流永远走同一条会话，出口地址才不会变。
+		idx := flowIndex(buf[masqueCtxRoom:masqueCtxRoom+sizes[0]], len(conns))
+		icmp, err := conns[idx].WritePacketBuffer(buf, masqueCtxRoom, sizes[0])
+		if err != nil && len(conns) > 1 {
+			// 这条会话刚坏（被 DPI 掐/迁移）：换一条重试一次。WritePacketBuffer
+			// 每次都会重写 contextID，所以可以直接重入。
+			icmp, err = conns[(idx+1)%len(conns)].WritePacketBuffer(buf, masqueCtxRoom, sizes[0])
+		}
 		if err != nil {
 			continue
 		}
@@ -581,18 +630,41 @@ func dialConnectIP(ctx context.Context, tlsCfg *tls.Config, quicCfg *quic.Config
 		hp := headers.Clone()
 		hp.Set("cf-connect-proto", "cf-connect-ip")
 		hp.Set("pq-enabled", "false")
-		client, err := protectedHTTP2Client(tlsCfg, endpoint)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		ipConn, _, err := connectip.DialH2(ctx, client, template, hp)
-		if err != nil {
-			if strings.Contains(err.Error(), "tls: access denied") {
-				return nil, nil, nil, fmt.Errorf("MASQUE 登录被拒：本设备的凭据没有登记到 Cloudflare Access（%w）", err)
+		// RFC 9297 的胶囊协议声明。h3 由 connect-ip-go 自己加，h2 这条路径
+		// 不会加 —— Aether 的 h3 请求头里也是显式带 `capsule-protocol: ?1`。
+		hp.Set("capsule-protocol", "?1")
+
+		// CONNECT 的 :authority 试两种：
+		//   1. 端点自己的 ip:port —— Aether 走的就是这条（`connect_ip_request(authority=端点)`）；
+		//   2. usque/connect-ip-go 默认的 cloudflareaccess.com。
+		// 两种在 CF 的不同边缘上都见过，先端点、后通用名，谁通算谁。
+		var lastErr error
+		for _, uri := range []string{"https://" + endpoint, masqueConnectURI} {
+			tmpl, terr := uritemplate.New(uri)
+			if terr != nil {
+				lastErr = terr
+				continue
 			}
-			return nil, nil, nil, err
+			client, cerr := protectedHTTP2Client(tlsCfg, endpoint)
+			if cerr != nil {
+				return nil, nil, nil, cerr
+			}
+			ipConn, rsp, derr := connectip.DialH2(ctx, client, tmpl, hp)
+			if derr == nil {
+				if rsp != nil && rsp.Body != nil {
+					// 成功时 body 就是隧道本身，绝不能关；这里只是把句柄留下。
+					_ = rsp
+				}
+				return nil, nil, ipConn, nil
+			}
+			lastErr = fmt.Errorf("%s 被拒：%w%s", uri, derr, httpRespSnippet(rsp))
+			client.CloseIdleConnections()
+			if strings.Contains(derr.Error(), "tls: access denied") {
+				return nil, nil, nil, fmt.Errorf(
+					"MASQUE(h2) 登录被拒：本设备的凭据没有登记到 Cloudflare Access（%w）", derr)
+			}
 		}
-		return nil, nil, ipConn, nil
+		return nil, nil, nil, fmt.Errorf("MASQUE(h2) 建流失败：%w", lastErr)
 	}
 
 	remote, err := net.ResolveUDPAddr("udp", endpoint)
@@ -731,8 +803,20 @@ func (t *masqueTunnel) handshakeErr(ctx context.Context, endpoint string, timeou
 // quicConfig 是每条 MASQUE 会话的 QUIC 参数。串行与竞速两条路共用，
 // 免得「竞速拨出来的连接」和「串行拨出来的」行为不一致。
 func (t *masqueTunnel) quicConfig(timeout time.Duration) *quic.Config {
+	// InitialPacketSize 决定「一发出去就用多大的 UDP 载荷」。默认 1200 会让
+	// quic-go 从 1200 起步、靠 DPLPMTUD 慢慢往上探（每升一档要一个 RTT），
+	// 而我们要装的是 mtu 大小的内层 IP 包：太小会频繁撞 DatagramTooLarge。
+	// 取 mtu+40：内层包 + contextID/帧头/QUIC 头/AEAD 的封装余量。
+	initial := t.mtu + 40
+	if initial < 1200 { // QUIC 规定客户端 Initial 不得小于 1200
+		initial = 1200
+	}
+	if initial > 1452 {
+		initial = 1452
+	}
 	return &quic.Config{
 		EnableDatagrams:      true,
+		InitialPacketSize:    uint16(initial),
 		KeepAlivePeriod:      masqueKeepalive,
 		HandshakeIdleTimeout: timeout,
 		MaxIdleTimeout:       masqueIdleTimeout,
@@ -765,20 +849,135 @@ func (d *masqueDial) close() {
 // 串行与竞速两条路都走它，保证行为一致。
 func (t *masqueTunnel) adoptDial(d *masqueDial) {
 	pumpCtx, cancelPump := context.WithCancel(context.Background())
+	t.mu.Lock()
+	if t.closed.Load() {
+		t.mu.Unlock()
+		cancelPump()
+		d.close()
+		return
+	}
+	t.pumpCtx = pumpCtx
+	t.cancelPump = cancelPump
+	t.conns = append(t.conns, d.conn)
+	t.dials = append(t.dials, d)
+	t.mu.Unlock()
 	// 接收侧开两条：一条 goroutine 每包一次 ReadPacket + 一次 tun 写 syscall，
 	// 千兆下行时单条会成为瓶颈（quic-go 的接收队列是加锁的，多个读者安全；
 	// 取出的包各自持有独立缓冲）。乱序交给内核的 TCP 处理，本来就是网络常态。
 	for i := 0; i < masquePumpReaders; i++ {
 		go t.pumpIn(pumpCtx, d.conn)
 	}
+}
 
+// adoptExtra 追加一条上行并行会话（握手时那条之外的）。
+func (t *masqueTunnel) adoptExtra(d *masqueDial) {
 	t.mu.Lock()
-	t.conn = d.conn
-	t.drop = func() {
-		cancelPump()
+	pumpCtx := t.pumpCtx
+	if t.closed.Load() || pumpCtx == nil {
+		t.mu.Unlock()
 		d.close()
+		return
 	}
+	t.conns = append(t.conns, d.conn)
+	t.dials = append(t.dials, d)
 	t.mu.Unlock()
+	for i := 0; i < masquePumpReaders; i++ {
+		go t.pumpIn(pumpCtx, d.conn)
+	}
+}
+
+// growConns 在后台把上行并行会话补齐到 masqueUploadConns 条。
+//
+// 为什么不在握手时就一起建：那会把「连上」的时间翻几倍，用户等的是可用
+// （第一条会话已经能跑），而不是完美。补齐过程中失败就停手 —— 少几条只是
+// 上行没那么宽，不能因此把已经可用的会话弄坏。
+//
+// 只对 HTTP/3 做：h2 是一条 TCP 连接，并行只会让同一条 TCP 自己跟自己抢，
+// 而且它的 CONNECT 请求活在 ctx 上，多一条就多一个长请求，没有收益。
+func (t *masqueTunnel) growConns(endpoint string, timeout time.Duration, report func(string)) {
+	if t.h2 || masqueUploadConns <= 1 {
+		return
+	}
+	go func() {
+		base := context.Background()
+		for i := 1; i < masqueUploadConns; i++ {
+			if t.closed.Load() {
+				return
+			}
+			dialCtx, cancel := context.WithCancel(base)
+			timer := time.AfterFunc(timeout, cancel)
+			udp, tr, conn, err := dialConnectIP(dialCtx, t.tlsCfg, t.quicConfig(timeout), endpoint, t.h2)
+			stopped := timer.Stop()
+			if err != nil || !stopped {
+				cancel()
+				closeMasqueTransport(udp, tr, conn)
+				if report != nil {
+					report(fmt.Sprintf("上行并行：第 %d 条会话没建起来（%v），保持 %d 条", i+1, err, i))
+				}
+				return
+			}
+			t.adoptExtra(&masqueDial{endpoint: endpoint, udp: udp, tr: tr, conn: conn, cancel: cancel})
+		}
+		if report != nil {
+			report(fmt.Sprintf("上行并行：%d 条 CONNECT-IP 会话就绪（按流分发）", masqueUploadConns))
+		}
+	}()
+}
+
+// flowIndex 按 IP 五元组把包固定分配到某条会话上。
+//
+// 不能简单轮询：同一条 TCP 流的上行包若分散到不同 CONNECT-IP 会话，会带来
+// 严重的乱序，而且万一两条会话的出口地址不同，服务端看到源 IP 变了直接 RST。
+// 五元组哈希保证同一条流始终同一条会话，不同的流才分散。
+//
+// （实测同一账号的各条隧道出口都是同一个 104.28.x.x，所以会话数变化时即使
+// 映射变了也不会换源 IP；乱序由内核 TCP 处理。这也是敢用无状态哈希的前提。）
+func flowIndex(pkt []byte, n int) int {
+	if n <= 1 || len(pkt) < 20 {
+		return 0
+	}
+	var proto byte
+	var src, dst []byte
+	var sport, dport int
+	switch pkt[0] >> 4 {
+	case 4:
+		ihl := int(pkt[0]&0x0f) * 4
+		if ihl < 20 || len(pkt) < ihl+4 {
+			return 0
+		}
+		proto = pkt[9]
+		src, dst = pkt[12:16], pkt[16:20]
+		if proto == 6 || proto == 17 {
+			sport = int(pkt[ihl])<<8 | int(pkt[ihl+1])
+			dport = int(pkt[ihl+2])<<8 | int(pkt[ihl+3])
+		}
+	case 6:
+		if len(pkt) < 44 {
+			return 0
+		}
+		proto = pkt[6]
+		src, dst = pkt[8:24], pkt[24:40]
+		if proto == 6 || proto == 17 {
+			sport = int(pkt[40])<<8 | int(pkt[41])
+			dport = int(pkt[42])<<8 | int(pkt[43])
+		}
+	default:
+		return 0
+	}
+	h := uint32(2166136261) // FNV-1a
+	mix := func(b []byte) {
+		for _, c := range b {
+			h ^= uint32(c)
+			h *= 16777619
+		}
+	}
+	mix(src)
+	mix(dst)
+	h ^= uint32(proto)
+	h *= 16777619
+	h ^= uint32(sport)<<16 | uint32(dport)
+	h *= 16777619
+	return int(h % uint32(n))
 }
 
 // dialRace 并发拨一批端点：第一个成功者胜出，其余立刻取消。
@@ -855,6 +1054,24 @@ func (t *masqueTunnel) dialRace(ctx context.Context, endpoints []string, timeout
 	return nil, errs
 }
 
+// httpRespSnippet 把被拒的 HTTP 响应压成一行日志：状态码 + 响应体前 160 字节。
+// 没有它，「h2 连不上」在日志里只剩一句 goaway/tls 错误，看不出是 401、404
+// 还是服务端根本不认这个 authority。
+func httpRespSnippet(rsp *http.Response) string {
+	if rsp == nil {
+		return ""
+	}
+	if rsp.Body != nil {
+		defer rsp.Body.Close()
+	}
+	body, _ := io.ReadAll(io.LimitReader(rsp.Body, 200))
+	s := strings.TrimSpace(string(body))
+	if s == "" {
+		return fmt.Sprintf("（HTTP %d）", rsp.StatusCode)
+	}
+	return fmt.Sprintf("（HTTP %d：%s）", rsp.StatusCode, clipText(s, 160))
+}
+
 func closeMasqueTransport(udpConn net.PacketConn, tr *http3.Transport, conn *connectip.Conn) {
 	if conn != nil {
 		conn.Close()
@@ -885,12 +1102,13 @@ func masqueCandidateList(o Options, h2 bool) []string {
 	if h2 {
 		v4, v6 = masqueH2PoolsV4, masqueH2PoolsV6
 	}
+	// 只出同一族：tun MTU 是按传输族定的（v4 1300 / v6 1160），混着试就会出现
+	// 「v4 的 MTU 落到 v6 路径上」——封装 1368 字节 > 1280 的路径 MTU，握手能过、
+	// 数据面全丢（2026-11-07 真机就是这样：8 轮外层探测全「数据面不通」）。
 	var addrs []netip.Addr
-	if !o.IPv6 {
-		addrs = append(addrs, prefixAddrs(v4, masqueSampleV4)...)
+	if o.IPv6 {
 		addrs = append(addrs, prefixAddrs(v6, masqueSampleV6)...)
 	} else {
-		addrs = append(addrs, prefixAddrs(v6, masqueSampleV6)...)
 		addrs = append(addrs, prefixAddrs(v4, masqueSampleV4)...)
 	}
 
@@ -978,9 +1196,9 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 	}
 	masqueAcct = acct
 
-	mtu := masqueMTU()
+	mtu := masqueMTU(o.IPv6)
 	if o.MTU > 0 {
-		// 只有嵌套的外层会用到：外层必须装得下内层 1200 字节的 QUIC 初始包。
+		// 只有嵌套的外层会用到：外层必须装得下内层的 QUIC 初始包。
 		mtu = o.MTU
 	}
 	h2 := o.Proto == protoMASQUEH2
@@ -1092,6 +1310,10 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 			if !s.startSocks(ctx, o.SocksListen, o.report, o.Rules) && o.SocksRequired {
 				return nil, fmt.Errorf("本地 SOCKS 端口 %s 起不来，而它这次是必需的（后续流程要连它）", o.SocksListen)
 			}
+		}
+		// 上行并行：先把可用会话交给用户，其余几条在后台补齐（补失败不影响连接）。
+		if !o.NoHedge && !o.NoParallelUplink {
+			tn.growConns(endpoint, 6*time.Second, o.report)
 		}
 		ok = true
 		return s, nil

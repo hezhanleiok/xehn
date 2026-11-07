@@ -32,9 +32,19 @@ import (
 //     访问」的典型现场）。所以外层单独用 masqueX2OuterMTU(1400)——代价是外层
 //     只能走 v4 路径（v6 路径 MTU 1280 塞不下），见下面对 o.IPv6 的处理。
 const (
-	// 外层隧道的 MTU：装得下内层 1200+28 的 IP 包，再加上 CONNECT-IP/QUIC/UDP/IP
-	// 的封装余量，同时仍留出 v4 路径 MTU 1500 的余量。
-	masqueX2OuterMTU = 1400
+	// 外层隧道的 MTU。
+	//
+	// 这个值必须同时满足两件事：
+	//   1. 装得下内层写进来的 IP 包：内层 QUIC 的 Initial 包 1200 字节（QUIC 规定
+	//      的最小值）+ UDP 8 + IP 20 ≈ 1228；
+	//   2. 外层自己封装后不超路径 MTU：外层 CONNECT-IP datagram ≈ MTU+60，
+	//      手机网络（v4）的路径 MTU 常在 1400 左右。
+	// 1300 → wire ≈1360，两边都留了余量。Aether 的实现里对应值是 1350（quiche
+	// 的 MAX_DATAGRAM_SIZE），同一量级。
+	//
+	// 2026-11-07 真机教训：之前取 1400，wire 1460 已经压到很多移动网络的
+	// 1400 路径 MTU 之上，结果外层的 8 个候选全部「已建立 CONNECT-IP、数据面不通」。
+	masqueX2OuterMTU = 1300
 )
 
 // masqueNestState 是「内层 QUIC 的 socket 应该开在哪里」。
@@ -134,6 +144,16 @@ func dialMasqueX2(ctx context.Context, o Options) (*Session, error) {
 	outerOpts.MTU = masqueX2OuterMTU
 	outerOpts.SocksListen = ""
 	outerOpts.SocksRequired = false
+	// 外层只当载体，不需要上行并行（它自己就是被内层用的那一条）。
+	outerOpts.NoParallelUplink = true
+	// 外层只走 v4：v6 路径 MTU 1280 装不下「内层 1228 的 IP 包 + 外层封装」。
+	// 2026-11-07 真机日志：外层候选混进 v6 时 8 轮全部「已建立 CONNECT-IP、
+	// 数据面不通」——握手能过，数据包全超 MTU 被丢。
+	outerOpts.IPv6 = false
+	// 外层只用一半预算，别把内层的预算吃光。
+	if outerOpts.Budget > 0 {
+		outerOpts.Budget = max(20*time.Second, outerOpts.Budget/2)
+	}
 
 	// 外层只跑在进程内 netstack 里：系统 tun fd 归内层 MASQUE 使用。
 	savedFD := tunFD
@@ -179,6 +199,8 @@ func dialMasqueX2(ctx context.Context, o Options) (*Session, error) {
 	inner := o
 	inner.Proto = protoMASQUE
 	inner.MTU = 0
+	// 内层的所有会话都挤在外层那一条隧道里：多开只会三条 QUIC 抢外层一个拥塞窗口。
+	inner.NoParallelUplink = true
 	s, err := dialMasque(ctx, inner)
 	if err != nil {
 		outer.Close()

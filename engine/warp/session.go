@@ -86,6 +86,10 @@ type Options struct {
 	// 只有 MASQUEX2 的外层用它：外层要装得下内层 1200 字节的 QUIC 初始包，
 	// 必须比内层大，见 masque_nest.go 的 masqueX2OuterMTU。
 	MTU int
+	// NoParallelUplink 关掉「上行多条 CONNECT-IP 会话并行」。
+	// 嵌套（MASQUEX2）的内层必须关：它的所有会话都挤在外层那一条隧道里，
+	// 多开只会让三条 QUIC 互相抢外层的一个拥塞窗口。
+	NoParallelUplink bool
 	// NoHedge 关掉「并发拨号竞速」（目前只有 MASQUE 用）。
 	//
 	// Psiphon 的上游必须关：它只有一个本地 SOCKS 端口，同时拨三个端点等于让
@@ -163,6 +167,18 @@ func Dial(ctx context.Context, o Options) (*Session, error) {
 	// MASQUE 是另一条传输：端点来自登记响应而不是扫描池，也不需要 amneziawg-go。
 	// 所以它在协议分派这一层就分开走，WG 那条路一行都不用动。
 	if isMasqueProto(o.Proto) {
+		s, err := dialMasque(ctx, o)
+		if err == nil || o.Proto != protoMASQUEH2 {
+			return s, err
+		}
+		// HTTP/2 这条传输在部分网络/边缘上根本建不起 CONNECT-IP 流（TCP 被拦、
+		// 边缘不认这个 authority）。这种情况下让用户「点 h2 就连不上」没有意义 ——
+		// 明确写一条日志，再用 HTTP/3 试一轮。用户要的是能上网，不是协议执念。
+		o.report(fmt.Sprintf("MASQUE(HTTP/2) 没建起来（%v）；改用 HTTP/3 再试一轮…", err))
+		o.Proto = protoMASQUE
+		if o.Budget <= 0 || o.Budget > 30*time.Second {
+			o.Budget = 30 * time.Second
+		}
 		return dialMasque(ctx, o)
 	}
 	run, err := protoRunFor(o.Proto)

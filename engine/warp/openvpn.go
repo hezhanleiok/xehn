@@ -387,7 +387,14 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	// 所以整条直连分支（含设置里的「连节点方式」）在 0.2.3 移除，不再作为选项。
 	under, client, push, err := dialOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr)
 	if err != nil {
-		return nil, fmt.Errorf("连接 OpenVPN 节点 %s 失败：%w", nodeAddr, err)
+		// 同一节点重试一次：VPN Gate 的 TCP 握手会抖（真机日志里 98 个节点有 36 个
+		// 是 `hard reset response` / `EOF` 这类瞬时失败，同一个节点下一次就过）。
+		// 用户看到的却是「固定节点连不上」——重试一次能救回相当一部分。
+		o.report(fmt.Sprintf("节点 %s 第一次握手失败（%v），重试一次…", nodeAddr, err))
+		under, client, push, err = dialOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr)
+		if err != nil {
+			return nil, fmt.Errorf("连接 OpenVPN 节点 %s 失败：%w", nodeAddr, err)
+		}
 	}
 	// ok 只在真正把会话交出去之后置位；中途任何 return 都要把上游隧道关掉，
 	// 否则一条 netstack 隧道会留在后台空转（系统看不到，日志里也看不出来）。
@@ -449,7 +456,16 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	//    这里必须多端点 + 重试：单端点（只看 1.1.1.1）单次请求会在两种情况下误判 ——
 	//    ① 某些网络里 1.1.1.1 直连被拦、经隧道才通，刚 establish 那一两秒正是飘的；
 	//    ② 个别节点只拦 Cloudflare 的 trace 端点本身。真机实测就是被这个窗口判死的。
-	ip, country, passed := probeExitViaTun(ctx, o.VerifyTimeout, o.Report)
+	//
+	//    预算不能照搬「单个端点握手超时」那档：这里要付的是
+	//    TCP(OpenVPN over WARP netstack) + TLS 到 1.1.1.1 的完整往返。真机日志
+	//    （2026-11-07）里 8s 预算只够跑 2 轮、两轮都超时，而节点其实能用（用户
+	//    实测有下载）。20s 是同一批节点里最慢那档的实际握手时长量级。
+	verify := o.VerifyTimeout
+	if verify < 20*time.Second {
+		verify = 20 * time.Second
+	}
+	ip, country, passed := probeExitViaTun(ctx, verify, o.Report)
 	if !passed {
 		ex.close()
 		sess.ovpn = nil
