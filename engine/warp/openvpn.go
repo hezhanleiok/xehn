@@ -700,23 +700,34 @@ func probeDownloadBps(stack *ipStack, budget time.Duration) int64 {
 	if err != nil {
 		return 0
 	}
-	start := time.Now()
+	// client.Do 包含 DNS + TCP + TLS + 首字节：经「WARP → 日本节点 → CF」这条
+	// 链路，光握手就要 3–7 秒（真机日志里 OpenVPN 握手 3037ms、4983ms 都有）。
+	// 所以计时**从首字节之后开始**，否则 2 秒预算连 TLS 都没完成，结果永远是 0。
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0
 	}
 	defer resp.Body.Close()
-	buf := make([]byte, 32<<10)
+
+	start := time.Now()
+	window := 2 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		if rest := time.Until(dl); rest < window {
+			window = rest
+		}
+	}
 	var got int64
+	buf := make([]byte, 32<<10)
 	for {
 		n, rerr := resp.Body.Read(buf)
 		got += int64(n)
-		if rerr != nil || time.Since(start) >= budget {
+		if rerr != nil || time.Since(start) >= window {
 			break
 		}
 	}
 	d := time.Since(start).Seconds()
-	if got <= 0 || d <= 0 {
+	// 样本太短（<0.3s）就不可信：可能是首包刚好卡在窗口边缘。
+	if got <= 0 || d < 0.3 {
 		return 0
 	}
 	return int64(float64(got) / d)

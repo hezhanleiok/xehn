@@ -52,6 +52,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.xiaohe.vpn.AppSettings
 import com.xiaohe.vpn.EngineBridge
@@ -1041,13 +1043,25 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
         Text(
             slot,
             style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.width(84.dp),
+            modifier = Modifier.width(100.dp),
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             color = when (n.cls) {
                 "residential" -> Color(0xFF1B7F3B)
                 "datacenter" -> Color(0xFF8A6D3B)
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             },
+        )
+        // 速度单独占一列，夹在「名称」和「握手延迟」之间（用户要求的位置）。
+        // 没测到就写「—」，不写「未测」—— 那一列只在测速有结果时有意义。
+        Text(
+            if (n.measuredBps > 0) NodeSpeedStore.text(n.measuredBps) else "—",
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.width(78.dp),
+            maxLines = 1,
+            textAlign = TextAlign.End,
+            color = if (n.measuredBps > 0) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.weight(1f))
         // 只显示真握手结果（用户要的就是「真延迟」），没测过就写「未测」。
@@ -1056,10 +1070,7 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
         val probeColor: androidx.compose.ui.graphics.Color
         when {
             n.hasProbe && n.handshakeOk -> {
-                // 实测过的速度也写在行里：用户问过「到底有没有测速」，光有握手
-                // 耗时看不出「这个节点连上能跑多快」，而那正是选节点最关心的事。
-                probeLabel = "握手 ${n.handshakeMs}ms" +
-                    if (n.measuredBps > 0) " · ${NodeSpeedStore.text(n.measuredBps)}" else ""
+                probeLabel = "握手 ${n.handshakeMs}ms"
                 probeColor = MaterialTheme.colorScheme.onSurface
             }
             n.hasProbe -> {

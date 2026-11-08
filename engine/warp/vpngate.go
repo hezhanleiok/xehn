@@ -269,14 +269,29 @@ func enrichClassify(n *VPNGateNode, r ipAPIResult) {
 		return
 	}
 	if dcGroups >= 1 && residential {
-		n.Class, n.ClassSource = "unknown", "ipapi"
+		// 证据冲突：宁可判机房 —— 「家宽」这个标签会让用户以为线路更好，
+		// 误标的代价比把机房标成机房大。
+		n.Class, n.ClassSource = "datacenter", "ipapi"
 		return
 	}
 	if residential {
 		n.Class, n.ClassSource = "residential", "ipapi"
 		return
 	}
-	n.Class, n.ClassSource = "unknown", "ipapi"
+	// 没有任何强证据：按 ASN/关键词二分，**不再留「未分类」**（用户要求界面上
+	// 只有家宽/机房两类）。
+	n.Class, n.ClassSource = heuristicClass(r.AS, blob), "ipapi+heur"
+}
+
+// heuristicClass 在两个数据源都给不出强证据时做二选一。
+//
+// 命中云厂商 ASN 或机房关键词 → 机房；否则按家宽处理：VPN Gate 的节点绝大多数
+// 是住宅/小 ISP 接入，非云厂商 ASN 的公网地址基本都在 ISP 网里。
+func heuristicClass(asnStr, blob string) string {
+	if hardDCASN[parseASN(asnStr)] || containsAny(blob, dcKeywords) {
+		return "datacenter"
+	}
+	return "residential"
 }
 
 func parseASN(s string) int {
@@ -413,10 +428,12 @@ type ipWhoResult struct {
 
 // enrichWithIPWhois 用第二个源补「仍然未知」的节点，返回实际拿到的条数。
 func enrichWithIPWhois(ctx context.Context, client *http.Client, nodes []VPNGateNode) int {
+	// 对**所有**节点取第二意见（不只 unknown）：用户要求「至少两个 API 交叉」，
+	// 而且 ip-api 的 hosting 标记很保守，单源容易把机房判成家宽。
 	idx := make([]int, 0, len(nodes))
 	seen := map[string]bool{}
 	for i := range nodes {
-		if nodes[i].Class != "unknown" || nodes[i].IP == "" || seen[nodes[i].IP] {
+		if nodes[i].IP == "" || seen[nodes[i].IP] {
 			continue
 		}
 		seen[nodes[i].IP] = true
@@ -490,8 +507,13 @@ func applyIPWho(n *VPNGateNode, r ipWhoResult) {
 	switch {
 	case r.Security.Hosting || strings.EqualFold(r.Type, "hosting"):
 		n.Class, n.ClassSource = "datacenter", "ipwho"
-	case strings.EqualFold(r.Type, "isp"):
+	case strings.EqualFold(r.Type, "isp") && n.Class == "unknown":
 		n.Class, n.ClassSource = "residential", "ipwho"
+	case n.Class == "unknown" || n.Class == "":
+		// 两个源都没有明确结论：走启发式二分，保证界面上不再出现「未分类」。
+		blob := strings.ToLower(isp + " " + r.Connection.Org)
+		n.Class = heuristicClass(strconv.Itoa(r.Connection.ASN), blob)
+		n.ClassSource = "ipwho+heur"
 	}
 }
 
@@ -570,10 +592,25 @@ func FetchVPNGate(ctx context.Context, o VPNGateFetchOptions) ([]VPNGateNode, er
 		m := enrichWithIPWhois(whoCtx, client, nodes)
 		whoCancel()
 		if m > 0 {
-			o.report(fmt.Sprintf("第二数据源（ipwho.is）补判了 %d 个节点的类型（原来 %d 个未分类）", m, unknown))
+			o.report(fmt.Sprintf("第二数据源（ipwho.is）复核了 %d 个节点，交叉验证后仍有 %d 个无强证据", m, unknown))
 		} else {
-			o.report(fmt.Sprintf("第二数据源（ipwho.is）没能补判（%d 个仍未分类），保持“未分类”而不是瞎猜", unknown))
+			o.report(fmt.Sprintf("第二数据源（ipwho.is）没有响应，%d 个节点将按 ASN 启发式二分", unknown))
 		}
+	}
+
+	// 收尾：**不允许出现「未分类」**。两源都没给出强证据的，按云厂商 ASN /
+	// 机房关键词二分（家宽 ↔ 机房），界面上只有两类。
+	heur := 0
+	for i := range nodes {
+		if nodes[i].Class == "" || nodes[i].Class == "unknown" {
+			blob := strings.ToLower(nodes[i].ISP + " " + nodes[i].AS)
+			nodes[i].Class = heuristicClass(nodes[i].AS, blob)
+			nodes[i].ClassSource = "heur"
+			heur++
+		}
+	}
+	if heur > 0 {
+		o.report(fmt.Sprintf("按 ASN 启发式把 %d 个节点二分（家宽/机房），不留未分类", heur))
 	}
 
 	// 实测 TCP 延迟（只对 tcp 节点；udp 节点保留自报 ping）。
