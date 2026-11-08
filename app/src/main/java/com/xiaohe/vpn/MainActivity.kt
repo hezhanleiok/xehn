@@ -221,7 +221,16 @@ class MainActivity : ComponentActivity() {
                 state = state,
                 settings = settings,
                 onToggle = onToggle,
-                onProtoChange = { p -> onSettingsChange(settings.copy(proto = p)) },
+                onProtoChange = { p ->
+                    onSettingsChange(settings.copy(proto = p))
+                    // 已连接/连接中时换协议 = 热切换：不退出服务、不用先点断开。
+                    if (state.isConnected || state.isBusy) {
+                        startVpnService(
+                            WarpVpnService.ACTION_SWITCH_PROTO,
+                            settings.copy(proto = p),
+                        )
+                    }
+                },
                 onOpenMenu = onOpenMenu,
                 onToggleTheme = onToggleTheme,
             )
@@ -232,6 +241,7 @@ class MainActivity : ComponentActivity() {
                 onChange = onSettingsChange,
                 onClearLogs = { EngineBridge.clearLogs() },
                 onPickApps = onPickApps,
+                onOpenLanShare = { onNavigate(Page.LanShare) },
                 onBack = back,
             )
 
@@ -282,12 +292,13 @@ class MainActivity : ComponentActivity() {
         val intent = Intent(this, WarpVpnService::class.java).apply {
             this.action = action
         }
-        if (action == WarpVpnService.ACTION_CONNECT) {
+        if (action == WarpVpnService.ACTION_CONNECT || action == WarpVpnService.ACTION_SWITCH_PROTO) {
             // 把「按下去那一刻的设置」显式带过去。服务读本地设置也能拿到同样的
             // 值，但显式传参才让「这次连接用的是哪套参数」在 intent 里可查，
             // 也避免了「改完设置没保存就点连接」这类竞态。
             intent.putExtra(WarpVpnService.EXTRA_PROTO, settings.proto)
             intent.putExtra(WarpVpnService.EXTRA_PSIPHON, settings.psiphon)
+            intent.putExtra(WarpVpnService.EXTRA_OPENVPN, settings.openvpn)
             startForegroundService(intent)
         } else {
             startService(intent)

@@ -471,7 +471,10 @@ private fun ConnectionCard(
         Column(Modifier.padding(16.dp)) {
             ProtoDropdown(
                 current = settings.proto,
-                enabled = !state.isConnected && !state.isBusy,
+                // 已连接也能换：MainActivity 会发 ACTION_SWITCH_PROTO 做热切换
+                //（服务不退出，只把引擎会话换成新协议重连）。
+                enabled = true,
+                switching = state.isConnected || state.isBusy,
                 onChange = onProtoChange,
             )
             Spacer(Modifier.height(14.dp))
@@ -481,7 +484,12 @@ private fun ConnectionCard(
 }
 
 @Composable
-private fun ProtoDropdown(current: String, enabled: Boolean, onChange: (String) -> Unit) {
+private fun ProtoDropdown(
+    current: String,
+    enabled: Boolean,
+    switching: Boolean,
+    onChange: (String) -> Unit,
+) {
     var open by remember { mutableStateOf(false) }
     Surface(
         shape = RoundedCornerShape(14.dp),
@@ -510,9 +518,9 @@ private fun ProtoDropdown(current: String, enabled: Boolean, onChange: (String) 
                         fontWeight = FontWeight.Medium,
                     )
                 }
-                if (!enabled) {
+                if (switching) {
                     Text(
-                        "连接中不可切换",
+                        "切换会重连",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

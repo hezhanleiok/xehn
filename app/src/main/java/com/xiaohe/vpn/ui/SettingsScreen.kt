@@ -86,6 +86,8 @@ fun SettingsScreen(
     onChange: (AppSettings) -> Unit,
     onClearLogs: () -> Unit,
     onPickApps: () -> Unit,
+    /** 打开「局域网共享」详情页（不再从侧边栏进入）。 */
+    onOpenLanShare: () -> Unit,
     onBack: () -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -143,8 +145,7 @@ fun SettingsScreen(
         // 而「打开 App 就自动连」在系统 VPN 未授权时只会弹一个授权框，容易误解。
         SettingSwitch(
             title = "健康守护（自动修复）",
-            subtitle = "连续探测失败/长时间无数据时自动断开重连（每 5 分钟最多 3 次）；" +
-                "关闭后只记录日志、不自动重连",
+            subtitle = "异常时自动断开重连（5 分钟最多 3 次）",
             checked = settings.healthGuard,
             onChange = { onChange(settings.copy(healthGuard = it)) },
         )
@@ -156,10 +157,9 @@ fun SettingsScreen(
         SettingSwitch(
             title = "Psiphon 出口",
             subtitle = if (settings.mode == "proxy") {
-                "只在「VPN 模式」可用：Psiphon 的 packet tunnel 需要一个 tun fd，仅代理模式没有"
+                "仅 VPN 模式可用"
             } else {
-                "最终出口走 Psiphon（进程内跑官方 tunnel-core）；" +
-                    "基础协议（建议 AWG）只作它的上游载体，出口 IP/国家按 Psiphon 实测显示"
+                "最终出口走 Psiphon，基础协议只作上游"
             },
             checked = settings.psiphon,
             enabled = settings.mode == "vpn",
@@ -221,10 +221,9 @@ fun SettingsScreen(
         SettingSwitch(
             title = "OpenVPN 出口",
             subtitle = if (settings.mode == "proxy") {
-                "只在「VPN 模式」可用：需要一个 tun fd 接管全机流量"
+                "仅 VPN 模式可用"
             } else {
-                "最终出口走 VPN Gate 节点（OpenVPN）；基础协议只作外层载体，" +
-                    "节点先握手拿到服务器下发的地址，再建系统 VPN"
+                "最终出口走 VPN Gate 节点"
             },
             checked = settings.openvpn,
             enabled = settings.mode == "vpn",
@@ -363,9 +362,9 @@ fun SettingsScreen(
         SettingChips(
             title = "分应用",
             subtitle = if (settings.mode == "vpn") {
-                "用系统原生白/黑名单实现，内核层生效"
+                "系统原生白/黑名单，内核层生效"
             } else {
-                "只在「VPN 模式」下有效：仅代理模式没有「哪些应用走隧道」这回事"
+                "仅 VPN 模式可用"
             },
             options = listOf("off" to "关闭", "proxy" to "仅代理所选", "direct" to "所选直连"),
             selected = settings.splitMode,
@@ -391,9 +390,9 @@ fun SettingsScreen(
         SettingSwitch(
             title = "开启本地代理",
             subtitle = if (settings.mode == "proxy") {
-                "仅代理模式固定开启：不建系统 VPN，只开这个 SOCKS5 端口"
+                "仅代理模式固定开启"
             } else {
-                "VPN 模式下也开一个本地 SOCKS5 端口，供本机或同一 Wi-Fi 的设备借用这条隧道"
+                "VPN 模式下也开本地 SOCKS5 端口"
             },
             checked = settings.mode == "proxy" || settings.localProxy,
             enabled = settings.mode != "proxy",
@@ -401,7 +400,7 @@ fun SettingsScreen(
         )
         SettingNumber(
             title = "代理端口",
-            subtitle = "SOCKS5 端口；浏览器/系统代理里填这个端口。改完要重新连接才生效",
+            subtitle = "SOCKS5 端口，改完要重连",
             value = settings.proxyPort.toString(),
             onChange = { v ->
                 val n = v.filter { it.isDigit() }.take(5).toIntOrNull() ?: 0
@@ -410,8 +409,7 @@ fun SettingsScreen(
         )
         SettingSwitch(
             title = "允许局域网访问",
-            subtitle = "监听 0.0.0.0：同一 Wi-Fi 下的其它设备也能用这个代理。" +
-                "SOCKS5 没有认证，公共 Wi-Fi 下别开；详细用法见侧边栏「局域网共享」",
+            subtitle = "监听 0.0.0.0，同一 Wi-Fi 可用；无认证，公共网络别开",
             checked = settings.proxyLan,
             onChange = { onChange(settings.copy(proxyLan = it, localProxy = settings.localProxy || it)) },
         )
@@ -419,6 +417,10 @@ fun SettingsScreen(
             if (state.socks.isNotBlank()) "正在监听" else "连接后监听",
             state.socks.ifBlank { settings.proxyListenAddr() },
         )
+        ActionRow(
+            "局域网共享",
+            "共享地址、端口与监听状态（同一 Wi-Fi 的设备怎么用）",
+        ) { onOpenLanShare() }
         if (settings.splitMode != "off" && parsePackageList(settings.splitApps).isEmpty()) {
             SettingCard {
                 Text(
@@ -439,13 +441,13 @@ fun SettingsScreen(
         )
         SettingNumber(
             title = "MTU",
-            subtitle = "与 VpnService 的 tun 设备共用同一个值，1280 最稳",
+            subtitle = "1280 最稳",
             value = settings.mtu.toString(),
             onChange = { v -> v.toIntOrNull()?.let { onChange(settings.copy(mtu = it.coerceIn(576, 1500))) } },
         )
         SettingText(
             title = "自定义 DNS",
-            subtitle = "逗号分隔，会下发给 VPN 接口",
+            subtitle = "逗号分隔",
             value = settings.dns,
             onChange = { onChange(settings.copy(dns = it)) },
         )
@@ -470,7 +472,7 @@ fun SettingsScreen(
         )
         SettingChips(
             title = "语言 / Language",
-            subtitle = "英文目前覆盖菜单、页面标题、设置分区与主要按钮；大段说明文字仍是中文",
+            subtitle = "英文覆盖菜单与标题",
             options = LANG_OPTIONS,
             selected = settings.lang,
             onSelect = { onChange(settings.copy(lang = it)) },
@@ -504,8 +506,7 @@ fun SettingsScreen(
         )
         SettingTextArea(
             title = "自定义规则",
-            subtitle = "一行一条：direct,example.com 或 proxy,1.2.3.0/24；# 开头是注释。" +
-                "域名规则只在「仅代理」生效，IP/CIDR 两种模式都生效",
+            subtitle = "一行一条：direct/proxy,域名或 CIDR；# 注释",
             value = settings.ruleText,
             onChange = { onChange(settings.copy(ruleText = it)) },
         )
@@ -529,25 +530,7 @@ fun SettingsScreen(
                 cnInfo = withContext(Dispatchers.IO) { EngineBridge.cnRoutesText(ctx) }
             }
         }
-        NotYet(
-            "VPN 模式做不到的",
-            "VPN 模式只看得到 IP（看不到域名），所以自定义规则里的域名在那一档不生效；" +
-                "「绕过大陆」在 VPN 模式靠大陆 CIDR 路由表实现，首次连接后才生效",
-        )
 
-        // ---------------- 尚未搬运 ----------------
-        // 只列**确实还没做**的。「语言切换」「健康守护」原来挂在这张表里，这一版
-        // 已经真做出来了（见上面「界面」「连接」两节），所以从这里删掉 ——
-        // 一张挂着已完成项的表，和假开关一样是误导。
-        Section("电脑版有、安卓版还没搬的功能")
-        NotYet(
-            "导出配置（.conf / mihomo YAML）",
-            "电脑版只有命令行能用；安卓版要另做分享入口，也要先确定「导出哪些协议」"
-        )
-        NotYet(
-            "按地区/域名分流的完整规则引擎",
-            "VpnService 只能按应用和 IP 分流；域名规则目前只在「仅代理」的本地 SOCKS 上生效"
-        )
 
         Spacer(Modifier.height(24.dp))
     }
@@ -813,19 +796,6 @@ private fun BrandHeader() {
     }
 }
 
-/** 从 PackageManager 读版本名，避免和 build.gradle 里的 versionName 各写一份。 */
-private fun appVersionName(ctx: Context): String = try {
-    val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        ctx.packageManager.getPackageInfo(ctx.packageName, PackageManager.PackageInfoFlags.of(0))
-    } else {
-        @Suppress("DEPRECATION")
-        ctx.packageManager.getPackageInfo(ctx.packageName, 0)
-    }
-    info.versionName ?: "—"
-} catch (_: Exception) {
-    "—"
-}
-
 /**
  * 「出口地区」这一行显示什么。
  *
@@ -836,28 +806,20 @@ private fun appVersionName(ctx: Context): String = try {
 private fun rulePolicySubtitle(policy: String, mode: String): String {
     val proxy = mode == "proxy"
     return when (policy) {
-        "bypass-cn" -> if (proxy) {
-            "大陆域名直连，其余走隧道（按域名判定）"
-        } else {
-            "大陆网段直连，其余走隧道（按路由表，首次连接后才生效）"
-        }
-        "blacklist" -> if (proxy) {
-            "只有规则里写 proxy 的走隧道，其余直连"
-        } else {
-            "只抓规则里写 proxy 的网段进隧道，其余直连"
-        }
+        "bypass-cn" -> if (proxy) "大陆域名直连" else "大陆网段直连（首次连接后生效）"
+        "blacklist" -> "只有列表里的走隧道"
         else -> "全部走隧道"
     }
 }
 
 private fun modeSubtitle(mode: String): String = when (mode) {
-    "proxy" -> "只开一个本地 SOCKS5 端口，不建系统 VPN；由你自己把应用/浏览器的代理指过来"
-    else -> "建立系统 VPN（VpnService），手机上所有应用走隧道；分应用名单只在这一档生效"
+    "proxy" -> "只开本地 SOCKS5，不建系统 VPN"
+    else -> "建立系统 VPN，全部应用走隧道"
 }
 
 private fun exitRegionSubtitle(region: String, regions: List<String>, psiphonOn: Boolean): String {
     if (!psiphonOn) {
-        return "先打开上面的「Psiphon 出口」—— 其它协议没有落地国家可选"
+        return "先打开 Psiphon 出口"
     }
     if (region.isEmpty()) {
         return "自动（由 Psiphon 决定）· 可选 ${regions.size} 个地区"
@@ -869,7 +831,7 @@ private fun exitRegionSubtitle(region: String, regions: List<String>, psiphonOn:
 
 private fun openvpnSubtitle(s: AppSettings, nodes: List<VpnGateNode>): String {
     if (s.mode == "proxy") return "只在「VPN 模式」可用"
-    if (!s.openvpn) return "打开后最终出口走 VPN Gate 节点（OpenVPN）"
+    if (!s.openvpn) return "最终出口走 VPN Gate 节点"
     val countries = nodes.map { it.cc }.distinct().size
     // 「已测速」= NodeSpeedStore 里还没过期的实测记录（6 小时）。它只参与排序，
     // 说清楚这一点，免得用户以为没测过的节点会被排除。
@@ -1193,30 +1155,6 @@ private fun ActionRow(title: String, subtitle: String, onClick: () -> Unit) {
             Text(title, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary)
             Text(
                 subtitle,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-private fun NotYet(title: String, why: String) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 8.dp),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-    ) {
-        Column(Modifier.padding(14.dp)) {
-            Text(
-                "· $title",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                why,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -297,6 +297,7 @@ adb shell run-as com.xiaohe.vpn cp /data/local/tmp/p.xml shared_prefs/xiaohe-set
 | `masque-x2`、`MASQUEX2`、`masque-outer.json` | **0.2.11**：MASQUE(HTTP/3) 套 MASQUE(HTTP/3) |
 | `改用 HTTP/3 再试一轮`、`按流分发`、`上行并行` | **0.2.12**：h2 回退 h3 + MASQUE 上行三条会话并行 |
 | `ipwho.is`、`未分类`、`握手 + 测速完成`、`局域网共享` | **0.2.13**：双数据源分类 + 探测测速 + 设置重构 |
+| `协议热切换`、`direct 网段`、`补集路由` | **0.2.14**：热切换 + VPN 模式 direct 规则 + 文案精简 |
 
 ---
 
@@ -473,5 +474,40 @@ Aether（Rust + quiche）同样是 Cubic、同样没有 BBR，它的优势不在
 | 健康守护 | `startWatchdog()` |
 | 分流规则 | 仅「仅代理」的本地 SOCKS 执行（VPN 模式只有 IP 级路由表） |
 | 清空日志 | `EngineBridge.clearLogs()` |
+
+---
+
+## 10. 0.2.14：热切换、入口去重、VPN 模式的 direct 规则
+
+### 10.1 协议热切换
+
+安卓没有「换隧道而系统 VPN 不动」的接口：协议变了，tun 的 MTU/地址就得跟着变
+（MASQUE 1300、Psiphon 1500、其它 1280），只能重建 tun。
+
+所以「热」的定义是：**服务不退出、通知不重建、用户不用先点断开**。
+`ACTION_SWITCH_PROTO` → `switchProto()`：断开引擎会话 → 等状态机回 idle（最多 3 秒）
+→ `startConnect()` 用新协议重建。全过程约 1–3 秒，首页协议下拉在已连接时也可点，
+右侧提示改成「切换会重连」。
+
+### 10.2 入口去重
+
+「局域网共享」不再占抽屉入口，改为 **设置 → 本地代理 → 局域网共享**。两处入口会
+让人以为这是两个功能。
+
+### 10.3 删除「电脑版有、安卓没搬」与解释性文案
+
+设置页里那整节「尚未搬运」已删除（`NotYet` 组件一并删掉），各设置项的副标题压到
+一句话。详细说明改在文档与回复里，不塞进 App。
+
+### 10.4 VPN 模式的 `direct,网段` 之前没生效
+
+`applyRoutePolicy` 原来只处理 `proxy,`：全局模式下 `direct,1.2.3.0/24` 被忽略。
+现在：
+
+- **API 33+**：`addRoute(0/0)` + `excludeRoute(该网段)`；
+- **API 24–32**：算 `0/0 减去 direct` 的补集，逐条 `addRoute`（`complementV4`）。
+
+域名形式的 direct 在 VPN 模式仍然无效 —— 内核按 IP 路由，看不到域名，这是
+平台限制，不是漏做。
 
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

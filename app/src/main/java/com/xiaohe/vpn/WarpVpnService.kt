@@ -46,6 +46,8 @@ class WarpVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "com.xiaohe.vpn.action.CONNECT"
         const val ACTION_DISCONNECT = "com.xiaohe.vpn.action.DISCONNECT"
+        /** 已连接时换协议：不退出前台服务，只把引擎会话换成新协议重连。 */
+        const val ACTION_SWITCH_PROTO = "com.xiaohe.vpn.action.SWITCH_PROTO"
         const val EXTRA_PROTO = "proto"
         const val EXTRA_ENDPOINT = "endpoint"
         const val EXTRA_PSIPHON = "psiphon"
@@ -244,12 +246,52 @@ class WarpVpnService : VpnService() {
                 startConnect(intent)
                 return START_NOT_STICKY
             }
+            ACTION_SWITCH_PROTO -> {
+                // 热切换：服务不退出、通知不重建，只换引擎里那条隧道。
+                startForegroundSafely(getString(R.string.notif_connecting))
+                switchProto(intent)
+                return START_NOT_STICKY
+            }
             else -> {
                 // 没有任何指令就进来了（例如系统重建服务）：绝不擅自建立 VPN。
                 // 建 VPN 必须是用户点出来的动作，这也是 START_NOT_STICKY 的理由。
                 EngineBridge.note("[vpn] 收到空指令，未做任何事")
                 return START_NOT_STICKY
             }
+        }
+    }
+
+    /**
+     * 协议热切换。
+     *
+     * 安卓没有「换一条隧道但系统 VPN 不动」的接口 —— 协议变了就必须重建 tun
+     * （MASQUE 用 1300 的 MTU、Psiphon 用 1500、其它用设置里的值）。所以这里的
+     * 「热」是指：**服务不退出、通知不重建、用户不用先点断开**，只把引擎里的
+     * 会话换掉，再用新协议连一次。整个过程约 1–3 秒。
+     */
+    private fun switchProto(intent: Intent) {
+        val e = EngineBridge.peek()
+        if (e == null) {
+            startConnect(intent)
+            return
+        }
+        val target = intent.getStringExtra(EXTRA_PROTO) ?: SettingsStore.load(this).proto
+        EngineBridge.note("[vpn] 协议热切换 → $target")
+        connectJob?.cancel()
+        connectJob = null
+        runCatching { e.disconnect() }
+        runCatching { e.setVPNState(false) }
+        EngineBridge.refresh(e)
+        scope.launch {
+            // 等状态机回到 idle（最多 3 秒）；startConnect 内部还有一次 awaitIdle 兜底。
+            val deadline = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline) {
+                EngineBridge.refresh(e)
+                val st = EngineBridge.state.value.state
+                if (st == "idle" || st == "error") break
+                delay(100)
+            }
+            startConnect(intent)
         }
     }
 
@@ -999,7 +1041,32 @@ class WarpVpnService : VpnService() {
                     EngineBridge.note("[vpn] 分流=黑名单：只抓 ${proxied.size} 个网段")
                 }
             }
-            else -> b.addRoute("0.0.0.0", 0)
+            else -> {
+                // 全局：默认全走隧道，但规则里写 direct 的**网段**要挖掉。
+                // VPN 模式看不到域名，所以只有 IP/CIDR 形式的 direct 能在这里生效。
+                val direct = parseDirectCIDRs(s.ruleText).mapNotNull { (cidr, len) ->
+                    ipToInt(cidr)?.let { it to len }
+                }
+                if (direct.isEmpty()) {
+                    b.addRoute("0.0.0.0", 0)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    b.addRoute("0.0.0.0", 0)
+                    var excluded = 0
+                    for ((net, len) in direct) {
+                        runCatching {
+                            b.excludeRoute(IpPrefix(InetAddress.getByAddress(intToBytes(net)), len))
+                        }.onSuccess { excluded++ }
+                    }
+                    EngineBridge.note("[vpn] 分流=全局：排除 $excluded 条 direct 网段")
+                } else {
+                    // API 24–32 没有 excludeRoute：改成「0/0 减去 direct」的补集。
+                    val gaps = complementV4(direct)
+                    for ((net, len) in gaps) b.addRoute(intToIp(net), len)
+                    EngineBridge.note(
+                        "[vpn] 分流=全局：挖掉 ${direct.size} 条 direct 网段，${gaps.size} 条补集路由"
+                    )
+                }
+            }
         }
     }
 
@@ -1022,11 +1089,16 @@ class WarpVpnService : VpnService() {
     }
 
     /** 规则文本里 `proxy,1.2.3.0/24` 那些网段 —— 黑名单模式要抓的就是它们。 */
-    private fun parseProxyCIDRs(text: String): List<Pair<String, Int>> = text.lineSequence()
+    private fun parseProxyCIDRs(text: String): List<Pair<String, Int>> = parseCIDRRules(text, "proxy")
+
+    /** 规则文本里 `direct,1.2.3.0/24` 那些网段 —— 全局模式要把它们从隧道里挖掉。 */
+    private fun parseDirectCIDRs(text: String): List<Pair<String, Int>> = parseCIDRRules(text, "direct")
+
+    private fun parseCIDRRules(text: String, action: String): List<Pair<String, Int>> = text.lineSequence()
         .map { it.substringBefore('#').trim() }
         .mapNotNull { line ->
             val parts = line.split(',', limit = 2)
-            if (parts.size != 2 || !parts[0].trim().equals("proxy", ignoreCase = true)) {
+            if (parts.size != 2 || !parts[0].trim().equals(action, ignoreCase = true)) {
                 return@mapNotNull null
             }
             val cidr = parts[1].trim()

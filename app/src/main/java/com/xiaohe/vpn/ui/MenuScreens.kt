@@ -138,7 +138,10 @@ fun MenuDrawer(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(start = 12.dp, bottom = 12.dp),
         )
-        Page.values().forEach { page ->
+        // 局域网共享不再单独占一个抽屉入口：它的开关和端口都在设置页里，
+        // 从「设置 → 本地代理 → 局域网共享」进去即可。两处入口只会让人以为
+        // 是两个不同的功能。
+        Page.values().filter { it != Page.LanShare }.forEach { page ->
             val active = page == current
             Row(
                 modifier = Modifier
@@ -456,23 +459,16 @@ fun LanShareScreen(
         InfoCard(
             t("怎么用", "How it works"),
             listOf(
-                t("1. 打开「本地代理」，需要给别的设备用时再打开「允许局域网访问」；",
-                    "1. Turn on local proxy; enable LAN access if other devices should use it."),
-                t("2. 电脑/平板连同一个 Wi-Fi，把 SOCKS5 代理指向下面的地址；",
-                    "2. On the same Wi-Fi, point their SOCKS5 proxy at the address below."),
-                t("3. 它们的流量就从手机这条隧道出去（出口 IP 与手机一致）。",
-                    "3. Their traffic leaves through this phone's tunnel."),
-                t("注意：SOCKS5 没有认证，公共 Wi-Fi 下别开局域网访问。",
-                    "Note: SOCKS5 has no authentication. Do not allow LAN access on public Wi-Fi."),
+                t("同一 Wi-Fi 的设备，把 SOCKS5 代理填成下面的地址。",
+                    "On the same Wi-Fi, set SOCKS5 proxy to the address below."),
+                t("SOCKS5 无认证，公共 Wi-Fi 下别开局域网访问。",
+                    "No authentication: do not allow LAN access on public Wi-Fi."),
             ),
         )
 
         ToggleCard(
             title = t("本地代理", "Local proxy"),
-            subtitle = t(
-                "在手机本地开一个 SOCKS5 端口；VPN 模式下也能用（默认关，多一个监听就多一个入口）",
-                "Runs a SOCKS5 listener on the phone; works in VPN mode too.",
-            ),
+            subtitle = t("在本机开一个 SOCKS5 端口", "Runs a SOCKS5 listener on the phone"),
             checked = settings.localProxy || settings.proxyLan,
             onChange = { on -> onChange(settings.copy(localProxy = on)) },
         )
@@ -480,7 +476,7 @@ fun LanShareScreen(
         ToggleCard(
             title = t("允许局域网访问", "Allow LAN access"),
             subtitle = t(
-                "监听 0.0.0.0：同一 Wi-Fi 下的设备可用；关闭时只监听 127.0.0.1（只有本机能用）",
+                "监听 0.0.0.0，同一 Wi-Fi 可用；关闭时只听 127.0.0.1",
                 "Listen on 0.0.0.0 so other devices on the same Wi-Fi can use it.",
             ),
             checked = settings.proxyLan,
@@ -489,8 +485,7 @@ fun LanShareScreen(
 
         PortCard(
             title = t("本地代理端口", "Proxy port"),
-            subtitle = t("SOCKS5 端口（1–65535）；改完需要重新连接才生效",
-                "SOCKS5 port (1-65535). Reconnect to apply."),
+            subtitle = t("SOCKS5 端口，改完要重连", "SOCKS5 port; reconnect to apply"),
             value = settings.proxyPort.toString(),
             onChange = { v ->
                 val n = v.filter { it.isDigit() }.take(5).toIntOrNull() ?: 0
@@ -504,8 +499,6 @@ fun LanShareScreen(
                 t("共享地址", "Address") + "：" + addr,
                 t("实际监听", "Listening") + "：" + state.socks.ifBlank { t("未连接 / 未开启", "off") },
                 t("本机局域网 IP", "Phone LAN IP") + "：" + lanIp.ifBlank { "—" },
-                t("仅在「已连接」后才会真正监听；改完端口要断开重连。",
-                    "The listener starts after connecting; reconnect after changing the port."),
             ),
         )
     }
