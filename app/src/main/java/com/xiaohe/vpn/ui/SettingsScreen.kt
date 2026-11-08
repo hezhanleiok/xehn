@@ -276,18 +276,24 @@ fun SettingsScreen(
                         probing = true
                         ovpnScope.launch {
                             val cc = settings.openvpnCountry
-                            // 当前范围内的**全部**节点都要测：原来只取前 40 个，剩下
-                            // 的既没结果也不显示状态，界面就退回写「自报」或裸延迟 ——
-                            // 用户看到的「一百来个节点里一大半没测」正是这个原因。
-                            // 引擎侧并发 6、单节点 10s：98 个最坏约 2.7 分钟，实际大多 1 分钟。
-                            val ids = nodes
-                                .sortedWith(vpnGateNodeOrder)
-                                .filter { cc.isEmpty() || it.cc == cc }
-                                .map { it.id }
+                            // 测试范围按用户当前的选择走：
+                            //   钉了节点 → 只测那一个；选了国家 → 只测该国；否则全部。
+                            // 以前不管选没选都测 98 个，既慢又没法回答「这个国家行不行」。
+                            val pinned = settings.openvpnNodeId
+                            val scopeNodes = when {
+                                pinned.isNotEmpty() -> nodes.filter { it.id == pinned }
+                                cc.isNotEmpty() -> nodes.filter { it.cc == cc }
+                                else -> nodes
+                            }.sortedWith(vpnGateNodeOrder)
+                            val ids = scopeNodes.map { it.id }
+                            val scopeText = when {
+                                pinned.isNotEmpty() -> "当前节点"
+                                cc.isNotEmpty() -> "地区 ${countryDisplayName(cc)}"
+                                else -> "全部"
+                            }
                             EngineBridge.note(
-                                "[ui] 开始测真实握手延迟：${ids.size} 个节点" +
-                                    (if (cc.isEmpty()) "（自动模式，测全部）" else "（地区 $cc）") +
-                                    "；只握手、不建系统 VPN，可能要 1–3 分钟"
+                                "[ui] 开始测握手 + 速度：${ids.size} 个节点（$scopeText）" +
+                                    "；只握手、不建系统 VPN"
                             )
                             val results = withContext(Dispatchers.IO) {
                                 EngineBridge.testOpenVpnNodes(ctx, ids)

@@ -4,7 +4,7 @@
 **本目录只读参考 `d:\xhwarp`，不修改它。**
 
 - 仓库：<https://github.com/hezhanleiok/xehn/tree/xehn-android>
-- 当前版本：**v0.2.14**（versionCode 16）
+- 当前版本：**v0.2.15**（versionCode 17）
 
 详细代码分析见 [`docs/porting-analysis.md`](docs/porting-analysis.md)。
 
@@ -17,7 +17,7 @@
 | `engine/` Go 引擎（gomobile 打成 `.aar`） | ✅ `go test` / `go vet` 全过，`android/arm64` 交叉编译通过 |
 | `app/libs/engine.aar` | ✅ 已生成（17.8 MB，含 arm64 + arm 的 `libgojni.so`） |
 | `app/` Kotlin + Compose 界面骨架 | ✅ 编译通过 |
-| **`xehn-<版本号>.apk`** | ✅ **已构建成功（`xehn-0.2.14.apk`，65.6 MB）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.9 MB）。产物名由 `app/build.gradle.kts` 的 `androidComponents` 统一改成 `xehn-<versionName>.apk` |
+| **`xehn-<版本号>.apk`** | ✅ **已构建成功（`xehn-0.2.15.apk`，65.6 MB）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.9 MB）。产物名由 `app/build.gradle.kts` 的 `androidComponents` 统一改成 `xehn-<versionName>.apk` |
 | `WarpVpnService` | ✅ 前台服务 + 通知 + tun fd 接缝（**路由默认关闭**，见下） |
 | 环境（JDK/SDK/NDK/gomobile/Gradle） | ✅ `check-env.ps1` **12 项就绪 / 0 缺失** |
 | **真正建立隧道（P1，已接入）** | ✅ warpscout 引擎搬进 `engine/warp`，能建 WG/AWG 隧道并拿到真实出口 IP |
@@ -28,6 +28,7 @@
 | **0.2.12：h2 / OpenVPN / X2 / 上行** | ✅ MASQUE(HTTP/2) 两种 authority + 失败回退 H3；OpenVPN 出口验证 20s + 同节点重试 + 只为「实测更快」的候选换点；MASQUEX2 外层改 v4-only、MTU 1300；MASQUE 上行 3 条会话按流并行、MTU 按 v4/v6 分档（1300/1160） |
 | **0.2.13：测速 / 分类 / 设置重构** | ✅ 「测延迟」改成「握手 + 真下载测速」（引擎用 gVisor netstack 当 tun，不建系统 VPN）；节点分类加 ipwho.is 第二数据源交叉验证，「未知」改「未分类」；设置页删除假开关与重复的关于信息，新增「本地代理（VPN 模式可用）」「局域网共享」页、「语言」「健康守护」 |
 | **0.2.14：热切换 / 入口去重 / 文案** | ✅ 已连接时换协议 = 热切换（服务不退出，只换引擎会话）；「局域网共享」收进设置页，抽屉不再重复；删除设置里「电脑版有、安卓没搬」整节与大量解释性文案；VPN 模式的 `direct,网段` 规则真正生效（API 33+ 用 excludeRoute，旧版用补集路由） |
+| **0.2.15：本机 IP / 账号 / 测速范围** | ✅ 首页「本机 IP」改回**局域网地址**（192.168.x.x，不再显示公网出口）；**移除内置 WARP 账号**，设备首次连接自动注册，缓存 14 天过期或连续 2 次失败自动重置重注册；测延迟支持「只测当前节点 / 只测当前国家 / 全部」；MASQUE 日志带 `colo`（区分 CF 边缘，替代不准的 IP 归属地） |
 | 装机运行 | ⏳ 需要一台开了 USB 调试的手机或模拟器（当前 `adb devices` 为空） |
 
 > P2 的意义：在这之前只有进程内的 gVisor 隧道，系统 VPN 根本没起来 ——

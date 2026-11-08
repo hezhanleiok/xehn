@@ -1304,7 +1304,14 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 		if s.ExitIP == "" && s.Country == "" {
 			o.report("警告：出口信息解析为空（/meta 被拒），但数据面已验证")
 		} else {
+			// 带上 colo（实际接入的 Cloudflare 边缘机场代码）：出口 IP 是 CF 的共享
+		// NAT 地址，同一个 IP 在不同地理库里会被标成不同城市（上海/郑州都出现过）。
+		// 真正能区分线路的是 colo，不是 IP 归属地。
+		if s.Colo != "" {
+			o.report(fmt.Sprintf("出口 %s (%s, colo=%s)", s.ExitIP, s.Country, s.Colo))
+		} else {
 			o.report(fmt.Sprintf("出口 %s (%s)", s.ExitIP, s.Country))
+		}
 		}
 		if o.SocksListen != "" && tn.stack() != nil {
 			if !s.startSocks(ctx, o.SocksListen, o.report, o.Rules) && o.SocksRequired {

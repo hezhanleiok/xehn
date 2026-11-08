@@ -523,4 +523,37 @@ Aether（Rust + quiche）同样是 Cubic、同样没有 BBR，它的优势不在
   `mergedFlavor.versionName`）。这里从 `android.defaultConfig.versionName` 读，
   一处定义、两处使用（APK 名和 `BuildConfig.VERSION_NAME`）。
 
+---
+
+## 11. 0.2.15：本机 IP、账号、测速范围、出口归属地
+
+### 11.1 「本机 IP」显示局域网地址
+
+原来首页那一栏调 `probeLocalJSON` 显示**公网出口 IP** —— 它和「出口 IP」几乎相同，
+用户既没法用它确认自己在哪个局域网，也没法据此给别的设备填局域网共享地址。
+现在直接读系统网卡的 IPv4（`LocalNetwork.ipv4`），不发请求、立刻返回。
+
+### 11.2 不再内置 WARP 账号
+
+删掉 `assets/account.json`。每台设备首次连接自己注册，凭据落在
+`filesDir/engine/account.json`，两条失效兜底：
+
+- **14 天过期**（`accountMaxAge`）：到期删除并重新注册 —— CF 会注销长期不用的设备，
+  之后握手一直失败，表象和「网络不通」完全一样；
+- **连续 2 次整体失败**：`accountFailStreak` 达到 2 就删缓存，下次连接重新注册。
+
+### 11.3 测速范围
+
+「测延迟+速度」按当前选择决定范围：钉了节点 → 只测它；选了国家 → 只测该国；
+都没选 → 全部。并发 8、测速预算 2s，98 个最坏约 2.5 分钟。
+
+### 11.4 MASQUE 出口「上海变郑州」
+
+出口 IP `104.28.245.200` 是 Cloudflare 的共享 NAT 地址，与 WG/AWG **相同是正常的**
+（同一个 CF 出口）。不同地理库对同一 IP 会给出不同城市（上海/郑州都出现过），
+这不是协议问题。
+
+真正能区分线路的是 `/cdn-cgi/trace` 里的 `colo`（接入的边缘机场代码），现在连接
+日志会写：`出口 104.28.245.200 (CN, colo=HKG)`。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

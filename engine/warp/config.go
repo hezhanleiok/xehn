@@ -119,12 +119,18 @@ func ApplyAccountJSON(raw string) error {
 	return nil
 }
 
+// accountMaxAge 是本地账号缓存的有效期。
+//
+// 为什么要过期：Cloudflare 会注销长期不用/被风控的设备，之后用这份凭据握手
+// 会一直失败，而失败看起来和「网络不通」一模一样。设备首次使用自动注册，
+// 缓存到期自动换一台新设备 —— 用户不用知道有「账号」这回事。
+const accountMaxAge = 14 * 24 * time.Hour
+
 // LoadOrRegisterAccount 按「supplied JSON → 本地文件 → 现注册」的顺序取账号，
 // 并把它应用到全局，返回账号 JSON（调用方可以存起来复用）。
 //
-// 为什么要允许外部喂 JSON：在部分网络里 api.cloudflareclient.com 连不上，
-// 现注册必然失败；这时在电脑上跑一次 warpscout register，把生成的
-// account.json 导进 App 就能用。
+// 现在 APK **不再内置账号**：每台设备首次连接时自己注册，凭据落在本地缓存，
+// 过期（[accountMaxAge]）或本地文件损坏就重新注册。
 func LoadOrRegisterAccount(ctx context.Context, accountPath, accountJSON string) (string, error) {
 	if accountJSON != "" {
 		if err := ApplyAccountJSON(accountJSON); err != nil {
@@ -134,16 +140,24 @@ func LoadOrRegisterAccount(ctx context.Context, accountPath, accountJSON string)
 	}
 
 	if accountPath != "" {
-		a, err := loadAccount(accountPath)
-		switch {
-		case err == nil:
-			applyAccount(a)
-			raw, _ := json.Marshal(a)
-			return string(raw), nil
-		case errors.Is(err, os.ErrNotExist):
-			// 没缓存，往下走注册。
-		default:
-			return "", err
+		st, serr := os.Stat(accountPath)
+		fresh := serr == nil && time.Since(st.ModTime()) < accountMaxAge
+		if fresh {
+			a, err := loadAccount(accountPath)
+			switch {
+			case err == nil:
+				applyAccount(a)
+				raw, _ := json.Marshal(a)
+				return string(raw), nil
+			case errors.Is(err, os.ErrNotExist):
+				// 没缓存，往下走注册。
+			default:
+				// 文件坏了：删掉重注册，不要卡在一条读不出来的缓存上。
+				_ = os.Remove(accountPath)
+			}
+		} else if serr == nil {
+			// 过期：删掉，走重新注册。
+			_ = os.Remove(accountPath)
 		}
 	}
 

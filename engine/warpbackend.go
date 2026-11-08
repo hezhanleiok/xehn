@@ -30,6 +30,9 @@ type warpBackend struct {
 	handshake time.Duration
 	// 账号在第一次连接时解析并缓存；后续连接（换端点、重连）不再走注册。
 	accountJSON string
+	// 连续整体失败次数。达到 2 就重置本地账号缓存（下次自动重新注册）——
+	// Cloudflare 注销设备后的表象和「网络不通」一模一样，只能靠这个兜底。
+	accountFailStreak int
 	// Psiphon 出口的官方 client.config 内容与系统 DNS，由 Kotlin 随包喂入。
 	// 为空表示没有随包配置，这时选 Psiphon 会明确报错而不是静默按基础协议走。
 	psiphonConfig string
@@ -388,7 +391,8 @@ func (b *warpBackend) TestOpenVPNNodes(
 	// 而「控制通道无响应」的节点一定要等满超时，所以并发数直接决定总时长 ——
 	// 98 个节点最坏 98×10/6 ≈ 2.7 分钟，实际大多在 1 分钟内。
 	const probeTimeout = 10 * time.Second
-	const workers = 6
+	// 并发 8：每个节点是「握手 + 2s 测速」，98 个最坏约 98×(10+2)/8 ≈ 2.5 分钟。
+	const workers = 8
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -404,7 +408,7 @@ func (b *warpBackend) TestOpenVPNNodes(
 			// 握手 + 真下载：只测握手的话，界面上「3341ms」这种数字看不出
 			// 「能握手但只有几 KB/s」的节点，而那正是用户最需要筛掉的。
 			// 测速预算 4s：够看出量级，又不会让一次全量探测拖到十分钟。
-			d, bps, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 4*time.Second)
+			d, bps, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 2*time.Second)
 			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), Bps: bps, OK: perr == nil}
 			if perr != nil {
 				p.Error = perr.Error()
@@ -756,10 +760,30 @@ func (b *warpBackend) Connect(ctx context.Context, req Request, report func(stri
 	// 一个没人读的 tun；用户实测只有退出 App 才恢复（进程消失，fd 被系统回收）。
 	defer func() {
 		if err == nil {
+			b.mu.Lock()
+			b.accountFailStreak = 0
+			b.mu.Unlock()
 			return
 		}
 		if fd, released := b.releaseLeftoverTunFD(); released {
 			report(fmt.Sprintf("已关闭系统 tun（fd %d）：没人接管的 fd 会让系统 VPN 一直挂着", fd))
+		}
+		// 账号失效的兜底：Cloudflare 注销设备后，用旧凭据握手会一直失败，
+		// 表象和「网络不通」完全一样。连续两次整体失败就把本地账号缓存删掉，
+		// 下次连接自动重新注册一台设备 —— 用户不需要知道有「账号」这回事。
+		b.mu.Lock()
+		b.accountFailStreak++
+		streak := b.accountFailStreak
+		b.mu.Unlock()
+		if streak >= 2 {
+			if p := b.accountPath(); p != "" {
+				if rmErr := os.Remove(p); rmErr == nil {
+					report("连续 2 次连接失败，已重置本地 WARP 账号；下次连接会自动重新注册")
+					b.mu.Lock()
+					b.accountFailStreak = 0
+					b.mu.Unlock()
+				}
+			}
 		}
 	}()
 

@@ -328,20 +328,13 @@ fun AboutScreen(state: VpnState, onBack: () -> Unit) {
         InfoCard(
             "运行信息",
             listOf(
-                "内置账号：" + if (state.accountBuiltIn) "已导入（assets/account.json）" else "未导入（连接时需联网注册）",
+                "WARP 账号：本机自动注册（无需内置；失效自动重置）",
                 "数据目录：" + ctx.filesDir.absolutePath + "/engine",
                 "日志文件：" + EngineBridge.logPath(ctx),
                 "系统 VPN：" + if (state.vpnUp) "已启用" else "未启用",
             ),
         )
-        InfoCard(
-            "这是什么",
-            listOf(
-                "把桌面版（d:/xhwarp）的 WARP / Psiphon 能力搬到安卓：",
-                "数据面是用户态 netstack，系统 VPN 由 VpnService 建立，不需要 root。",
-                "基础隧道支持 WG / AWG / MASQUE / WARP-in-WARP，可再叠加 Psiphon 出口。",
-            ),
-        )
+
         LinkRow("引擎核心（WG / AWG）", "amnezia-vpn/amneziawg-go", AppLinks.CORE_AWG_REPO)
         LinkRow("用户态网络栈", "google/gvisor（netstack）", AppLinks.CORE_GVISOR_REPO)
         LinkRow("MASQUE 传输", "quic-go + usque", AppLinks.CORE_USQUE_REPO)
@@ -355,26 +348,13 @@ fun AboutScreen(state: VpnState, onBack: () -> Unit) {
 fun PrivacyScreen(onBack: () -> Unit) {
     PageScaffold("隐私政策", onBack) {
         InfoCard(
-            "一句话",
-            listOf("不收集、不上传任何用户数据；没有统计、没有广告、没有第三方 SDK。"),
-        )
-        InfoCard(
-            "数据都去哪了",
+            "数据",
             listOf(
-                "· 账号与凭据（WARP / MASQUE / 外层设备 / Psiphon）只存在本机 App 私有目录。",
-                "· 运行日志只在本机内存里，导出也是你主动点、导到你选的位置。",
-                "· 连接期间只与 Cloudflare WARP 服务器、以及（开启 Psiphon 时）Psiphon 服务器通信。",
-                "· 分应用名单、协议、DNS 等设置存在本机 SharedPreferences。",
+                "不收集、不上传任何用户数据；没有统计、没有广告。",
+                "账号与日志只在本机 App 私有目录。",
             ),
         )
-        InfoCard(
-            "内置账号要注意",
-            listOf(
-                "APK 里带了一份 WARP 设备身份（assets/account.json）。把 APK 转发给别人，",
-                "等于把这份身份一起给了 —— 需要自己独占身份时请替换成自己的账号。",
-            ),
-        )
-        LinkRow("完整隐私政策", "跟随 App 仓库（占位）", AppLinks.APP_PRIVACY)
+        LinkRow("完整隐私政策", "跟随 App 仓库", AppLinks.APP_PRIVACY)
     }
 }
 
@@ -420,14 +400,7 @@ fun UpdateScreen(state: VpnState, onBack: () -> Unit) {
                 "引擎：${state.version.ifBlank { "—" }}",
             ),
         )
-        InfoCard(
-            "还没做的部分",
-            listOf(
-                "应用内检查更新 / 下载安装：尚未实现（需要仓库地址与签名约定）。",
-                "现在请到下方仓库页面手动查看新版本。",
-            ),
-        )
-        LinkRow("查看新版本", "GitHub Releases（占位仓库）", AppLinks.APP_RELEASES)
+        LinkRow("查看新版本", "GitHub Releases", AppLinks.APP_RELEASES)
         LinkRow("问题反馈", "GitHub Issues", AppLinks.APP_ISSUES)
     }
 }
