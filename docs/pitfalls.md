@@ -510,4 +510,17 @@ Aether（Rust + quiche）同样是 Cubic、同样没有 BBR，它的优势不在
 域名形式的 direct 在 VPN 模式仍然无效 —— 内核按 IP 路由，看不到域名，这是
 平台限制，不是漏做。
 
+### 10.5 产物命名：`xehn-<版本号>.apk`
+
+在 `app/build.gradle.kts` 里用 `androidComponents { onVariants { ... } }` 把
+`VariantOutputImpl.outputFileName` 改成 `xehn-$buildVersionName.apk`。
+
+注意两件事：
+
+- **不能用老的 `applicationVariants.all`**：AGP 8 已废弃，而且它改的是「输出对象」
+  的旧实现；`androidComponents` 是官方路径。
+- **`Variant.versionName` 不存在**（只有 `applicationVariants` 的
+  `mergedFlavor.versionName`）。这里从 `android.defaultConfig.versionName` 读，
+  一处定义、两处使用（APK 名和 `BuildConfig.VERSION_NAME`）。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

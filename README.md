@@ -17,7 +17,7 @@
 | `engine/` Go 引擎（gomobile 打成 `.aar`） | ✅ `go test` / `go vet` 全过，`android/arm64` 交叉编译通过 |
 | `app/libs/engine.aar` | ✅ 已生成（17.8 MB，含 arm64 + arm 的 `libgojni.so`） |
 | `app/` Kotlin + Compose 界面骨架 | ✅ 编译通过 |
-| **`app-debug.apk`** | ✅ **已构建成功（65.6 MB，v0.2.14）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.9 MB） |
+| **`xehn-<版本号>.apk`** | ✅ **已构建成功（`xehn-0.2.14.apk`，65.6 MB）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.9 MB）。产物名由 `app/build.gradle.kts` 的 `androidComponents` 统一改成 `xehn-<versionName>.apk` |
 | `WarpVpnService` | ✅ 前台服务 + 通知 + tun fd 接缝（**路由默认关闭**，见下） |
 | 环境（JDK/SDK/NDK/gomobile/Gradle） | ✅ `check-env.ps1` **12 项就绪 / 0 缺失** |
 | **真正建立隧道（P1，已接入）** | ✅ warpscout 引擎搬进 `engine/warp`，能建 WG/AWG 隧道并拿到真实出口 IP |
@@ -164,7 +164,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\check-env.ps1
 # 1) Go 引擎 → app\libs\engine.aar
 powershell -ExecutionPolicy Bypass -File .\tools\build-engine.ps1
 
-# 2) 打 APK（产物 app\build\outputs\apk\debug\app-debug.apk）
+# 2) 打 APK（产物 app\build\outputs\apk\debug\xehn-<版本号>.apk）
 powershell -ExecutionPolicy Bypass -File .\tools\build-apk.ps1
 powershell -ExecutionPolicy Bypass -File .\tools\build-apk.ps1 -Install   # 直接装到设备
 ```
@@ -206,7 +206,7 @@ $adb = "$env:ANDROID_HOME\platform-tools\adb.exe"
 powershell -ExecutionPolicy Bypass -File .\tools\build-apk.ps1 -Install   # 之后无线装机
 ```
 
-**C. U 盘 / 网盘**：把 `app-debug.apk` 拷出去，手机上点开安装。最慢，但最不需要配置。
+**C. U 盘 / 网盘**：把 `xehn-<版本号>.apk` 拷出去，手机上点开安装。最慢，但最不需要配置。
 
 ---
 

@@ -55,6 +55,24 @@ android {
     }
 }
 
+/**
+ * 产物名统一成 `xehn-<版本号>.apk`（用户要求：包名就叫 xehn + 版本号）。
+ *
+ * 用 androidComponents 而不是老的 applicationVariants —— AGP 8 里后者已经废弃，
+ * 而且变体输出必须通过 VariantOutputImpl 改名，改目录名是不生效的。
+ */
+private val buildVersionName: String = android.defaultConfig.versionName ?: "0.0.0"
+
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            (output as? com.android.build.api.variant.impl.VariantOutputImpl)
+                ?.outputFileName
+                ?.set("xehn-$buildVersionName.apk")
+        }
+    }
+}
+
 dependencies {
     // gomobile 产物。用 tools/build-engine.ps1 生成；没有它时 Kotlin 里的
     // com.xiaohe.engine.* 会编译不过 —— 这是正常的，先生成再构建。
