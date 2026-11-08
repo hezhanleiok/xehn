@@ -328,6 +328,29 @@ object EngineBridge {
     }
 
     /**
+     * 连接前预注册账号（阻塞，必须放 IO 线程）。
+     *
+     * 必须在 `VpnService.establish()` **之前**调用：VPN 一建立，系统 DNS 查询就被
+     * 路由进还没通的隧道，`api.cloudflareclient.com` 会 `no such host`。
+     */
+    fun prepareAccounts(context: Context, proto: String) {
+        val raw = try {
+            engineOrCreate(context).prepareAccounts(proto)
+        } catch (t: Throwable) {
+            note("[ui] 预注册调用失败：${t.message}")
+            return
+        }
+        try {
+            val o = JSONObject(raw)
+            if (!o.optBoolean("ok", false)) {
+                note("[ui] 账号预注册失败：${o.optString("error", "未知原因")}")
+            }
+        } catch (_: Exception) {
+            // 解析失败就当作没预注册，连接流程自己会再报错。
+        }
+    }
+
+    /**
      * 未连接时首页显示的「本机 IP」= **局域网地址**（如 192.168.5.8）。
      *
      * 以前这里显示公网出口 IP：那个数字和「出口 IP」几乎一样，用户无法用它核对

@@ -145,8 +145,10 @@ func (b *warpBackend) RefreshVPNGateNodes(ctx context.Context, report func(strin
 		UnderlayProto:    "awg",
 		UnderlayPrefer:   b.preferEndpoint("awg"),
 		HandshakeTimeout: handshake,
-		Timeout:          20 * time.Second,
-		Report:           report,
+		// 40s：vpngate.net 经 WARP 到日本再回源，实测经常 20s 以上；
+		// 20s 会在「其实能拉到」的情况下报超时。
+		Timeout: 40 * time.Second,
+		Report:  report,
 	})
 	if err != nil {
 		return 0, err
@@ -161,6 +163,41 @@ func (b *warpBackend) RefreshVPNGateNodes(ctx context.Context, report func(strin
 	b.vpnGate = c
 	b.mu.Unlock()
 	return len(nodes), nil
+}
+
+// PrepareAccounts 在建系统 VPN **之前**把账号准备好（必要时注册）。
+//
+// 顺序很重要：VpnService.establish() 之后，系统的 DNS 查询会被路由进 tun，而
+// 那时隧道还没通 —— 注册请求的域名解析直接失败。真机日志里 MASQUE 连不上就是
+// 这一条（`lookup api.cloudflareclient.com: no such host`）。
+func (b *warpBackend) PrepareAccounts(ctx context.Context, proto string, report func(string)) error {
+	if proto == "" {
+		proto = "awg"
+	}
+	// 只为让 EnsureMasqueAccount 知道凭据路径；不动 tunFD（连接前本来就是 0）。
+	warp.Apply(warp.Config{
+		MasqueCredsPath:      filepath.Join(b.workDir, "masque.json"),
+		MasqueOuterCredsPath: filepath.Join(b.workDir, "masque-outer.json"),
+		OuterCredsPath:       filepath.Join(b.workDir, "outer.json"),
+	})
+
+	b.mu.Lock()
+	accountJSON := b.accountJSON
+	b.mu.Unlock()
+	raw, err := warp.LoadOrRegisterAccount(ctx, b.accountPath(), accountJSON)
+	if err != nil {
+		return fmt.Errorf("注册 WARP 账号失败：%w", err)
+	}
+	b.mu.Lock()
+	b.accountJSON = raw
+	b.mu.Unlock()
+
+	if strings.HasPrefix(proto, "masque") {
+		if err := warp.EnsureMasqueAccount(ctx, report); err != nil {
+			return fmt.Errorf("注册 MASQUE 账号失败：%w", err)
+		}
+	}
+	return nil
 }
 
 // SetOpenVPNExit 选择 OpenVPN 出口。enabled=false 时清空，回到普通会话。

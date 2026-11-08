@@ -181,6 +181,27 @@ var masqueAcct *account
 // 每次会话的 MASQUE 凭据文件路径，由 Config 注入（与 WG 账号分开存）。
 var masqueCredsFile string
 
+// EnsureMasqueAccount 确保 MASQUE 凭据就绪（必要时现注册），供「连接前预注册」用。
+//
+// 为什么必须在建系统 VPN **之前**做：VPN 一建立，系统 DNS 查询就被路由进一条
+// 还没通的隧道，`api.cloudflareclient.com` 直接解析失败 —— 真机日志原文：
+//
+//	MASQUE 注册失败: Post "https://api.cloudflareclient.com/v0a4471/reg":
+//	dial tcp: lookup api.cloudflareclient.com: no such host
+//
+// 这也是为什么 WG/AWG 能连（账号有缓存）、MASQUE 连不上（凭据丢了要重注册）。
+func EnsureMasqueAccount(ctx context.Context, report func(string)) error {
+	if masqueAcct != nil {
+		return nil
+	}
+	a, err := ensureMasqueAccount(ctx, report)
+	if err != nil {
+		return err
+	}
+	masqueAcct = a
+	return nil
+}
+
 // masqueMTU 与系统 tun 用同一个 MTU：Kotlin 的 VpnService.Builder 和引擎
 // 必须是同一个值，否则内核会按错误尺寸切包。
 //

@@ -556,4 +556,37 @@ Aether（Rust + quiche）同样是 Cubic、同样没有 BBR，它的优势不在
 真正能区分线路的是 `/cdn-cgi/trace` 里的 `colo`（接入的边缘机场代码），现在连接
 日志会写：`出口 104.28.245.200 (CN, colo=HKG)`。
 
+---
+
+## 12. 0.2.16：MASQUE 注册失败的真正原因
+
+真机日志（2026-11-08 16:29）：
+
+```
+[tunnel] 准备 MASQUE 账号（首次需要注册 + 登记 ECDSA 公钥）…
+[engine] 连接失败: MASQUE 注册失败: POST /reg:
+         dial tcp: lookup api.cloudflareclient.com: no such host
+```
+
+**因果链**：`WarpVpnService.startConnect()` 先 `establish()` 建系统 VPN，再
+`connect()`；账号注册发生在 connect 内部。此时系统 DNS 已经被路由进 tun，
+而隧道还没通 —— 域名解析直接失败。WG/AWG 之所以能连，是因为它们的账号早就有
+缓存，根本不需要联网注册。
+
+修法：把账号准备**提到建 tun 之前**。
+
+- 引擎新增 `Engine.PrepareAccounts(proto)` → `warpBackend.PrepareAccounts`
+  → `warp.EnsureMasqueAccount`（MASQUE 时）；
+- `WarpVpnService` 的 `ACTION_CONNECT` 改成协程：先在 IO 线程预注册，
+  再 `startConnect()`。首次会慢几秒（注册 + ECDSA 登记），之后走缓存。
+
+顺带把 VPN Gate 抓取改成**只走 WARP**（原先是 8s 直连超时后再走 WARP，纯白等），
+超时从 20s 提到 40s（经 WARP 到日本回源经常 20s 以上）。
+
+> 对照：官方 Cloudflare One Client 的 `conf.json` 里也是**匿名免费账号**
+> （`account_type: free` + `license`，无登录），`tunnel_key_data` 为
+> `secp256r1/masque`，MASQUE 端点只有 `162.159.198.2`（7 个端口），
+> 并且用 `always_exclude` 把 `162.159.197.3` 永久排除出隧道 —— 正是为了避免
+> 「建隧道后连不上控制面」这类死锁。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

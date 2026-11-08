@@ -593,22 +593,17 @@ func FetchVPNGate(ctx context.Context, o VPNGateFetchOptions) ([]VPNGateNode, er
 }
 
 // fetchVPNGateTextWithFallback 返回 CSV 与（可能为 nil 的）临时隧道。
+//
+// **只有 WARP 前置一种方式**：vpngate.net 在受限网络里直连必然超时，先试直连
+// 只会让每次「刷新节点」都白等一次（真机日志里就是这样：8 秒直连超时，再走
+// WARP）。用户明确要求取消直连，这里不再保留那条分支。
 func fetchVPNGateTextWithFallback(ctx context.Context, o VPNGateFetchOptions) (string, *Session, error) {
-	// 直连只给 8 秒：受限网络里这个域名必然超时，等满 20 秒才转 WARP 纯属白等。
-	direct := o
-	if direct.Timeout > 8*time.Second {
-		direct.Timeout = 8 * time.Second
-	}
-	text, err := fetchVPNGateText(ctx, nil, direct)
-	if err == nil {
-		return text, nil, nil
-	}
-	o.report("直连抓取 VPN Gate 失败（" + shortErr(err) + "），改走 WARP…")
+	o.report("经 WARP 抓取 VPN Gate…")
 	sess, derr := dialFetchUnderlay(ctx, o)
 	if derr != nil {
-		return "", nil, fmt.Errorf("抓取 VPN Gate 失败：直连 %v；WARP %v", err, derr)
+		return "", nil, fmt.Errorf("经 WARP 抓取 VPN Gate 失败（WARP 上游没建起来）：%w", derr)
 	}
-	text, err = fetchVPNGateText(ctx, sess.tn.stack(), o)
+	text, err := fetchVPNGateText(ctx, sess.tn.stack(), o)
 	if err != nil {
 		sess.Close()
 		return "", nil, fmt.Errorf("经 WARP 抓取 VPN Gate 失败: %w", err)

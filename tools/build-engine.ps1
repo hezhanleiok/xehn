@@ -11,7 +11,15 @@ param(
     # com.xiaohe.engine.engine，Kotlin 侧全部 Unresolved reference。
     [string]$JavaPkg = 'com.xiaohe',
     [int]$AndroidAPI = 24,
-    [switch]$SkipInit
+    [switch]$SkipInit,
+    # 跳过 `go test ./...`。
+    #
+    # 少数机器开了 Windows 应用控制策略（WDAC / Smart App Control），会拦住
+    # 刚编译出来、未签名的 *.test.exe：
+    #   fork/exec ...\warp.test.exe: An Application Control policy has blocked this file
+    # 这不是代码错误，但脚本会因为「自测失败」中止。真遇到这种情况用 -SkipTest，
+    # 打完包自己在能跑测试的环境里补跑一次 go test。
+    [switch]$SkipTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,9 +90,13 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'go get -tool golang.org/x/mobile/cmd/gobind 失败' }
     }
 
-    Write-Host 'go test ./... （打 aar 前先跑引擎自测）' -ForegroundColor Cyan
-    & go test ./...
-    if ($LASTEXITCODE -ne 0) { throw 'engine go test 失败，先修好再打 aar' }
+    if (-not $SkipTest) {
+        Write-Host 'go test ./... （打 aar 前先跑引擎自测）' -ForegroundColor Cyan
+        & go test ./...
+        if ($LASTEXITCODE -ne 0) { throw 'engine go test 失败，先修好再打 aar' }
+    } else {
+        Write-Host '已按 -SkipTest 跳过 go test（记得在能跑测试的环境补一次）' -ForegroundColor Yellow
+    }
 
     if (-not $SkipInit) {
         Write-Host 'gomobile init ...' -ForegroundColor Cyan

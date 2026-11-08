@@ -252,6 +252,29 @@ func (e *Engine) SetOpenVPNExit(idsCSV, label, country string) {
 	e.sess.logf("[engine] OpenVPN 出口 = %s（%s），候选 %d 个", label, country, len(kept))
 }
 
+// PrepareAccounts 在建立系统 VPN **之前**把账号准备好（首次使用会现注册）。
+//
+// 为什么必须在 establish 之前：VPN 一建立，系统 DNS 就被路由进还没通的 tun，
+// 注册域名解析失败。Kotlin 侧在 ACTION_CONNECT 里先调它，再建 tun。
+//
+// Returns JSON: {"ok":true} 或 {"ok":false,"error":"..."}
+func (e *Engine) PrepareAccounts(proto string) string {
+	wb := e.warpBackendOf()
+	if wb == nil {
+		return `{"ok":false,"error":"引擎未安装"}`
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	e.sess.logf("[engine] 连接前预注册账号（协议 %s）…", proto)
+	if err := wb.PrepareAccounts(ctx, proto, func(s string) { e.sess.logf("[acct] %s", s) }); err != nil {
+		e.sess.logf("[engine] 预注册失败：%v", err)
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+		return string(b)
+	}
+	e.sess.logf("[engine] 账号就绪")
+	return `{"ok":true}`
+}
+
 // TestOpenVPNNodes runs a REAL OpenVPN handshake against each given node and
 // returns them with the measured handshake time.
 //

@@ -243,7 +243,16 @@ class WarpVpnService : VpnService() {
             ACTION_CONNECT -> {
                 startForegroundSafely(getString(R.string.notif_connecting))
                 startWatchdog()
-                startConnect(intent)
+                val proto = intent.getStringExtra(EXTRA_PROTO) ?: SettingsStore.load(this).proto
+                // 账号必须在建 tun **之前**注册好：系统 VPN 一建立，DNS 查询就被
+                // 路由进还没通的隧道，注册域名会解析失败（真机日志里 MASQUE 就卡
+                // 在这一步：lookup api.cloudflareclient.com: no such host）。
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        EngineBridge.prepareAccounts(this@WarpVpnService, proto)
+                    }
+                    startConnect(intent)
+                }
                 return START_NOT_STICKY
             }
             ACTION_SWITCH_PROTO -> {
