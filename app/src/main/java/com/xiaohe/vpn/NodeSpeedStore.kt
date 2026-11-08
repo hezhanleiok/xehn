@@ -156,7 +156,7 @@ object NodeSpeedStore {
 
     /** 「≈1.2 MB/s」/「≈14 KB/s」，给日志用。 */
     fun text(bps: Long): String = when {
-        bps <= 0 -> "未知"
+        bps <= 0 -> "未测"
         bps >= 1024L * 1024 -> String.format(java.util.Locale.US, "≈%.1f MB/s", bps / 1048576.0)
         else -> "≈${bps / 1024} KB/s"
     }

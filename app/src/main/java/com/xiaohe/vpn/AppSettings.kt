@@ -25,13 +25,26 @@ data class AppSettings(
      * 所以这里只有两种，第三种列出来只会是骗人的开关。
      */
     val mode: String = "vpn",
-    /** 本地代理端口（仅 proxy 模式有效）。 */
+    /** 本地代理端口（「仅代理」模式必开；VPN 模式下由 [localProxy] 决定）。 */
     val proxyPort: Int = 1080,
     /**
-     * 允许局域网访问代理端口（仅 proxy 模式）：监听 0.0.0.0 而不是 127.0.0.1。
+     * 允许局域网访问代理端口：监听 0.0.0.0 而不是 127.0.0.1。
      * 注意 SOCKS5 没有认证 —— 同一 Wi-Fi 下谁都能用，公共网络别开。
      */
     val proxyLan: Boolean = false,
+    /**
+     * VPN 模式下也开本地 SOCKS5 端口。
+     *
+     * 「仅代理」模式本来就必须开；这一项是给 VPN 模式用的：整机已经走隧道，
+     * 但同一 Wi-Fi 下的电脑/平板想借这条隧道，就需要一个监听在局域网上的入口
+     * （见「局域网共享」页）。默认关：多一个监听就多一个攻击面。
+     */
+    val localProxy: Boolean = false,
+    /**
+     * 健康守护：连接被掐断/长时间无数据时自动断开重连（Service 内的看门狗）。
+     * 关掉后只写日志、不自动重连，适合按流量计费或需要绝对稳定的场景。
+     */
+    val healthGuard: Boolean = true,
     /** 分流策略：global（全局）/ bypass-cn（绕过大陆）/ blacklist（黑名单）。 */
     val rulePolicy: String = "global",
     /**
@@ -120,6 +133,8 @@ object SettingsStore {
             mode = p.getString("mode", d.mode) ?: d.mode,
             proxyPort = p.getInt("proxyPort", d.proxyPort),
             proxyLan = p.getBoolean("proxyLan", d.proxyLan),
+            localProxy = p.getBoolean("localProxy", d.localProxy),
+            healthGuard = p.getBoolean("healthGuard", d.healthGuard),
             rulePolicy = p.getString("rulePolicy", d.rulePolicy) ?: d.rulePolicy,
             ruleText = p.getString("ruleText", d.ruleText) ?: d.ruleText,
             ipv6 = p.getBoolean("ipv6", d.ipv6),
@@ -150,6 +165,8 @@ object SettingsStore {
             putString("mode", s.mode)
             putInt("proxyPort", s.proxyPort)
             putBoolean("proxyLan", s.proxyLan)
+            putBoolean("localProxy", s.localProxy)
+            putBoolean("healthGuard", s.healthGuard)
             putString("rulePolicy", s.rulePolicy)
             putString("ruleText", s.ruleText)
             putBoolean("ipv6", s.ipv6)

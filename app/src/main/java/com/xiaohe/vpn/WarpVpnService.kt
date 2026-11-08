@@ -328,8 +328,14 @@ class WarpVpnService : VpnService() {
             e.setTunFD(fd.toLong())
             e.setVPNState(true)
             e.setTimeout(s.timeoutSec.toLong())
-            // VPN 模式不需要本地端口：整个系统已经走隧道，多开一个监听没人用。
-            e.setSocksListen("")
+            // VPN 模式默认不开本地端口（整个系统已经走隧道）；但用户想要
+            // 「局域网共享」——让同一 Wi-Fi 的电脑借这条隧道 —— 就需要一个监听在
+            // 局域网上的 SOCKS5 入口，所以这里按设置决定。
+            val socks = if (s.localProxy || s.proxyLan) s.proxyListenAddr() else ""
+            e.setSocksListen(socks)
+            if (socks.isNotEmpty()) {
+                EngineBridge.note("[vpn] 本地代理已开启：$socks（局域网共享入口）")
+            }
             EngineBridge.note(
                 "[vpn] 系统 VPN 已启用（tun fd=$fd, MTU=" +
                     when {
@@ -1149,6 +1155,12 @@ class WarpVpnService : VpnService() {
             while (isActive) {
                 delay(WATCHDOG_TICK_MS)
                 if (!EngineBridge.state.value.needRecover) continue
+                // 健康守护关掉时只记录，不自动断开重连（按流量计费/需要绝对稳定的
+                // 场景，重连本身比断流更糟）。
+                if (!SettingsStore.load(this@WarpVpnService).healthGuard) {
+                    EngineBridge.note("[vpn] 出口异常，但「健康守护」已关闭：只记录，不自动重连")
+                    continue
+                }
                 val now = System.currentTimeMillis()
                 if (now - windowStart > RECOVER_WINDOW_MS) {
                     windowStart = now

@@ -255,11 +255,47 @@ func (o *OpenVPNOptions) report(msg string) {
 	}
 }
 
+// packetStream 是 tun 侧的最小读写接口。
+//
+// 真实连接用 packetFile（借用 VpnService 的 fd，不拥有、不关闭）；
+// 「测延迟时顺便测速」用 gVisor netstack 设备（tunDeviceStream），这样不必为
+// 测一个节点的速度而去建系统 VPN（那会把用户正在用的连接踢掉）。
+type packetStream interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	Close() error
+}
+
+// tunDeviceStream 把 amneziawg-go 的 tun.Device（这里是 gVisor netstack）适配成
+// packetStream：设备的 Read/Write 是「批量 + offset」形状，这里退化成单包。
+type tunDeviceStream struct {
+	dev interface {
+		Read([][]byte, []int, int) (int, error)
+		Write([][]byte, int) (int, error)
+	}
+}
+
+func (t *tunDeviceStream) Read(p []byte) (int, error) {
+	bufs := [][]byte{p}
+	sizes := []int{0}
+	if _, err := t.dev.Read(bufs, sizes, 0); err != nil {
+		return 0, err
+	}
+	return sizes[0], nil
+}
+
+func (t *tunDeviceStream) Write(p []byte) (int, error) {
+	return t.dev.Write([][]byte{p}, 0)
+}
+
+// Close 什么都不做：netstack 设备由调用方关闭。
+func (t *tunDeviceStream) Close() error { return nil }
+
 // openvpnExit 是一条已经跑起来的 OpenVPN 数据面。
 type openvpnExit struct {
 	client *ovpn.Client
 	// file 只借用 tun fd，不拥有、不关闭（关闭权在 Kotlin 的 ParcelFileDescriptor）。
-	file   *packetFile
+	file   packetStream
 	cancel context.CancelFunc
 	once   sync.Once
 
@@ -526,20 +562,62 @@ func OpenUnderlay(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 // 注意它证明不了「能转发流量」：握手成功但一个字节都不转的节点在 VPN Gate 上很常见，
 // 所以这只是**筛掉死的**，真正能不能用还得靠连接时的出口验证。
 func ProbeOpenVPNHandshake(ctx context.Context, under *Session, configText string, timeout time.Duration) (time.Duration, error) {
+	client, _, elapsed, err := probeOpenVPNHandshake(ctx, under, configText, timeout)
+	if client != nil {
+		_ = client.Close()
+	}
+	return elapsed, err
+}
+
+// ProbeOpenVPNSpeed 在握手之后，经**同一个节点**真下载一小段，返回
+// (握手耗时, 字节/秒, error)。
+//
+// bps == 0 且 err == nil 表示「握手成功但测不出速度」（节点慢、测速端点不可达）：
+// 这种情况**不要判节点失败** —— 没有证据说明它不能用，界面显示「握手成功 ·
+// 速度未测」即可，和连接时 measureExitBps 的取舍一致。
+//
+// 数据面用进程内 gVisor netstack 当 tun：OpenVPN 的包泵往它写，HTTPS 从它拨。
+// 这样测速不需要建系统 VPN，也就不会把用户正在用的连接踢掉。
+func ProbeOpenVPNSpeed(
+	ctx context.Context, under *Session, configText string,
+	timeout, budget time.Duration,
+) (time.Duration, int64, error) {
+	client, push, elapsed, err := probeOpenVPNHandshake(ctx, under, configText, timeout)
+	if err != nil {
+		if client != nil {
+			_ = client.Close()
+		}
+		return elapsed, 0, err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = client.Close()
+		}
+	}()
+	bps := measureThroughOpenVPN(client, push, budget)
+	closed = true
+	return elapsed, bps, nil
+}
+
+// probeOpenVPNHandshake 拨号并完成握手，把可用的 client 交给调用方关闭。
+func probeOpenVPNHandshake(
+	ctx context.Context, under *Session, configText string, timeout time.Duration,
+) (*ovpn.Client, *ovpn.PushReply, time.Duration, error) {
 	if under == nil {
-		return 0, errors.New("没有上游隧道")
+		return nil, nil, 0, errors.New("没有上游隧道")
 	}
 	stack := under.tn.stack()
 	if stack == nil {
-		return 0, errors.New("上游没有 netstack（内部错误）")
+		return nil, nil, 0, errors.New("上游没有 netstack（内部错误）")
 	}
 	cfgText, err := ParseOpenVPNConfig(configText)
 	if err != nil {
-		return 0, err
+		return nil, nil, 0, err
 	}
 	clientCfg, err := cfgText.clientConfig()
 	if err != nil {
-		return 0, fmt.Errorf("ovpn 配置不受支持: %w", err)
+		return nil, nil, 0, fmt.Errorf("ovpn 配置不受支持: %w", err)
 	}
 	if timeout <= 0 {
 		timeout = 12 * time.Second
@@ -547,7 +625,7 @@ func ProbeOpenVPNHandshake(ctx context.Context, under *Session, configText strin
 	nodeAddr := net.JoinHostPort(cfgText.RemoteHost, strconv.Itoa(cfgText.RemotePort))
 	conn, err := dialThroughStack(ctx, stack, cfgText.Proto, nodeAddr, timeout)
 	if err != nil {
-		return 0, fmt.Errorf("经 WARP 连接节点失败: %w", err)
+		return nil, nil, 0, fmt.Errorf("经 WARP 连接节点失败: %w", err)
 	}
 	packetIO := ovpn.NewDatagramPacketIO(conn)
 	if cfgText.Proto == ovpn.ProtoTCP {
@@ -556,9 +634,8 @@ func ProbeOpenVPNHandshake(ctx context.Context, under *Session, configText strin
 	client, err := ovpn.NewClient(clientCfg, packetIO)
 	if err != nil {
 		_ = conn.Close()
-		return 0, fmt.Errorf("OpenVPN 客户端初始化失败: %w", err)
+		return nil, nil, 0, fmt.Errorf("OpenVPN 客户端初始化失败: %w", err)
 	}
-	defer client.Close()
 
 	hsCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -566,12 +643,83 @@ func ProbeOpenVPNHandshake(ctx context.Context, under *Session, configText strin
 	push, err := client.Handshake(hsCtx)
 	elapsed := time.Since(start)
 	if err != nil {
-		return elapsed, fmt.Errorf("OpenVPN 握手失败: %w", err)
+		_ = client.Close()
+		return nil, nil, elapsed, fmt.Errorf("OpenVPN 握手失败: %w", err)
 	}
 	if push == nil || len(push.Prefixes) == 0 {
-		return elapsed, errors.New("握手成功但服务器没有下发 ifconfig 地址")
+		_ = client.Close()
+		return nil, nil, elapsed, errors.New("握手成功但服务器没有下发 ifconfig 地址")
 	}
-	return elapsed, nil
+	return client, push, elapsed, nil
+}
+
+// measureThroughOpenVPN 用 gVisor netstack 当 tun，把 OpenVPN 的包泵接上去，
+// 然后做一次真实下载。0 = 测不出来。
+func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget time.Duration) int64 {
+	tun := openVPNTunFromPush(push)
+	addr, err := netip.ParseAddr(tun.Address)
+	if err != nil || !addr.Is4() {
+		return 0
+	}
+	dev, stack, err := newIPStack([]netip.Addr{addr}, tun.MTU)
+	if err != nil {
+		return 0
+	}
+	defer dev.Close()
+	ex := &openvpnExit{client: client, file: &tunDeviceStream{dev: dev}}
+	ex.startPump(context.Background())
+	defer ex.close()
+	if budget <= 0 {
+		budget = 5 * time.Second
+	}
+	return probeDownloadBps(stack, budget)
+}
+
+// probeSpeedURL 是探测用的测速端点：1 MiB 足够看出量级，又不至于让一个节点
+// 占住探测通道太久。正式的出口测速另有 speedURL（100 MiB + 预热）。
+const probeSpeedURL = "https://speed.cloudflare.com/__down?bytes=1048576"
+
+// probeDownloadBps 经 netstack 下载一小段并算出字节/秒。
+//
+// 不做预热：探测要的是「这个节点大概能跑多少」，不是精确的稳态吞吐；
+// 预算内收到多少算多少，收不到就返回 0（调用方显示「未测」）。
+func probeDownloadBps(stack *ipStack, budget time.Duration) int64 {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	client := &http.Client{
+		Timeout: budget,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+				// 交给 gVisor：域名在隧道里解析，不泄漏到本机。
+				return stack.tnet.DialContext(dctx, network, addr)
+			},
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeSpeedURL, nil)
+	if err != nil {
+		return 0
+	}
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 32<<10)
+	var got int64
+	for {
+		n, rerr := resp.Body.Read(buf)
+		got += int64(n)
+		if rerr != nil || time.Since(start) >= budget {
+			break
+		}
+	}
+	d := time.Since(start).Seconds()
+	if got <= 0 || d <= 0 {
+		return 0
+	}
+	return int64(float64(got) / d)
 }
 
 // dialOpenVPNUpstream 起 WARP 上游 → 经它拨节点 → 完成 OpenVPN 握手。

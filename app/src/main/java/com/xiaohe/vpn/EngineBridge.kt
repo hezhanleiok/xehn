@@ -228,8 +228,19 @@ object EngineBridge {
         "刷新失败：${t.message}"
     }
 
-    /** 一条「真实 OpenVPN 握手」测试结果。 */
-    data class NodeProbeResult(val id: String, val ms: Int, val ok: Boolean, val error: String)
+    /**
+     * 一条「真实 OpenVPN 握手 + 真下载」测试结果。
+     *
+     * [bps] 是握手后经该节点实测的吞吐（0 = 握手成功但测不出，界面写「速度未测」）。
+     * 只测握手看不出「能握手但只有几 KB/s」的节点，而那正是最该筛掉的。
+     */
+    data class NodeProbeResult(
+        val id: String,
+        val ms: Int,
+        val ok: Boolean,
+        val error: String,
+        val bps: Long = 0,
+    )
 
     /**
      * 对给定节点做**真实 OpenVPN 握手**测试并把结果落盘（阻塞，几秒到两三分钟）。
@@ -264,6 +275,7 @@ object EngineBridge {
                         ms = r.optInt("ms", 0),
                         ok = r.optBoolean("ok", false),
                         error = r.optString("error"),
+                        bps = r.optLong("bps", 0),
                     )
                 )
             }
@@ -432,7 +444,7 @@ data class VpnGateNode(
     val classLabel: String get() = when (cls) {
         "residential" -> "家宽"
         "datacenter" -> "机房"
-        else -> "未知"
+        else -> "未分类"
     }
 }
 

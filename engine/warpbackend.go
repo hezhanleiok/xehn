@@ -324,10 +324,13 @@ func (b *warpBackend) freshOpenVPNIDs(ids []string, report func(string)) []strin
 	return fresh
 }
 
-// OpenVPNProbe 是一次「真握手测延迟」的结果。
+// OpenVPNProbe 是一次「真握手 + 真下载」的结果。
 type OpenVPNProbe struct {
-	ID    string `json:"id"`
-	MS    int64  `json:"ms"`
+	ID string `json:"id"`
+	// MS 是真实 OpenVPN 握手耗时。
+	MS int64 `json:"ms"`
+	// Bps 是握手后经该节点下载实测的吞吐（字节/秒）；0 = 握手成功但测不出。
+	Bps   int64  `json:"bps,omitempty"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
@@ -398,8 +401,11 @@ func (b *warpBackend) TestOpenVPNNodes(
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			d, perr := warp.ProbeOpenVPNHandshake(ctx, under, cfg, probeTimeout)
-			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), OK: perr == nil}
+			// 握手 + 真下载：只测握手的话，界面上「3341ms」这种数字看不出
+			// 「能握手但只有几 KB/s」的节点，而那正是用户最需要筛掉的。
+			// 测速预算 4s：够看出量级，又不会让一次全量探测拖到十分钟。
+			d, bps, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 4*time.Second)
+			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), Bps: bps, OK: perr == nil}
 			if perr != nil {
 				p.Error = perr.Error()
 				b.markOpenVPNFailed(id)
@@ -435,7 +441,10 @@ func (b *warpBackend) TestOpenVPNNodes(
 // probeSummary 是日志里每个节点的一句话结果。
 func probeSummary(p OpenVPNProbe) string {
 	if p.OK {
-		return fmt.Sprintf("握手成功 %dms", p.MS)
+		if p.Bps > 0 {
+			return fmt.Sprintf("握手成功 %dms · ≈%d KB/s", p.MS, p.Bps/1024)
+		}
+		return fmt.Sprintf("握手成功 %dms · 速度未测", p.MS)
 	}
 	return "失败：" + p.Error
 }

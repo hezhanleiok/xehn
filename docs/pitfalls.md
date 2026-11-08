@@ -296,6 +296,7 @@ adb shell run-as com.xiaohe.vpn cp /data/local/tmp/p.xml shared_prefs/xiaohe-set
 | `改用 amneziawg 再试`、`本地 SOCKS %s` | **0.2.11**：Psiphon 上游临时端口 + 失败自动换协议 |
 | `masque-x2`、`MASQUEX2`、`masque-outer.json` | **0.2.11**：MASQUE(HTTP/3) 套 MASQUE(HTTP/3) |
 | `改用 HTTP/3 再试一轮`、`按流分发`、`上行并行` | **0.2.12**：h2 回退 h3 + MASQUE 上行三条会话并行 |
+| `ipwho.is`、`未分类`、`握手 + 测速完成`、`局域网共享` | **0.2.13**：双数据源分类 + 探测测速 + 设置重构 |
 
 ---
 
@@ -404,5 +405,73 @@ Aether（Rust + quiche）同样是 Cubic、同样没有 BBR，它的优势不在
    配合 `quic.Config.InitialPacketSize` 直接按该尺寸起步，省掉 DPLPMTUD 的爬坡。
 
 > 验证点：日志里应出现 `上行并行：3 条 CONNECT-IP 会话就绪（按流分发）`。
+
+---
+
+## 9. 0.2.13：测速、分类与设置页审计
+
+### 9.1 「测延迟」改成「握手 + 真下载」
+
+只测握手看不出「能握手但只有几 KB/s」的节点 —— 而那正是最该筛掉的（用户在
+2026-11-07 的日志里就碰到：65 KB/s 的节点连上后立刻被换掉）。
+
+做法：`ProbeOpenVPNSpeed` 在握手成功后，用 **gVisor netstack 当 tun** 把 OpenVPN
+的包泵接上，再经它下载 1 MiB 测吞吐。这样测速**不需要建系统 VPN**，不会把用户
+正在用的连接踢掉；代价是每个节点多 4 秒。
+
+结果同时写进速度记忆（`NodeSpeedStore`）：列表里的 `握手 3341ms · ≈94 KB/s`
+和下次排序、自动选点用的是同一份数据。
+
+### 9.2 家宽识别：两个数据源 + 「未分类」
+
+原来只查 ip-api，判不出来就写 `unknown`，界面显示成 `US未知01` —— 用户以为程序坏了。
+
+现在：
+
+1. ip-api（批量）先判；
+2. **只对仍然是 unknown 的 IP** 再查 ipwho.is（免费、无需 key），看它的顶层
+   `type`（isp / hosting / business）与 `security.hosting`；
+3. 两个源都给不出证据时写「**未分类**」—— 这是中性结论，不是错误。
+
+判定口径没有放宽：`business` / `education` 这类既不是托管也不确定是居民宽带的，
+仍然保持未分类。宁可少说，也不把机房说成家宽。
+
+### 9.3 设置页清理（含「有没有真的生效」审计）
+
+删除：
+
+| 项 | 原因 |
+|---|---|
+| 启动后自动连接 / 开机自启 | 安卓没有开机自启；「打开 App 就自动连」在未授权时会弹授权框，容易误解 |
+| 不下发 DNS | 与「自定义 DNS」互相打脸；要跟随系统就把自定义 DNS 留空 |
+| 连接前重新扫描端点 | 置灰的假开关（安卓每次连接本来就会重新抽样） |
+| 设置页的「关于」节 | 版本/引擎/账号/目录/日志路径与侧边栏「关于」完全重复 —— 全部收进关于页 |
+| 顶部品牌块的版本号 | 同上 |
+| 「尚未搬运」里的语言、健康守护 | 这一版真做出来了，不能再挂在未实现表里 |
+
+新增：
+
+- **本地代理**（VPN 模式也能开）＋ 侧边栏 **局域网共享** 页：手机这条隧道借给
+  同一 Wi-Fi 的电脑，地址/端口/监听状态都写在一页里。
+- **语言**：中 / 英 / 跟随系统。**诚实说明**：英文覆盖抽屉、页面标题、设置分区与
+  主要按钮，大段说明文字仍是中文（副标题里写着）。
+- **健康守护**：关掉后出口异常只记录、不自动重连（按流量计费/要绝对稳定时用）。
+
+审计结论（设置的每一项到底有没有生效）：
+
+| 设置项 | 生效点 |
+|---|---|
+| 连接模式 vpn/proxy | `WarpVpnService.startConnect` 分支 |
+| 连接超时 | `e.setTimeout()` → 引擎单端点握手预算 |
+| Psiphon / 出口地区 | `setPsiphonRegion` / `PsiphonOptions.EgressRegion` |
+| OpenVPN / 地区 / 节点 | `setOpenVPNExit` + 引擎候选 |
+| 分应用 | `VpnService.Builder.addAllowed/DisallowedApplication` |
+| 本地代理 / 端口 / 局域网 | `setSocksListen`（VPN 模式按 `localProxy`） |
+| IPv6 / MTU / 自定义 DNS | `Builder.addRoute` / `setMtu` / `addDnsServer` |
+| 主题 / 日志自动滚动 | `XiaoheTheme` / `HomeScreen` 冻结日志 |
+| 语言 | 抽屉与页面标题、设置分区 |
+| 健康守护 | `startWatchdog()` |
+| 分流规则 | 仅「仅代理」的本地 SOCKS 执行（VPN 模式只有 IP 级路由表） |
+| 清空日志 | `EngineBridge.clearLogs()` |
 
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

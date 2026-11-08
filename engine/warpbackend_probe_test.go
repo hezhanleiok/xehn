@@ -25,6 +25,16 @@ func TestProbeSummary(t *testing.T) {
 	if !strings.Contains(ok, "成功") || !strings.Contains(ok, "1234ms") {
 		t.Fatalf("成功结果格式不对: %q", ok)
 	}
+	// 测速成功时，日志与界面都要能看出「多少 KB/s」——这正是用户要的那一列。
+	fast := probeSummary(OpenVPNProbe{ID: "x", MS: 3341, OK: true, Bps: 94 * 1024})
+	if !strings.Contains(fast, "3341ms") || !strings.Contains(fast, "94 KB/s") {
+		t.Fatalf("带速度的结果格式不对: %q", fast)
+	}
+	// 握手成功但测不出速度：不能说成失败，也不能写 0 KB/s。
+	slow := probeSummary(OpenVPNProbe{ID: "x", MS: 900, OK: true})
+	if !strings.Contains(slow, "速度未测") {
+		t.Fatalf("未测速的结果格式不对: %q", slow)
+	}
 	bad := probeSummary(OpenVPNProbe{ID: "x", OK: false, Error: "AUTH_FAILED"})
 	if !strings.Contains(bad, "失败") || !strings.Contains(bad, "AUTH_FAILED") {
 		t.Fatalf("失败结果格式不对: %q", bad)

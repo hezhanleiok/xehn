@@ -384,6 +384,117 @@ func enrichWithIPAPI(ctx context.Context, client *http.Client, nodes []VPNGateNo
 	return len(byIP), nil
 }
 
+// ---- 第二个数据源：ipwho.is ----
+//
+// 只用 ip-api 会留下大量「未知」：它的 hosting 标记很保守，ISP 名里没有品牌词
+// 时既不判机房也不判家宽。用户看到的就是「US未知01」这种没有类型的节点。
+//
+// ipwho.is 免费、无需 key，而且直接给顶层 `type`（isp / business / hosting…）
+// 与 `security.hosting` —— 两个**独立**数据源交叉验证，比单源猜靠谱得多。
+// 只对「ip-api 判完后仍是 unknown」的 IP 发请求：既省额度，也不会拿第二意见
+// 去覆盖已经明确的结论（宁可保留一致的判断，不让两个源互相打架）。
+const ipWhoEndpoint = "https://ipwho.is/%s?fields=success,type,connection,security"
+
+type ipWhoResult struct {
+	Success    bool   `json:"success"`
+	Type       string `json:"type"`
+	Connection struct {
+		ASN  int    `json:"asn"`
+		Org  string `json:"org"`
+		ISP  string `json:"isp"`
+	} `json:"connection"`
+	Security struct {
+		Proxy   bool `json:"proxy"`
+		VPN     bool `json:"vpn"`
+		Tor     bool `json:"tor"`
+		Hosting bool `json:"hosting"`
+	} `json:"security"`
+}
+
+// enrichWithIPWhois 用第二个源补「仍然未知」的节点，返回实际拿到的条数。
+func enrichWithIPWhois(ctx context.Context, client *http.Client, nodes []VPNGateNode) int {
+	idx := make([]int, 0, len(nodes))
+	seen := map[string]bool{}
+	for i := range nodes {
+		if nodes[i].Class != "unknown" || nodes[i].IP == "" || seen[nodes[i].IP] {
+			continue
+		}
+		seen[nodes[i].IP] = true
+		idx = append(idx, i)
+	}
+	if len(idx) == 0 {
+		return 0
+	}
+
+	const workers = 4
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got := 0
+	for _, i := range idx {
+		i := i
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ip := nodes[i].IP
+			reqCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet,
+				fmt.Sprintf(ipWhoEndpoint, ip), nil)
+			if err != nil {
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			var r ipWhoResult
+			if json.Unmarshal(body, &r) != nil || !r.Success {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			applyIPWho(&nodes[i], r)
+			if nodes[i].Class != "unknown" {
+				got++
+			}
+		}()
+	}
+	wg.Wait()
+	return got
+}
+
+// applyIPWho 把第二个源的意见落到一个节点上。
+//
+// 判定顺序：托管服务（security.hosting 或 type=hosting）优先判机房；顶层
+// type=isp 是「居民/企业宽带接入」的直接证据，判家宽；business/education 这类
+// 既不是托管也不确定是家宽的，保持未知 —— 用户要的是「别乱说」。
+func applyIPWho(n *VPNGateNode, r ipWhoResult) {
+	isp := strings.TrimSpace(r.Connection.ISP)
+	if isp == "" {
+		isp = strings.TrimSpace(r.Connection.Org)
+	}
+	if isp != "" && n.ISP == "" {
+		n.ISP = isp
+	}
+	if r.Security.Proxy || r.Security.VPN || r.Security.Tor {
+		n.Shared = true
+	}
+	switch {
+	case r.Security.Hosting || strings.EqualFold(r.Type, "hosting"):
+		n.Class, n.ClassSource = "datacenter", "ipwho"
+	case strings.EqualFold(r.Type, "isp"):
+		n.Class, n.ClassSource = "residential", "ipwho"
+	}
+}
+
 // ---- 抓取 ----
 
 // VPNGateFetchOptions 是抓取一轮的输入。
@@ -442,9 +553,27 @@ func FetchVPNGate(ctx context.Context, o VPNGateFetchOptions) ([]VPNGateNode, er
 	n, err := enrichWithIPAPI(enrichCtx, client, nodes)
 	enrichCancel()
 	if err != nil {
-		o.report(fmt.Sprintf("节点分类补证只完成 %d 个（%v）；其余保持“未知”", n, err))
+		o.report(fmt.Sprintf("节点分类补证只完成 %d 个（%v）；其余保持“未分类”", n, err))
 	} else {
 		o.report(fmt.Sprintf("节点分类补证完成 %d 个 IP", n))
+	}
+
+	// 第二个数据源：只补 ip-api 判不出来（unknown）的那些。
+	unknown := 0
+	for i := range nodes {
+		if nodes[i].Class == "unknown" {
+			unknown++
+		}
+	}
+	if unknown > 0 {
+		whoCtx, whoCancel := context.WithTimeout(ctx, 25*time.Second)
+		m := enrichWithIPWhois(whoCtx, client, nodes)
+		whoCancel()
+		if m > 0 {
+			o.report(fmt.Sprintf("第二数据源（ipwho.is）补判了 %d 个节点的类型（原来 %d 个未分类）", m, unknown))
+		} else {
+			o.report(fmt.Sprintf("第二数据源（ipwho.is）没能补判（%d 个仍未分类），保持“未分类”而不是瞎猜", unknown))
+		}
 	}
 
 	// 实测 TCP 延迟（只对 tcp 节点；udp 节点保留自报 ping）。

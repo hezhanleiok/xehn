@@ -27,6 +27,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xiaohe.vpn.ui.AboutScreen
 import com.xiaohe.vpn.ui.AppPickerScreen
 import com.xiaohe.vpn.ui.HomeScreen
+import com.xiaohe.vpn.ui.LanShareScreen
 import com.xiaohe.vpn.ui.LicenseScreen
 import com.xiaohe.vpn.ui.MenuDrawer
 import com.xiaohe.vpn.ui.Page
@@ -149,7 +150,7 @@ class MainActivity : ComponentActivity() {
                         // 抽屉只占屏幕 3/4：M3 默认宽 360dp，在多数手机上就是整屏，
                         // 展开后看不到底下的界面，也没有「这是浮层」的感觉。
                         ModalDrawerSheet(modifier = Modifier.fillMaxWidth(0.75f)) {
-                            MenuDrawer(current = current) { page ->
+                            MenuDrawer(current = current, lang = settings.lang) { page ->
                                 current = page
                                 scope.launch { drawer.close() }
                             }
@@ -231,6 +232,13 @@ class MainActivity : ComponentActivity() {
                 onChange = onSettingsChange,
                 onClearLogs = { EngineBridge.clearLogs() },
                 onPickApps = onPickApps,
+                onBack = back,
+            )
+
+            Page.LanShare -> LanShareScreen(
+                settings = settings,
+                state = state,
+                onChange = onSettingsChange,
                 onBack = back,
             )
 

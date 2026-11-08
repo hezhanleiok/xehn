@@ -55,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.xiaohe.vpn.AppSettings
 import com.xiaohe.vpn.EngineBridge
+import com.xiaohe.vpn.LANG_OPTIONS
 import com.xiaohe.vpn.NodeSpeedStore
 import com.xiaohe.vpn.PROTOCOLS
 import com.xiaohe.vpn.ProtoOption
@@ -130,12 +131,6 @@ fun SettingsScreen(
             selected = settings.mode,
             onSelect = { onChange(settings.copy(mode = it)) },
         )
-        SettingSwitch(
-            title = "启动后自动连接",
-            subtitle = "打开 App 时自动建立隧道",
-            checked = settings.autoConnect,
-            onChange = { onChange(settings.copy(autoConnect = it)) },
-        )
         SettingNumber(
             title = "连接超时（秒）",
             subtitle = "单个端点握手等待时间，1-15 秒；越小切端点越快",
@@ -144,13 +139,17 @@ fun SettingsScreen(
                 v.toIntOrNull()?.let { onChange(settings.copy(timeoutSec = it.coerceIn(1, 15))) }
             },
         )
+        // 「启动后自动连」和「开机自启」这两项已按要求移除：安卓上没有开机自启，
+        // 而「打开 App 就自动连」在系统 VPN 未授权时只会弹一个授权框，容易误解。
         SettingSwitch(
-            title = "连接前重新扫描端点",
-            subtitle = "安卓版每次连接都会重新从端点池抽样，等效于常开",
-            checked = true,
-            enabled = false,
-            onChange = {},
+            title = "健康守护（自动修复）",
+            subtitle = "连续探测失败/长时间无数据时自动断开重连（每 5 分钟最多 3 次）；" +
+                "关闭后只记录日志、不自动重连",
+            checked = settings.healthGuard,
+            onChange = { onChange(settings.copy(healthGuard = it)) },
         )
+        // 「连接前重新扫描端点」原来是个置灰的假开关（安卓版每次连接本来就会重新
+        // 抽样，等效常开）。假开关已删：一个点不动的东西放在设置里只会浪费时间。
 
         // ---------------- 出口 ----------------
         Section("出口")
@@ -291,9 +290,22 @@ fun SettingsScreen(
                                     (if (cc.isEmpty()) "（自动模式，测全部）" else "（地区 $cc）") +
                                     "；只握手、不建系统 VPN，可能要 1–3 分钟"
                             )
-                            withContext(Dispatchers.IO) {
+                            val results = withContext(Dispatchers.IO) {
                                 EngineBridge.testOpenVpnNodes(ctx, ids)
                             }
+                            // 把实测吞吐写进速度记忆：列表里的「≈94 KB/s」就来自这里，
+                            // 也是下次排序与自动选点的依据 —— 不记下来就白测了。
+                            var recorded = 0
+                            results.forEach { r ->
+                                if (r.ok && r.bps > 0) {
+                                    NodeSpeedStore.remember(ctx, r.id, r.bps)
+                                    recorded++
+                                }
+                            }
+                            EngineBridge.note(
+                                "[ui] 握手 + 测速完成：${results.count { it.ok }}/${ids.size} 个能握手" +
+                                    (if (recorded > 0) "，$recorded 个测到了速度" else "")
+                            )
                             probing = false
                             // 重读节点：新测到的延迟已并入排序与编号（家宽/机房仍分块）。
                             nodeVersion++
@@ -370,30 +382,43 @@ fun SettingsScreen(
             },
         ) { if (settings.mode == "vpn") onPickApps() }
 
-        // ---------------- 本地代理（仅代理模式） ----------------
-        if (settings.mode == "proxy") {
-            Section("本地代理")
-            SettingNumber(
-                title = "代理端口",
-                subtitle = "SOCKS5 端口；浏览器/系统代理里填这个端口",
-                value = settings.proxyPort.toString(),
-                onChange = { v ->
-                    val n = v.filter { it.isDigit() }.take(5).toIntOrNull() ?: 0
-                    onChange(settings.copy(proxyPort = n))
-                },
-            )
-            SettingSwitch(
-                title = "允许局域网访问",
-                subtitle = "监听 0.0.0.0：同一 Wi-Fi 下的其它设备也能用这个代理。" +
-                    "SOCKS5 没有认证，公共 Wi-Fi 下别开",
-                checked = settings.proxyLan,
-                onChange = { onChange(settings.copy(proxyLan = it)) },
-            )
-            InfoRow(
-                if (state.socks.isNotBlank()) "正在监听" else "连接后监听",
-                state.socks.ifBlank { settings.proxyListenAddr() },
-            )
-        }
+        // ---------------- 本地代理 ----------------
+        //
+        // 以前这一节只在「仅代理」模式出现，VPN 模式下完全看不到 —— 而「局域网
+        // 共享」恰恰要在 VPN 模式下用。现在始终显示：VPN 模式由开关决定，
+        // 仅代理模式固定开启（那一档的意义就是这个端口）。
+        Section("本地代理")
+        SettingSwitch(
+            title = "开启本地代理",
+            subtitle = if (settings.mode == "proxy") {
+                "仅代理模式固定开启：不建系统 VPN，只开这个 SOCKS5 端口"
+            } else {
+                "VPN 模式下也开一个本地 SOCKS5 端口，供本机或同一 Wi-Fi 的设备借用这条隧道"
+            },
+            checked = settings.mode == "proxy" || settings.localProxy,
+            enabled = settings.mode != "proxy",
+            onChange = { onChange(settings.copy(localProxy = it)) },
+        )
+        SettingNumber(
+            title = "代理端口",
+            subtitle = "SOCKS5 端口；浏览器/系统代理里填这个端口。改完要重新连接才生效",
+            value = settings.proxyPort.toString(),
+            onChange = { v ->
+                val n = v.filter { it.isDigit() }.take(5).toIntOrNull() ?: 0
+                onChange(settings.copy(proxyPort = n.coerceIn(0, 65535)))
+            },
+        )
+        SettingSwitch(
+            title = "允许局域网访问",
+            subtitle = "监听 0.0.0.0：同一 Wi-Fi 下的其它设备也能用这个代理。" +
+                "SOCKS5 没有认证，公共 Wi-Fi 下别开；详细用法见侧边栏「局域网共享」",
+            checked = settings.proxyLan,
+            onChange = { onChange(settings.copy(proxyLan = it, localProxy = settings.localProxy || it)) },
+        )
+        InfoRow(
+            if (state.socks.isNotBlank()) "正在监听" else "连接后监听",
+            state.socks.ifBlank { settings.proxyListenAddr() },
+        )
         if (settings.splitMode != "off" && parsePackageList(settings.splitApps).isEmpty()) {
             SettingCard {
                 Text(
@@ -424,12 +449,9 @@ fun SettingsScreen(
             value = settings.dns,
             onChange = { onChange(settings.copy(dns = it)) },
         )
-        SettingSwitch(
-            title = "不下发 DNS",
-            subtitle = "让系统继续用当前网络的解析器",
-            checked = settings.dnsOff,
-            onChange = { onChange(settings.copy(dnsOff = it)) },
-        )
+        // 「不下发 DNS」已移除：它会和上面的自定义 DNS 互相打脸（填了地址却不下发），
+        // 而且实测系统解析器在部分网络里会把查询泄漏到墙外。要「跟随系统」就把
+        // 自定义 DNS 留空。
 
         // ---------------- 界面 ----------------
         Section("界面")
@@ -446,19 +468,22 @@ fun SettingsScreen(
             checked = settings.logAutoScroll,
             onChange = { onChange(settings.copy(logAutoScroll = it)) },
         )
+        SettingChips(
+            title = "语言 / Language",
+            subtitle = "英文目前覆盖菜单、页面标题、设置分区与主要按钮；大段说明文字仍是中文",
+            options = LANG_OPTIONS,
+            selected = settings.lang,
+            onSelect = { onChange(settings.copy(lang = it)) },
+        )
 
-        // ---------------- 关于 ----------------
-        Section("关于")
-        InfoRow("App 版本", appVersionName(ctx))
-        InfoRow("引擎", state.version.ifBlank { "—" })
-        InfoRow("内置账号", if (state.accountBuiltIn) "已导入（assets/account.json）" else "未导入（连接时需联网注册）")
-        InfoRow("数据目录", ctx.filesDir.absolutePath + "/engine")
-        // 日志一直写在这里，退出/崩溃/重启都不删；闪退后重开界面会把它读回来。
-        // 要排查问题直接取这个文件，比在界面上滚动复制完整。
-        InfoRow("日志文件", EngineBridge.logPath(ctx))
-        InfoRow("系统 VPN", if (state.vpnUp) "已启用" else "未启用")
-        Spacer(Modifier.height(8.dp))
+        // ---------------- 诊断 ----------------
+        //
+        // 版本号 / 引擎 / 内置账号 / 数据目录 / 日志路径 / 系统 VPN 全部收进侧边栏
+        // 「关于」：那些是只读信息，留在设置里既和「关于」重复，又把真正能改的
+        // 开关挤到看不见的地方。设置页只留「可以改的东西」和这一个操作。
+        Section("诊断")
         ActionRow("清空日志", "删除界面日志与日志文件（全 App 只有这一处会删）") { onClearLogs() }
+        InfoRow("版本 / 引擎 / 日志路径", "见侧边栏「关于」")
 
         // ---------------- 分流规则 ----------------
         //
@@ -511,12 +536,18 @@ fun SettingsScreen(
         )
 
         // ---------------- 尚未搬运 ----------------
+        // 只列**确实还没做**的。「语言切换」「健康守护」原来挂在这张表里，这一版
+        // 已经真做出来了（见上面「界面」「连接」两节），所以从这里删掉 ——
+        // 一张挂着已完成项的表，和假开关一样是误导。
         Section("电脑版有、安卓版还没搬的功能")
-        NotYet("分流规则（直连域名 / 代理域名 / 地区分流）", "需要域名级规则引擎，VpnService 只能按应用和 IP 分流")
-        NotYet("全局 / 规则 / 直连 三档模式", "「直连」等价于断开；「规则」依赖上面的规则引擎")
-        NotYet("导出配置（.conf / mihomo YAML）", "电脑版只有命令行能用；安卓版要另做分享入口")
-        NotYet("界面语言中英切换", "安卓界面目前只有中文，i18n 表还没建")
-        NotYet("健康守护自动修复", "电脑版靠子进程守护；安卓会改成 Service 内的看门狗")
+        NotYet(
+            "导出配置（.conf / mihomo YAML）",
+            "电脑版只有命令行能用；安卓版要另做分享入口，也要先确定「导出哪些协议」"
+        )
+        NotYet(
+            "按地区/域名分流的完整规则引擎",
+            "VpnService 只能按应用和 IP 分流；域名规则目前只在「仅代理」的本地 SOCKS 上生效"
+        )
 
         Spacer(Modifier.height(24.dp))
     }
@@ -770,8 +801,10 @@ private fun BrandHeader() {
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                 )
+                // 版本号不再写在这里：它和侧边栏「关于」页是同一份信息，重复出现
+                // 只会让人以为两处会不一致。要查版本去「关于」。
                 Text(
-                    "版本 ${appVersionName(ctx)}",
+                    "xiaohe VPN · 安卓版",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -925,11 +958,11 @@ private fun OpenVpnNodePicker(
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("出口地区", modifier = Modifier.weight(1f))
-                // 「测延迟」= 对节点做一次**真实 OpenVPN 握手**（只握手，不建系统 VPN）。
-                // 列表里那个延迟只是 api 域名的 TCP 连接时间，节点多得国家看着都快、
-                // 实际握不上 —— 这个按钮就是为了把这种假延迟筛掉。
+                // 「测延迟」= 对节点做一次**真实 OpenVPN 握手 + 真下载测速**。
+                // 只测握手看不出「能握手但只有几 KB/s」的节点，而那正是最该筛掉的；
+                // 列表里原来的延迟只是 api 域名的 TCP 连接时间，跟能不能连无关。
                 TextButton(onClick = onProbe, enabled = !probing && !refreshing && nodes.isNotEmpty()) {
-                    Text(if (probing) "测试中…" else "测延迟")
+                    Text(if (probing) "测试中…" else "测延迟+速度")
                 }
                 TextButton(onClick = onRefresh, enabled = !refreshing && !probing) {
                     Text(if (refreshing) "刷新中…" else "刷新")
@@ -944,8 +977,8 @@ private fun OpenVpnNodePicker(
             ) {
                 if (probing) {
                     Text(
-                        "正在测真实握手（只握手、不建 VPN）：" + progress.ifEmpty { "建 WARP 上游…" } +
-                            "；测完会按握手耗时重排，期间可以关掉这个窗口",
+                        "正在测真实握手 + 下载速度（不建 VPN）：" + progress.ifEmpty { "建 WARP 上游…" } +
+                            "；每个节点握手后再下载一小段，测完按握手耗时重排，期间可以关掉这个窗口",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 4.dp),
@@ -1100,11 +1133,16 @@ private fun classKeyOf(cls: String): String = when (cls) {
     else -> "unknown"
 }
 
-/** 名字里的类别后缀：JP家宽01 / JP机房01 / JP未知01。 */
+/**
+ * 名字里的类别后缀：JP家宽01 / JP机房01 / JP未分类01。
+ *
+ * 「未知」改成「未分类」：两个数据源都没给出证据时，这是一个**中性**结论，
+ * 不是「查不到」的错误。用户看到「未知」会以为程序坏了。
+ */
 private fun classTagOf(cls: String): String = when (cls) {
     "residential" -> "家宽"
     "datacenter" -> "机房"
-    else -> "未知"
+    else -> "未分类"
 }
 
 @Composable

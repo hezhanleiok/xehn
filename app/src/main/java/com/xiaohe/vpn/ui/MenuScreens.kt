@@ -30,13 +30,20 @@ import androidx.compose.material.icons.filled.Policy
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -44,8 +51,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.xiaohe.vpn.AppLang
+import com.xiaohe.vpn.AppSettings
 import com.xiaohe.vpn.BuildConfig
 import com.xiaohe.vpn.EngineBridge
+import com.xiaohe.vpn.LocalNetwork
 import com.xiaohe.vpn.VpnState
 
 /**
@@ -74,13 +84,14 @@ object AppLinks {
     const val PSIPHON_LICENSE = "$PSIPHON_REPO/blob/master/LICENSE"
 }
 
-/** 抽屉 / 菜单里的目的地。 */
-enum class Page(val title: String, val icon: ImageVector) {
-    Settings("设置", Icons.Filled.Settings),
-    About("关于", Icons.Filled.Info),
-    Privacy("隐私政策", Icons.Filled.Policy),
-    License("授权说明", Icons.Filled.Description),
-    Update("更新", Icons.Filled.Refresh),
+/** 抽屉 / 菜单里的目的地（titleEn 供英文界面用）。 */
+enum class Page(val title: String, val titleEn: String, val icon: ImageVector) {
+    Settings("设置", "Settings", Icons.Filled.Settings),
+    LanShare("局域网共享", "LAN sharing", Icons.Filled.Share),
+    About("关于", "About", Icons.Filled.Info),
+    Privacy("隐私政策", "Privacy", Icons.Filled.Policy),
+    License("授权说明", "Licenses", Icons.Filled.Description),
+    Update("更新", "Updates", Icons.Filled.Refresh),
 }
 
 /** 打开一个外部链接。失败只记一行日志，不弹崩溃。 */
@@ -94,12 +105,15 @@ fun openUrl(ctx: Context, url: String) {
     }
 }
 
-/** 抽屉内容：六个入口一行一个。选中项高亮。 */
+/** 抽屉内容：入口一行一个。选中项高亮。 */
 @Composable
 fun MenuDrawer(
     current: Page?,
+    lang: String,
     onSelect: (Page) -> Unit,
 ) {
+    val en = com.xiaohe.vpn.AppLang.isEnglish(lang)
+    fun t(zh: String, enText: String) = if (en && enText.isNotEmpty()) enText else zh
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -116,7 +130,10 @@ fun MenuDrawer(
             modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp),
         )
         Text(
-            "xiaohe VPN · 安卓版 ${BuildConfig.VERSION_NAME}",
+            t(
+                "xiaohe VPN · 安卓版 ${BuildConfig.VERSION_NAME}",
+                "xiaohe VPN · Android ${BuildConfig.VERSION_NAME}",
+            ),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(start = 12.dp, bottom = 12.dp),
@@ -145,7 +162,7 @@ fun MenuDrawer(
                 )
                 Spacer(Modifier.width(14.dp))
                 Text(
-                    page.title,
+                    t(page.title, page.titleEn),
                     style = MaterialTheme.typography.bodyLarge,
                     color = if (active) MaterialTheme.colorScheme.onPrimaryContainer
                     else MaterialTheme.colorScheme.onSurface,
@@ -293,6 +310,7 @@ private fun LinkRow(title: String, subtitle: String, url: String) {
 
 @Composable
 fun AboutScreen(state: VpnState, onBack: () -> Unit) {
+    val ctx = LocalContext.current
     PageScaffold("关于", onBack) {
         InfoCard(
             "版本",
@@ -300,6 +318,17 @@ fun AboutScreen(state: VpnState, onBack: () -> Unit) {
                 "App：${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）",
                 "引擎：${state.version.ifBlank { "—" }}",
                 "包名：${BuildConfig.APPLICATION_ID}",
+            ),
+        )
+        // 这一块原来在设置页底部（「关于」节），和这里的版本卡完全重复。
+        // 现在统一收到这里：设置页只管「能改的东西」，只读信息全在关于页。
+        InfoCard(
+            "运行信息",
+            listOf(
+                "内置账号：" + if (state.accountBuiltIn) "已导入（assets/account.json）" else "未导入（连接时需联网注册）",
+                "数据目录：" + ctx.filesDir.absolutePath + "/engine",
+                "日志文件：" + EngineBridge.logPath(ctx),
+                "系统 VPN：" + if (state.vpnUp) "已启用" else "未启用",
             ),
         )
         InfoCard(
@@ -397,5 +426,154 @@ fun UpdateScreen(state: VpnState, onBack: () -> Unit) {
         )
         LinkRow("查看新版本", "GitHub Releases（占位仓库）", AppLinks.APP_RELEASES)
         LinkRow("问题反馈", "GitHub Issues", AppLinks.APP_ISSUES)
+    }
+}
+
+/**
+ * 局域网共享：把手机这条隧道借给同一 Wi-Fi 下的电脑/平板。
+ *
+ * 它做的不是新协议 —— 只是把「本地 SOCKS5」在 VPN 模式下也开出来，并把
+ * 端口/监听范围/当前地址集中在一页里说清楚。之前这些散在「仅代理」分支里，
+ * VPN 模式下根本看不到，用户只能猜。
+ */
+@Composable
+fun LanShareScreen(
+    settings: AppSettings,
+    state: VpnState,
+    onChange: (AppSettings) -> Unit,
+    onBack: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    val en = AppLang.isEnglish(settings.lang)
+    fun t(zh: String, s: String) = if (en && s.isNotEmpty()) s else zh
+
+    val lanIp = LocalNetwork.ipv4(ctx)
+    val port = if (settings.proxyPort in 1..65535) settings.proxyPort else 1080
+    val host = if (settings.proxyLan) lanIp.ifBlank { "0.0.0.0" } else "127.0.0.1"
+    val addr = "$host:$port"
+
+    PageScaffold(t("局域网共享", "LAN sharing"), onBack) {
+        InfoCard(
+            t("怎么用", "How it works"),
+            listOf(
+                t("1. 打开「本地代理」，需要给别的设备用时再打开「允许局域网访问」；",
+                    "1. Turn on local proxy; enable LAN access if other devices should use it."),
+                t("2. 电脑/平板连同一个 Wi-Fi，把 SOCKS5 代理指向下面的地址；",
+                    "2. On the same Wi-Fi, point their SOCKS5 proxy at the address below."),
+                t("3. 它们的流量就从手机这条隧道出去（出口 IP 与手机一致）。",
+                    "3. Their traffic leaves through this phone's tunnel."),
+                t("注意：SOCKS5 没有认证，公共 Wi-Fi 下别开局域网访问。",
+                    "Note: SOCKS5 has no authentication. Do not allow LAN access on public Wi-Fi."),
+            ),
+        )
+
+        ToggleCard(
+            title = t("本地代理", "Local proxy"),
+            subtitle = t(
+                "在手机本地开一个 SOCKS5 端口；VPN 模式下也能用（默认关，多一个监听就多一个入口）",
+                "Runs a SOCKS5 listener on the phone; works in VPN mode too.",
+            ),
+            checked = settings.localProxy || settings.proxyLan,
+            onChange = { on -> onChange(settings.copy(localProxy = on)) },
+        )
+
+        ToggleCard(
+            title = t("允许局域网访问", "Allow LAN access"),
+            subtitle = t(
+                "监听 0.0.0.0：同一 Wi-Fi 下的设备可用；关闭时只监听 127.0.0.1（只有本机能用）",
+                "Listen on 0.0.0.0 so other devices on the same Wi-Fi can use it.",
+            ),
+            checked = settings.proxyLan,
+            onChange = { on -> onChange(settings.copy(proxyLan = on, localProxy = settings.localProxy || on)) },
+        )
+
+        PortCard(
+            title = t("本地代理端口", "Proxy port"),
+            subtitle = t("SOCKS5 端口（1–65535）；改完需要重新连接才生效",
+                "SOCKS5 port (1-65535). Reconnect to apply."),
+            value = settings.proxyPort.toString(),
+            onChange = { v ->
+                val n = v.filter { it.isDigit() }.take(5).toIntOrNull() ?: 0
+                onChange(settings.copy(proxyPort = n.coerceIn(0, 65535)))
+            },
+        )
+
+        InfoCard(
+            t("当前状态", "Status"),
+            listOf(
+                t("共享地址", "Address") + "：" + addr,
+                t("实际监听", "Listening") + "：" + state.socks.ifBlank { t("未连接 / 未开启", "off") },
+                t("本机局域网 IP", "Phone LAN IP") + "：" + lanIp.ifBlank { "—" },
+                t("仅在「已连接」后才会真正监听；改完端口要断开重连。",
+                    "The listener starts after connecting; reconnect after changing the port."),
+            ),
+        )
+    }
+}
+
+@Composable
+private fun ToggleCard(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(checked = checked, onCheckedChange = onChange)
+        }
+    }
+}
+
+@Composable
+private fun PortCard(
+    title: String,
+    subtitle: String,
+    value: String,
+    onChange: (String) -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = value,
+                onValueChange = onChange,
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium,
+            )
+        }
     }
 }
