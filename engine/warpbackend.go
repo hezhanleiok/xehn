@@ -370,7 +370,9 @@ type OpenVPNProbe struct {
 	// MS 是真实 OpenVPN 握手耗时。
 	MS int64 `json:"ms"`
 	// Bps 是握手后经该节点下载实测的吞吐（字节/秒）；0 = 握手成功但测不出。
-	Bps   int64  `json:"bps,omitempty"`
+	Bps int64 `json:"bps,omitempty"`
+	// Note 是「握手成功但没测到速度」的具体原因（DNS/TCP/TLS/没数据），只写日志。
+	Note  string `json:"-"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
@@ -451,8 +453,13 @@ func (b *warpBackend) TestOpenVPNNodes(
 			// 测速本身还有并发槽位（见 warp.measureThroughOpenVPN），所以这里
 			// 给 6s 而不是 8s：全量 97 个节点时总时长才不至于超过预算。
 			started := time.Now()
-			d, bps, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 6*time.Second)
+			d, bps, stage, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 6*time.Second)
 			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), Bps: bps, OK: perr == nil}
+			if perr == nil && bps <= 0 {
+				// 「握手成功但没测到速度」必须说清是哪一步失败：DNS/TCP/TLS 还是
+				// 真的没数据。只写「速度未测」的话，下次还是没法判断。
+				p.Note = stage
+			}
 			if perr != nil {
 				p.Error = perr.Error()
 				b.markOpenVPNFailed(id)
@@ -493,6 +500,9 @@ func probeSummary(p OpenVPNProbe) string {
 	if p.OK {
 		if p.Bps > 0 {
 			return fmt.Sprintf("握手成功 %dms · ≈%d KB/s", p.MS, p.Bps/1024)
+		}
+		if p.Note != "" {
+			return fmt.Sprintf("握手成功 %dms · 速度未测（%s）", p.MS, p.Note)
 		}
 		return fmt.Sprintf("握手成功 %dms · 速度未测", p.MS)
 	}

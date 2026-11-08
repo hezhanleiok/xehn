@@ -24,6 +24,7 @@ package warp
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -581,13 +582,13 @@ func ProbeOpenVPNHandshake(ctx context.Context, under *Session, configText strin
 func ProbeOpenVPNSpeed(
 	ctx context.Context, under *Session, configText string,
 	timeout, budget time.Duration,
-) (time.Duration, int64, error) {
+) (time.Duration, int64, string, error) {
 	client, push, elapsed, err := probeOpenVPNHandshake(ctx, under, configText, timeout)
 	if err != nil {
 		if client != nil {
 			_ = client.Close()
 		}
-		return elapsed, 0, err
+		return elapsed, 0, "", err
 	}
 	closed := false
 	defer func() {
@@ -595,9 +596,9 @@ func ProbeOpenVPNSpeed(
 			_ = client.Close()
 		}
 	}()
-	bps := measureThroughOpenVPN(client, push, budget)
+	bps, stage := measureThroughOpenVPN(client, push, budget)
 	closed = true
-	return elapsed, bps, nil
+	return elapsed, bps, stage, nil
 }
 
 // probeOpenVPNHandshake 拨号并完成握手，把可用的 client 交给调用方关闭。
@@ -663,7 +664,7 @@ var probeSpeedSlots = make(chan struct{}, 3)
 
 // measureThroughOpenVPN 用 gVisor netstack 当 tun，把 OpenVPN 的包泵接上去，
 // 然后做一次真实下载。0 = 测不出来。
-func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget time.Duration) int64 {
+func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget time.Duration) (int64, string) {
 	if budget <= 0 {
 		budget = 6 * time.Second
 	}
@@ -676,17 +677,17 @@ func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget tim
 	case probeSpeedSlots <- struct{}{}:
 		defer func() { <-probeSpeedSlots }()
 	case <-time.After(30 * time.Second):
-		return 0
+		return 0, "测速队列等待超时"
 	}
 
 	tun := openVPNTunFromPush(push)
 	addr, err := netip.ParseAddr(tun.Address)
 	if err != nil || !addr.Is4() {
-		return 0
+		return 0, "节点没有下发 IPv4 地址"
 	}
 	dev, stack, err := newIPStack([]netip.Addr{addr}, tun.MTU)
 	if err != nil {
-		return 0
+		return 0, "建测速网络栈失败"
 	}
 	ex := &openvpnExit{client: client, file: &tunDeviceStream{dev: dev}}
 	// 硬超时 + 关闭顺序都必须是「先关 dev、再关 client」：
@@ -710,37 +711,81 @@ func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget tim
 	return probeDownloadBps(stack, budget)
 }
 
-// probeSpeedURL 是探测用的测速端点：1 MiB 足够看出量级，又不至于让一个节点
-// 占住探测通道太久。正式的出口测速另有 speedURL（100 MiB + 预热）。
-const probeSpeedURL = "https://speed.cloudflare.com/__down?bytes=1048576"
+// probeSpeedHost / probeSpeedURL 是探测用的测速端点：1 MiB 足够看出量级，
+// 又不至于让一个节点占住探测通道太久（正式出口测速另有 speedURL）。
+const (
+	probeSpeedHost = "speed.cloudflare.com"
+	probeSpeedURL  = "https://" + probeSpeedHost + "/__down?bytes=1048576"
+)
+
+// probeSpeedIP 缓存测速端点的 IPv4 解析结果。
+var probeSpeedIP atomic.Value
+
+// lookupProbeSpeedIP 用**主机** DNS 解析测速端点。
+//
+// 为什么不用隧道里的解析：探测阶段系统 VPN 还没建立，主机 DNS 一定可用；而经节点
+// 的 DNS 经常不通（VPN Gate 节点普遍不转发 UDP 53）。那会让测速「6 秒一个字节都
+// 收不到」，表现就是握手成功、速度永远显示「未测」—— 真机里澳大利亚节点就是这样。
+func lookupProbeSpeedIP() string {
+	if v, ok := probeSpeedIP.Load().(string); ok && v != "" {
+		return v
+	}
+	ips, err := net.LookupIP(probeSpeedHost)
+	if err != nil {
+		return ""
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			probeSpeedIP.Store(v4.String())
+			return v4.String()
+		}
+	}
+	return ""
+}
 
 // probeDownloadBps 经 netstack 下载一小段并算出字节/秒。
 //
-// 不做预热：探测要的是「这个节点大概能跑多少」，不是精确的稳态吞吐；
-// 预算内收到多少算多少，收不到就返回 0（调用方显示「未测」）。
-func probeDownloadBps(stack *ipStack, budget time.Duration) int64 {
+// 第二个返回值是「为什么没测出来」，由调用方写进日志 —— 只写「速度未测」的话，
+// 下次还是分不清是 DNS 不通、TLS 失败，还是节点真的没带宽。
+func probeDownloadBps(stack *ipStack, budget time.Duration) (int64, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	client := &http.Client{
-		Timeout: budget,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
-				// 交给 gVisor：域名在隧道里解析，不泄漏到本机。
-				return stack.tnet.DialContext(dctx, network, addr)
-			},
-		},
+
+	tr := &http.Transport{DisableKeepAlives: true}
+	if ip := lookupProbeSpeedIP(); ip != "" {
+		// 直接拨 IP + 固定 SNI：绕过隧道内 DNS，这一步救回了大量「握手成功但
+		// 测速 0 字节」的节点。
+		tr.DialTLSContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := stack.tnet.DialContext(dctx, "tcp", net.JoinHostPort(ip, "443"))
+			if err != nil {
+				return nil, fmt.Errorf("tcp: %w", err)
+			}
+			tc := tls.Client(c, &tls.Config{
+				ServerName: probeSpeedHost,
+				NextProtos: []string{"http/1.1"},
+			})
+			if err := tc.HandshakeContext(dctx); err != nil {
+				_ = c.Close()
+				return nil, fmt.Errorf("tls: %w", err)
+			}
+			return tc, nil
+		}
+	} else {
+		tr.DialContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
+			return stack.tnet.DialContext(dctx, network, addr)
+		}
 	}
+
+	client := &http.Client{Timeout: budget, Transport: tr}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeSpeedURL, nil)
 	if err != nil {
-		return 0
+		return 0, "构造请求失败"
 	}
-	// client.Do 包含 DNS + TCP + TLS + 首字节：经「WARP → 日本节点 → CF」这条
-	// 链路，光握手就要 3–7 秒（真机日志里 OpenVPN 握手 3037ms、4983ms 都有）。
-	// 所以计时**从首字节之后开始**，否则 2 秒预算连 TLS 都没完成，结果永远是 0。
+	// client.Do 包含 TCP + TLS + 首字节：经「WARP → 节点 → CF」链路，光握手就要
+	// 好几秒，所以计时**从首字节之后开始**。
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0
+		return 0, shortErr(err)
 	}
 	defer resp.Body.Close()
 
@@ -762,10 +807,13 @@ func probeDownloadBps(stack *ipStack, budget time.Duration) int64 {
 	}
 	d := time.Since(start).Seconds()
 	// 样本太短（<0.3s）就不可信：可能是首包刚好卡在窗口边缘。
-	if got <= 0 || d < 0.3 {
-		return 0
+	if got <= 0 {
+		return 0, "已连上但 2 秒内没有收到数据"
 	}
-	return int64(float64(got) / d)
+	if d < 0.3 {
+		return 0, "样本太短"
+	}
+	return int64(float64(got) / d), ""
 }
 
 // dialOpenVPNUpstream 起 WARP 上游 → 经它拨节点 → 完成 OpenVPN 握手。
