@@ -296,8 +296,10 @@ func (e *Engine) TestOpenVPNNodes(idsCSV string) string {
 	if len(ids) == 0 {
 		return `{"ok":false,"error":"没有要测试的节点"}`
 	}
-	// 一个都测不完时也别让界面永远转：留一点余量给 40 个节点 × 12s / 3 并发。
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	// 全量 97 个节点：握手并发 8（单节点最多 10s）+ 测速并发 3（单节点最多 6s），
+	// 最坏约 97×10/8 + 60×6/3 ≈ 4 分钟。给 10 分钟余量，避免跑一半被 ctx 掐断
+	//（掐断的表现和「卡住不动」一模一样，很难区分）。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	e.sess.logf("[engine] 开始真实握手测速：%d 个节点（只握手，不建系统 VPN）", len(ids))
 	probes, err := wb.TestOpenVPNNodes(ctx, ids, "", 0, func(s string) {

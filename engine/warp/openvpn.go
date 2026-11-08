@@ -653,9 +653,32 @@ func probeOpenVPNHandshake(
 	return client, push, elapsed, nil
 }
 
+// probeSpeedSlots 限制「同时做测速」的节点数。
+//
+// 每一个测速都要起一个完整的 gVisor netstack（TCP/IP 栈 + goroutine 池）再叠
+// 一条 OpenVPN 数据通道。握手探测本身很轻（一个控制通道），但测速很重：
+// 真机现象是「测到第 8 个就再也不动了」—— 8 个并发 netstack 把手机 CPU/内存
+// 压满，后面的节点永远等不到 worker。握手仍然并发 8，只把**测速**限到 3。
+var probeSpeedSlots = make(chan struct{}, 3)
+
 // measureThroughOpenVPN 用 gVisor netstack 当 tun，把 OpenVPN 的包泵接上去，
 // 然后做一次真实下载。0 = 测不出来。
 func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget time.Duration) int64 {
+	if budget <= 0 {
+		budget = 6 * time.Second
+	}
+	// 等一个测速槽位。
+	//
+	// 这里**不能**只等 budget：8 个握手 worker 里只有 3 个能同时测速，其余 5 个
+	// 若 6 秒就放弃，界面会有一大半节点「速度未测」（用户明确不接受）。正常排队
+	// 最多 3×6=18 秒，所以给 30 秒的等待上限：足够排队，又不会把 worker 永久占住。
+	select {
+	case probeSpeedSlots <- struct{}{}:
+		defer func() { <-probeSpeedSlots }()
+	case <-time.After(30 * time.Second):
+		return 0
+	}
+
 	tun := openVPNTunFromPush(push)
 	addr, err := netip.ParseAddr(tun.Address)
 	if err != nil || !addr.Is4() {
@@ -665,13 +688,25 @@ func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget tim
 	if err != nil {
 		return 0
 	}
-	defer dev.Close()
 	ex := &openvpnExit{client: client, file: &tunDeviceStream{dev: dev}}
-	ex.startPump(context.Background())
-	defer ex.close()
-	if budget <= 0 {
-		budget = 5 * time.Second
+	// 硬超时 + 关闭顺序都必须是「先关 dev、再关 client」：
+	//   dev.Close() 让包泵里卡在 Read/Write 的 goroutine 立刻返回，
+	//   之后 client.Close() 才不会等一个永远不返回的读循环。
+	// 没有这层保护时，某个节点一旦卡在泵里，这个 worker 就永久丢失 ——
+	// 8 个 worker 全部卡住 = 探测停在 8/N 再也不动（真机现场）。
+	var once sync.Once
+	forceClose := func() {
+		once.Do(func() {
+			_ = dev.Close()
+			ex.close()
+		})
 	}
+	timer := time.AfterFunc(budget+3*time.Second, forceClose)
+	ex.startPump(context.Background())
+	defer func() {
+		timer.Stop()
+		forceClose()
+	}()
 	return probeDownloadBps(stack, budget)
 }
 

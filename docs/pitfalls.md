@@ -630,4 +630,27 @@ OpenVPN 握手就要 3–7 秒（日志里 3037ms、4983ms、7535ms），2 秒�
 `名称 ｜ 速度 ｜ 握手延迟`：速度单独一列夹在中间（用户指定位置），
 `JP家宽01` 的宽度从 84dp 放到 100dp 并加 ellipsis，避免「JP未分类」被截掉数字。
 
+---
+
+## 14. 0.2.18：全量测速停在 8/N
+
+真机日志（2026-11-08 21:14）最后一行是 `握手测试 8/97`，之后再无输出、App 也没崩。
+
+根因：探测有 **8 个 worker**，而每个「握手成功」的节点都会走 `measureThroughOpenVPN`
+—— 它要起一个**完整的 gVisor netstack**（TCP/IP 栈 + goroutine）+ 一条 OpenVPN
+数据通道。8 个并发 netstack 把手机 CPU/内存压满，worker 卡在泵里出不来（`dev.Read`
+阻塞，`client.Close()` 又在等读循环），于是 8 个 worker 全部丢失，队里剩下 89 个
+永远等不到 worker。
+
+四处修法：
+
+1. **测速限流**：`probeSpeedSlots` 容量 3 —— 握手仍并发 8（很轻），只有测速受限；
+   等槽位最多 30 秒（正常排队 3×6=18s 足够），超时才放弃。
+2. **硬超时**：`time.AfterFunc(budget+3s, forceClose)`，到点强制收掉，任何一步卡住
+   都不会拖死 worker。
+3. **关闭顺序**：`dev.Close()` → `ex.close()`。先关 dev 让泵里卡在 Read/Write 的
+   goroutine 立刻返回，`client.Close()` 才不会等一个永远不返回的读循环。
+4. **探测预算 6→10 分钟**，日志每行带单节点耗时（`… 握手成功 3767ms · ≈152 KB/s（7.2s）`），
+   下次再出问题能直接看出是某个节点拖住、还是整体停摆。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

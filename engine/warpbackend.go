@@ -445,10 +445,13 @@ func (b *warpBackend) TestOpenVPNNodes(
 			// 握手 + 真下载：只测握手的话，界面上「3341ms」这种数字看不出
 			// 「能握手但只有几 KB/s」的节点，而那正是用户最需要筛掉的。
 			//
-			// 预算 8s 是**整条 HTTP 请求**（DNS+TCP+TLS+首字节+2s 下载窗口）：
+			// 预算 6s 是**整条 HTTP 请求**（DNS+TCP+TLS+首字节+2s 下载窗口）：
 			// 经「WARP → 日本节点 → CF」，光 TLS 就要好几秒，2s 一定测不出来
 			//（0.2.16 之前就是这么全变成「速度未测」的）。
-			d, bps, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 8*time.Second)
+			// 测速本身还有并发槽位（见 warp.measureThroughOpenVPN），所以这里
+			// 给 6s 而不是 8s：全量 97 个节点时总时长才不至于超过预算。
+			started := time.Now()
+			d, bps, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 6*time.Second)
 			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), Bps: bps, OK: perr == nil}
 			if perr != nil {
 				p.Error = perr.Error()
@@ -461,7 +464,10 @@ func (b *warpBackend) TestOpenVPNNodes(
 			done++
 			n := done
 			mu.Unlock()
-			report(fmt.Sprintf("握手测试 %d/%d：%s %s", n, len(order), id, probeSummary(p)))
+			// 带上单节点总耗时：下次再出现「卡在 N/M」时，能直接看出是某个
+			// 节点拖住了 worker，还是整体停摆。
+			report(fmt.Sprintf("握手测试 %d/%d：%s %s（%.1fs）",
+				n, len(order), id, probeSummary(p), time.Since(started).Seconds()))
 		}()
 	}
 	wg.Wait()
