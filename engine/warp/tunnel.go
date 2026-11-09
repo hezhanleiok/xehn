@@ -48,8 +48,17 @@ func newIPStack(local []netip.Addr, mtu int) (tun.Device, *ipStack, error) {
 	}
 	transport := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return tnet.DialContext(ctx, "tcp", metaDialAddr())
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// 有缓存就用缓存 IP（省一次 DNS），没有就用请求本身给的地址。
+			//
+			// 以前这里无条件用 metaDialAddr()：解析失败时它返回空串，于是
+			// 连 `https://1.1.1.1/cdn-cgi/trace` 这种 IP 字面量也拨不出去 ——
+			// 一条完全正常的隧道被判成「数据面不通（隧道内请求超时）」。
+			// 真机日志里 14 个端点全被误判，就是这么来的。
+			if m := metaDialAddr(); m != "" {
+				addr = m
+			}
+			return tnet.DialContext(ctx, "tcp", addr)
 		},
 	}
 	return tunDev, &ipStack{tnet: tnet, client: &http.Client{Transport: transport}}, nil

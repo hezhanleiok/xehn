@@ -174,12 +174,14 @@ func (b *warpBackend) PrepareAccounts(ctx context.Context, proto string, report 
 	if proto == "" {
 		proto = "awg"
 	}
-	// 只为让 EnsureMasqueAccount 知道凭据路径；不动 tunFD（连接前本来就是 0）。
-	warp.Apply(warp.Config{
-		MasqueCredsPath:      filepath.Join(b.workDir, "masque.json"),
-		MasqueOuterCredsPath: filepath.Join(b.workDir, "masque-outer.json"),
-		OuterCredsPath:       filepath.Join(b.workDir, "outer.json"),
-	})
+	// 只为让 EnsureMasqueAccount 知道凭据路径；**不能**用完整的 Apply：
+	// 那会把 metaAddr 一起清掉，导致紧接着的连接必须重做一次 DNS 解析，
+	// 解析失败就会把好隧道误判成「数据面不通」。
+	warp.SetCredsPaths(
+		filepath.Join(b.workDir, "masque.json"),
+		filepath.Join(b.workDir, "masque-outer.json"),
+		filepath.Join(b.workDir, "outer.json"),
+	)
 
 	b.mu.Lock()
 	accountJSON := b.accountJSON

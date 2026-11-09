@@ -790,4 +790,59 @@ tun 的 1500 —— 每个包都超出 WARP 能承载的大小，握手（小包
 [psiphon] Psiphon 出口 … (…)
 ```
 
+---
+
+## 19. 0.2.23：出口验证误判（真正的原因）
+
+0.2.22 的直连日志证明：**隧道其实是通的，是验证把它判死了。**
+
+```
+[tunnel] Psiphon 隧道已建立（1 条）
+[tunnel] Psiphon[ConnectedServerRegion] {"serverRegion":"FR"}
+[tunnel] Psiphon[TotalBytesTransferred] {"received":62,"sent":20693}
+[tunnel] Psiphon 直连没成功（出口验证失败（SOCKS 127.0.0.1:41029））
+```
+
+### 19.1 `newIPStack` 的 DialContext 丢掉了请求地址
+
+```go
+DialContext: func(ctx, network, _ string) (net.Conn, error) {
+    return tnet.DialContext(ctx, "tcp", metaDialAddr())
+}
+```
+
+第三个参数（请求自己的地址）被丢弃，一律用全局 `metaDialAddr()`。当 `metaAddr`
+为空时它返回 **空串** → `Dial("tcp", "")` 必失败 → 连
+`https://1.1.1.1/cdn-cgi/trace` 这种 **IP 字面量**也拨不出去 → `verifyEgress`
+三档全灭 → 报「数据面不通」。
+
+### 19.2 谁把 metaAddr 清空的：`PrepareAccounts`
+
+0.2.16 加的「连接前预注册账号」里调了完整的 `warp.Apply(Config{})`，它会
+`metaAddr.Store(nil)`。于是**每次连接前**缓存必被清 → 必须重新解析 → WARP 刚
+起来时解析经常失败 → 必误判。
+
+这解释了两个场景的差别：
+
+- 「更新地区列表」不经过 `PrepareAccounts` → metaAddr 还是上次的 → 通过；
+- 连接必经过 `PrepareAccounts` → metaAddr 被清 → 全灭。
+
+### 19.3 与基线的对比
+
+```powershell
+git show 3e9caba:engine/warp/tunnel.go | Select-String metaDialAddr
+```
+
+基线（`3e9caba`，2026-10-22 可运行状态）里 `DialContext` 也是 `metaDialAddr()`，
+但**基线能连** —— 因为那时没有 `PrepareAccounts`，`metaAddr` 从上次会话一直
+保留着。所以问题不是基线写法，而是 0.2.16 引入的「连接前 Apply」。
+
+### 19.4 本版修复
+
+1. **删除赛风直连**（按要求，只走 WARP 前置）；
+2. `DialContext` 尊重传入地址：`metaAddr` 为空时用它 → IP 字面量档恢复可用；
+3. `probeViaSocks` 加第三档 IP 字面量（`https://1.1.1.1/cdn-cgi/trace`）；
+4. `PrepareAccounts` 改用 `warp.SetCredsPaths()`，只设凭据路径，**不再清 metaAddr**；
+5. 保留上游 netstack MTU 固定 1280。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

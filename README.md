@@ -4,7 +4,7 @@
 **本目录只读参考 `d:\xhwarp`，不修改它。**
 
 - 仓库：<https://github.com/hezhanleiok/xehn/tree/xehn-android>
-- 当前版本：**v0.2.22**（versionCode 24）
+- 当前版本：**v0.2.23**（versionCode 25）
 
 详细代码分析见 [`docs/porting-analysis.md`](docs/porting-analysis.md)。
 

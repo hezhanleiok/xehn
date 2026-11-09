@@ -568,25 +568,11 @@ func DialPsiphon(ctx context.Context, o PsiphonOptions) (*Session, error) {
 	var lastErr error
 	tried := 0
 
-	// ① 先直连。
+	// 只走 WARP 前置：不用直连。
 	//
-	// Psiphon 本身就是抗审查隧道，直连是它的设计用法 —— 对照 Aether 的日志：
-	// `starting psiphon with no tunnel underneath it`，2 秒拿到地区、6 秒就绪。
-	// 只有直连失败（网络把 Psiphon 服务器也拦了）才退到「WARP 前置」。
-	directBudget := 45 * time.Second
-	if r := time.Until(deadline); r < directBudget {
-		directBudget = r
-	}
-	if directBudget > 5*time.Second {
-		if sess, err := dialPsiphonDirect(ctx, o, directBudget); err == nil {
-			return sess, nil
-		} else {
-			lastErr = err
-			tried++
-			o.report(fmt.Sprintf("Psiphon 直连没成功（%s），改走 WARP 前置…", shortErr(err)))
-		}
-	}
-
+	// 用户明确要求（2026-11-09）。实测直连虽然也能把 Psiphon 隧道拉起来，
+	// 但它走的是本机裸网络，在这张网里经常刚建立就被掐、出口验证吃不到数据，
+	// 观感是「时好时坏」。统一走 WARP 前置至少是同一条已知可用的链路。
 	for pi, proto := range protos {
 		o.UnderlayProto = proto
 		skip := ""
@@ -632,28 +618,6 @@ func DialPsiphon(ctx context.Context, o PsiphonOptions) (*Session, error) {
 		lastErr = fmt.Errorf("预算 %s 内没等到可用的上游", psiphonTotalBudget)
 	}
 	return nil, fmt.Errorf("%w（共试了 %d 次上游）%s", lastErr, tried, underlayHint(o.UnderlayProto))
-}
-
-// dialPsiphonDirect 直接叠加 Psiphon（**不建 WARP 上游**），是最快的一条路。
-//
-// 与 Aether 的做法一致：它的日志里就是 `starting psiphon with no tunnel
-// underneath it`，2 秒拿到可用地区、6 秒出口就绪。
-func dialPsiphonDirect(ctx context.Context, o PsiphonOptions, remaining time.Duration) (*Session, error) {
-	readyTimeout := psiphonReadyTimeout
-	if remaining > 0 && remaining < readyTimeout {
-		readyTimeout = remaining
-	}
-	o.report(fmt.Sprintf("Psiphon 直连（不建上游隧道），等就绪上限 %s…", readyTimeout.Round(time.Second)))
-	ex, err := startPsiphon(ctx, o, "", readyTimeout)
-	if err != nil {
-		return nil, err
-	}
-	ip, country, ok := probeViaSocks(ctx, ex.SocksAddr(), o.VerifyTimeout)
-	if !ok {
-		ex.stop()
-		return nil, fmt.Errorf("Psiphon 直连已建立但出口验证失败（SOCKS %s）", ex.SocksAddr())
-	}
-	return &Session{ExitIP: ip, Country: country, psiphon: ex, tunFD: o.TunFD}, nil
 }
 
 // dialPsiphonOnce 是一次完整的「拨上游 → 叠加 Psiphon → 出口实测」。
@@ -837,9 +801,21 @@ func probeViaSocks(ctx context.Context, socksAddr string, timeout time.Duration)
 			},
 		},
 	}
+	// 三档端点，最后一档是 IP 字面量（不需要 DNS）。
+	//
+	// 只试前两档会误判：Psiphon 刚 ready 的一两秒里，域名请求常常吃不到数据
+	//（真机日志：`TotalBytesTransferred received=62 sent=20693`，随即被判
+	// 「出口验证失败」）。1.1.1.1 只要隧道真的在转发就一定能通。
 	body, ok := fetchMeta(reqCtx, client, metaURL)
 	if !ok {
 		body, ok = fetchMeta(reqCtx, client, traceURL)
+	}
+	if !ok {
+		for _, u := range traceIPURLs {
+			if body, ok = fetchMeta(reqCtx, client, u); ok {
+				break
+			}
+		}
 	}
 	if !ok {
 		return "", "", false

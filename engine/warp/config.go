@@ -56,6 +56,18 @@ var (
 )
 
 // Apply 把配置写进包的全局状态，并清掉上一次会话残留的运行时缓存。
+// SetCredsPaths 只设置凭据文件路径，不碰任何会话状态。
+//
+// 给「连接前预注册账号」用：那里只需要知道 masque.json 在哪，之前却调了
+// 完整的 Apply(Config{})，顺手把 metaAddr / outer / masqueNest 全清了。清掉
+// metaAddr 的后果是出口验证必须重新做一次 DNS 解析，而解析在 WARP 刚起来时
+// 经常失败 —— 于是一条好隧道被判定成「数据面不通」。
+func SetCredsPaths(masque, masqueOuter, outer string) {
+	masqueCredsFile = masque
+	masqueOuterCredsFile = masqueOuter
+	outerCredsFile = outer
+}
+
 // ResetTransient 只清「跨会话的临时状态」，不动 tunFD / MTU / 凭据路径。
 //
 // 用途：某些流程（「更新地区列表」跑一次 Psiphon、之前的探测会话）会留下
