@@ -770,6 +770,41 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	return under, used, nil
 }
 
+// ProbePsiphonRegion 用**一条已经就绪的上游 SOCKS** 把 Psiphon 拉到指定地区，
+// 测一次下载速度后停掉。返回 (就绪耗时 ms, 字节/秒, error)。
+//
+// 为什么要复用上游：真机日志（2026-11-09 15:22）里，逐个地区各建一条上游测完
+// 27 个之后，紧接着连接就失败了 —— `RemoteServerListResourceDownloadedBytes
+// bytes:0`、候选只剩 13 个、1m29s 建不起隧道。27 次「建上游 + 起 Psiphon + 停」
+// 把 socket / netstack / tunnel-core 的全局状态全耗掉了。
+func ProbePsiphonRegion(
+	ctx context.Context, cfg, dns, dataDir, upSocks, region string,
+	timeout time.Duration, report func(string),
+) (int64, int64, error) {
+	o := PsiphonOptions{
+		ClientConfigJSON: cfg,
+		DNS:              dns,
+		DataDir:          dataDir,
+		// RegionsOnly：不建 tun、不接管流量，只借 Psiphon 的 SOCKS 测一次。
+		RegionsOnly:   true,
+		EgressRegion:  region,
+		VerifyTimeout: 8 * time.Second,
+		Report:        report,
+	}
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	started := time.Now()
+	ex, err := startPsiphon(ctx, o, upSocks, timeout)
+	if err != nil {
+		return time.Since(started).Milliseconds(), 0, err
+	}
+	ms := time.Since(started).Milliseconds()
+	bps := ProbeSpeedViaSocks(ctx, ex.SocksAddr(), 512<<10, 8*time.Second)
+	ex.stop()
+	return ms, bps, nil
+}
+
 // ProbeSpeedViaSocks 经一个 SOCKS5 下载最多 limit 字节，返回字节/秒（0 = 测不出）。
 //
 // 用于「出口地区」里的测速：RegionsOnly 模式下 Psiphon 只有 SOCKS、没有 tun，

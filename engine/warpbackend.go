@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xhwarp/android-engine/warp"
@@ -33,6 +34,10 @@ type warpBackend struct {
 	// 连续整体失败次数。达到 2 就重置本地账号缓存（下次自动重新注册）——
 	// Cloudflare 注销设备后的表象和「网络不通」一模一样，只能靠这个兜底。
 	accountFailStreak int
+	// 地区测速进行中。tunnel-core 的 psi 是**进程内单例**，测速与连接同时跑
+	// 会互相踩（真机日志：测速后立刻连接，远程服务器列表 0 字节、1m29s 建不起
+	// 隧道）。这里让连接在测速期间明确拒绝，而不是两个流程互相破坏。
+	probingRegions atomic.Bool
 	// Psiphon 出口的官方 client.config 内容与系统 DNS，由 Kotlin 随包喂入。
 	// 为空表示没有随包配置，这时选 Psiphon 会明确报错而不是静默按基础协议走。
 	psiphonConfig string
@@ -752,36 +757,40 @@ func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string,
 	if cfg == "" {
 		return out
 	}
+	b.probingRegions.Store(true)
+	defer b.probingRegions.Store(false)
+	// **一条上游复用给所有地区**（见 warp.ProbePsiphonRegion 的注释）。
+	// 每个地区都重建一条 WARP 上游，测完 27 个之后资源耗尽，紧接着的连接会
+	// 直接失败（真机日志 15:22：远程服务器列表 0 字节、1m29s 建不起隧道）。
+	report("地区测速：先建一条 WARP 上游（各地区共用）…")
+	under, err := warp.OpenUnderlay(ctx, warp.OpenVPNOptions{
+		UnderlayProto:    "awg",
+		HandshakeTimeout: 3 * time.Second,
+		Budget:           60 * time.Second,
+		Report:           report,
+	})
+	if err != nil {
+		for _, region := range regions {
+			out = append(out, PsiphonRegionProbe{Region: region, Error: "上游建立失败：" + shortErrStr(err)})
+		}
+		return out
+	}
+	defer under.Close()
+	upSocks := under.SocksAddr()
+	dir := filepath.Join(b.workDir, "psiphon")
+
 	for i, region := range regions {
 		if ctx.Err() != nil {
 			break
 		}
 		report(fmt.Sprintf("地区测速 %d/%d：%s…", i+1, len(regions), region))
 		p := PsiphonRegionProbe{Region: region}
-		started := time.Now()
-		sess, err := warp.DialPsiphon(ctx, warp.PsiphonOptions{
-			ClientConfigJSON: cfg,
-			DNS:              dns,
-			DataDir:          filepath.Join(b.workDir, "psiphon"),
-			EgressRegion:     region,
-			RegionsOnly:      true,
-			UnderlayProto:    "awg",
-			HandshakeTimeout: 3 * time.Second,
-			Budget:           60 * time.Second,
-			Report:           report,
-		})
-		if err != nil {
-			p.Error = err.Error()
-			if len(p.Error) > 90 {
-				p.Error = p.Error[:90]
-			}
+		ms, bps, perr := warp.ProbePsiphonRegion(ctx, cfg, dns, dir, upSocks, region, 45*time.Second, report)
+		p.MS, p.Bps = ms, bps
+		if perr != nil {
+			p.Error = shortErrStr(perr)
 		} else {
-			p.MS = time.Since(started).Milliseconds()
-			if socks := sess.PsiphonSocks(); socks != "" {
-				p.Bps = warp.ProbeSpeedViaSocks(ctx, socks, 512<<10, 8*time.Second)
-			}
-			sess.Close()
-			p.OK = p.Bps > 0
+			p.OK = bps > 0
 			if !p.OK {
 				p.Error = "连上了但测不出速度"
 			}
@@ -790,7 +799,25 @@ func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string,
 			map[bool]string{true: fmt.Sprintf("≈%d KB/s", p.Bps/1024), false: "失败 " + p.Error}[p.OK]))
 		out = append(out, p)
 	}
+	// 让 tunnel-core 彻底停稳再放行正式连接：它的 psi 是进程内单例，刚 Stop
+	// 完立刻 Start 会拿不到服务器列表（日志里就是 bytes:0）。
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+	}
 	return out
+}
+
+// shortErrStr 把错误压到一行（日志/界面用）。
+func shortErrStr(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if len(s) > 90 {
+		s = s[:90]
+	}
+	return s
 }
 
 // SetPsiphonRegion 设置 Psiphon 的落地地区：""（或 "auto"）= 自动，否则 ISO-2。
@@ -848,6 +875,10 @@ func (b *warpBackend) SetPsiphonConfig(clientConfigJSON, dns string) {
 func (b *warpBackend) connectPsiphon(
 	ctx context.Context, req Request, report func(string),
 	handshake time.Duration, tunFD int) (Result, error) {
+
+	if b.probingRegions.Load() {
+		return Result{}, errors.New("赛风地区测速正在进行，请等它结束再连接（两者共用同一个进程内 Psiphon 实例）")
+	}
 
 	// 先把上一轮留下的临时状态清干净。
 	//

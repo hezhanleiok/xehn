@@ -904,4 +904,45 @@ Psiphon 的整个上游都走这个 SOCKS，32 KB 的小缓冲 + Nagle 会把高
 > 1280。内层 1500 的包在外层会被切成两段，理论上有约 10% 的效率损失。要不要
 > 降到 1280 需要真机对照（改小会让终端的 MSS 变小，可能反而更慢），先看测速数据。
 
+---
+
+## 22. 0.2.26：地区测速把资源耗光，导致随后连不上赛风
+
+真机日志（2026-11-09 15:22）的顺序很清楚：先测了 27 个地区，然后连接失败。
+
+**测速侧完全正常**（每个地区都有值）：
+
+```
+[psiphon] 地区测速 AT：≈99 KB/s
+[psiphon] 地区测速 AU：≈84 KB/s
+[psiphon] 地区测速 BE：≈274 KB/s
+[psiphon] 地区测速 CA：≈6 KB/s
+[psiphon] 地区测速 BR：失败  Psiphon 本次不提供 BR 地区的出口
+```
+
+**紧接着的连接失败**：
+
+```
+[tunnel] Psiphon[RemoteServerListResourceDownloadedBytes] {"bytes":0,...}
+[tunnel] Psiphon[CandidateServers] {"count":13,"initialCount":0,...}
+[engine] 连接失败: Psiphon 在 1m29.999s 内没有建立隧道
+```
+
+`bytes:0` = 远程服务器列表没下载到；候选只剩 13 个（正常是 20+）。根因是
+`ProbePsiphonRegions` 对**每个地区**都 `DialPsiphon` 一次 —— 27 次「建 WARP 上游
++ 启动/停止 Psiphon」，把 socket / netstack / tunnel-core 的进程内全局状态全耗光。
+
+三条修法：
+
+1. **一条上游复用给所有地区**：`warp.OpenUnderlay` 只建一次，每个地区改用
+   `warp.ProbePsiphonRegion(ctx, …, upSocks, region, …)`（同一上游 SOCKS 上起停
+   Psiphon）。27 条上游 → 1 条。
+2. **测速结束后冷却 2 秒**再放行正式连接（`psi` 是进程内单例，刚 `Stop` 完立刻
+   `Start` 拿不到服务器列表）。
+3. **测速进行中拒绝连接**（`probingRegions`）：两者共用同一个 `psi`，同时跑只会
+   互相破坏，明确报错比静默失败好。
+
+UI 也加了进度：`测速中… 3/27`（从引擎日志里取），27 个地区要 5 分钟以上，没有
+进度看起来就是卡死。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

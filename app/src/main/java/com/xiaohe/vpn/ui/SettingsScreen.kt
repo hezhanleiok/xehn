@@ -251,7 +251,20 @@ fun SettingsScreen(
                             .heightIn(max = 420.dp)
                             .verticalScroll(rememberScrollState())
                     ) {
-                        if (regionUpdating) {
+                        if (regionProbing) {
+                            // 进度直接取引擎日志里的「地区测速 3/27：BE…」——
+                            // 27 个地区要跑 5 分钟以上，没有进度看起来就是卡死。
+                            val prog = state.logs.lastOrNull {
+                                it.contains("地区测速 ") && it.contains("/")
+                            }?.substringAfter("地区测速 ")?.substringBefore("…")?.trim().orEmpty()
+                            Text(
+                                "测速中…" + if (prog.isNotEmpty()) " $prog" else "" +
+                                    "（逐个国家经 WARP 前置跑一次 Psiphon，每个 10–20 秒）",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 6.dp),
+                            )
+                        } else if (regionUpdating) {
                             Text(
                                 "正在经 WARP 获取 Psiphon 地区列表，通常 10–40 秒…",
                                 style = MaterialTheme.typography.labelSmall,
