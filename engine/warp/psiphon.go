@@ -633,6 +633,9 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	}
 	savedTunFD := tunFD
 	tunFD = 0 // 系统 tun fd 这一轮归 Psiphon 的 packet tunnel，上游退成 netstack
+	// 诊断：上游是 netstack 模式，MTU 为 0 会让 gVisor 一个包都发不出去（真机
+	// 「握手成功、数据面全不通」的一种成因），所以把这两个值写进日志。
+	o.report(fmt.Sprintf("Psiphon 上游：netstack 数据面（全局 tunFD %d→0, tunMTU %d）", savedTunFD, tunMTU))
 	under, err := Dial(ctx, Options{
 		Proto:            underlayProto,
 		Endpoint:         o.UnderlayEndpoint,

@@ -36,6 +36,11 @@ type ipStack struct {
 const netstackTCPBufferMax = 0
 
 func newIPStack(local []netip.Addr, mtu int) (tun.Device, *ipStack, error) {
+	// MTU 为 0 时 gVisor 连一个 IP 包都发不出去，表现正是「隧道握手成功、
+	// 数据面全不通」——而调用方完全看不出原因。这里兜底成标准值。
+	if mtu < 576 {
+		mtu = 1280
+	}
 	tunDev, tnet, err := netstack.CreateNetTUNBuffered(
 		local, []netip.Addr{netip.MustParseAddr(tunnelDNS)}, mtu, netstackTCPBufferMax)
 	if err != nil {

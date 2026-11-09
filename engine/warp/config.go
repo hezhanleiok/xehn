@@ -56,6 +56,19 @@ var (
 )
 
 // Apply 把配置写进包的全局状态，并清掉上一次会话残留的运行时缓存。
+// ResetTransient 只清「跨会话的临时状态」，不动 tunFD / MTU / 凭据路径。
+//
+// 用途：某些流程（「更新地区列表」跑一次 Psiphon、之前的探测会话）会留下
+// outer / masqueNest / metaAddr 这些指针。下一次连接如果复用了它们，上游的 UDP
+// 会被塞进一条已经关闭的 netstack —— 表现就是「握手成功、数据面全不通」。
+func ResetTransient() {
+	metaAddr.Store(nil)
+	pingAddr.Store(nil)
+	masqueNest.Store(nil)
+	outer = nil
+	outerAcct = nil
+}
+
 func Apply(c Config) {
 	tunFD = c.TunFD
 	tunMTU = c.MTU

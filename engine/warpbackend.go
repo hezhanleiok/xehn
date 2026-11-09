@@ -781,6 +781,14 @@ func (b *warpBackend) connectPsiphon(
 	ctx context.Context, req Request, report func(string),
 	handshake time.Duration, tunFD int) (Result, error) {
 
+	// 先把上一轮留下的临时状态清干净。
+	//
+	// 真机现场：点过「更新地区列表」（它会跑一次 Psiphon + 一条 WARP 上游）之后
+	// 立刻连接，上游就变成「每个端点都握手成功、但数据面全不通」；而单独跑
+	// 「更新列表」时同样的端点却完全正常。差别就是这一层残留 —— outer /
+	// masqueNest / metaAddr 指向上一条已关闭的会话。
+	warp.ResetTransient()
+
 	// 上游可以是任意一种传输：它在这里的角色只是「一个能出网的本地 SOCKS」，
 	// WG / AWG / MASQUE / WARP-in-WARP 都满足（见 warp/psiphon.go 的 DialPsiphon）。
 	// 空 proto 由 warp 侧按 awg 处理。
