@@ -212,7 +212,16 @@ func (e *Engine) SetTunProvider(p TunProvider) {
 		}
 		return fd, nil
 	})
-	e.sess.logf("[engine] 已安装 OpenVPN 建 tun 回调")
+	// Psiphon 走同一条回调：它的 tun 也是"上游建好之后"才建（见 warp/psiphon.go）。
+	// 参数只是占位 —— Kotlin 的 Psiphon provider 用自己的固定地址/MTU。
+	warp.SetPsiphonTunProvider(func() (int, error) {
+		fd := p.EstablishTun("172.16.0.2", 32, "0.0.0.0/0", "", 1500)
+		if fd <= 0 {
+			return 0, fmt.Errorf("Android 侧建 Psiphon tun 失败")
+		}
+		return fd, nil
+	})
+	e.sess.logf("[engine] 已安装 OpenVPN / Psiphon 建 tun 回调")
 }
 
 // SetOpenVPNExit selects the OpenVPN nodes to try, in order, as the final exit.
@@ -250,6 +259,30 @@ func (e *Engine) SetOpenVPNExit(idsCSV, label, country string) {
 	}
 	wb.SetOpenVPNExit(true, kept, label, country)
 	e.sess.logf("[engine] OpenVPN 出口 = %s（%s），候选 %d 个", label, country, len(kept))
+}
+
+// RefreshPsiphonRegions 通过 WARP 前置重新获取 Psiphon 可用出口地区。
+//
+// BLOCKING：要起一条 WARP 上游再启动 Psiphon，通常 10–40 秒。
+// Returns JSON: {"ok":true,"regions":["JP","US",…]} 或 {"ok":false,"error":"…"}
+func (e *Engine) RefreshPsiphonRegions() string {
+	wb := e.warpBackendOf()
+	if wb == nil {
+		return `{"ok":false,"error":"引擎未安装"}`
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	e.sess.logf("[engine] 更新 Psiphon 地区列表（经 WARP 前置）…")
+	list, err := wb.RefreshPsiphonRegions(ctx, func(s string) { e.sess.logf("[psiphon] %s", s) })
+	payload := map[string]any{"ok": err == nil, "regions": list}
+	if err != nil {
+		payload["error"] = err.Error()
+		e.sess.logf("[engine] 更新 Psiphon 地区列表失败：%v", err)
+	} else {
+		e.sess.logf("[engine] Psiphon 地区列表已更新：%d 个", len(list))
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
 }
 
 // PrepareAccounts 在建立系统 VPN **之前**把账号准备好（首次使用会现注册）。

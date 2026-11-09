@@ -680,4 +680,50 @@ OpenVPN 握手就要 3–7 秒（日志里 3037ms、4983ms、7535ms），2 秒�
 > 1 MiB 预热），后者当然能测出数。两者互不矛盾，**连接后的结果会写回本节点的
 > 速度记忆**，所以再打开出口地区就能看到。
 
+---
+
+## 16. 0.2.20：赛风连不上（提前建 tun）与地区列表
+
+### 16.1 赛风 14 个端点全「数据面不通」
+
+真机日志（2026-11-09 12:37）：Psiphon 的上游连续 14 个端点
+`握手成功，验证出口…` → `数据面不通（隧道内请求超时）`，最后 60 秒失败；
+**同一时刻 OpenVPN 出口用同一条 awg 上游却是通的**（`上游就绪，出口 104.28.245.200`）。
+
+两者唯一的差别是**建 tun 的时机**：
+
+- OpenVPN 分支：`e.setTunFD(0)` → 引擎先建上游 → 回调 `TunProvider` 建 tun；
+- Psiphon 分支：Kotlin **先** `establish()` 建 tun（整机路由立刻被接管），再建上游。
+
+系统 VPN 一建立，即使 socket 被 `protect`，在「VPN 刚起来」的窗口里这条上游的
+UDP 仍会被丢。修法是把顺序反过来：`psiphonTunProvider`（`warp/psiphon.go` 的
+`psiphonTunProvider` + `SetPsiphonTunProvider`），上游就绪后才向 Android 要 fd。
+
+顺带把重试从 3 次 / 150 秒收紧到 **2 次 / 90 秒** —— 根因修了，不必再用 150 秒
+去赌第三个端点（用户明确要求连接时间短）。
+
+### 16.2 出口地区列表首次为空
+
+Psiphon 的可用地区是 tunnel-core 运行时上报的，没有独立 API：没连过就一定是空的。
+
+新增 `RefreshPsiphonRegions()`（引擎）：
+
+1. 起一条 WARP 上游（netstack）；
+2. 以 `PsiphonOptions.RegionsOnly` 启动 Psiphon —— 不建 tun、不接管流量、不做
+   出口测速，只在拿到 `AvailableEgressRegions` 后立即返回；
+3. 落盘 `psiphon-regions.json`（`savePsiphonRegions`），下次启动直接预置。
+
+UI：出口地区弹窗右上角「更新列表」；**首次打开且列表为空时自动拉一次**（只自动
+尝试一次，失败后等用户手动点，避免每次弹窗都白等 30 秒）。
+
+### 16.3 首次启动就注册账号
+
+`MainActivity.onCreate` 起一个后台线程调 `EngineBridge.prepareAccountsOnFirstLaunch`
+——只在本地没有 `account.json` / `masque.json` 时才联网注册，之后走缓存。日志有
+`[ui] 首次启动：正在注册本机 WARP 账号…`，注册过程引擎会写 `[acct] …`。
+
+> APK 内**不打包任何账号或节点**：`assets/` 只有 `psiphon/client.config`（官方
+> Psiphon 客户端配置，必需且不含身份）。账号、节点、大陆路由表全部是运行时生成
+> 并缓存在 `filesDir/engine/`。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

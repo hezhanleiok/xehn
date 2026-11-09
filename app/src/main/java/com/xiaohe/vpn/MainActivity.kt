@@ -100,6 +100,14 @@ class MainActivity : ComponentActivity() {
         // —— 闪退本身不留痕迹，这条日志是唯一能自己开口的证据。
         CrashGuard.markStart(this, "UI")
 
+        // 首次启动就把本机 WARP 账号注册好（注册之后才缓存）。
+        // 放后台线程，不挡首帧；只在本地没有账号时才真的联网。
+        Thread {
+            runCatching {
+                EngineBridge.prepareAccountsOnFirstLaunch(this, SettingsStore.load(this).proto)
+            }
+        }.start()
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             requestNotifications.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }

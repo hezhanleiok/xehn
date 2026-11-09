@@ -4,7 +4,7 @@
 **本目录只读参考 `d:\xhwarp`，不修改它。**
 
 - 仓库：<https://github.com/hezhanleiok/xehn/tree/xehn-android>
-- 当前版本：**v0.2.19**（versionCode 21）
+- 当前版本：**v0.2.20**（versionCode 22）
 
 详细代码分析见 [`docs/porting-analysis.md`](docs/porting-analysis.md)。
 
@@ -17,7 +17,7 @@
 | `engine/` Go 引擎（gomobile 打成 `.aar`） | ✅ `go test` / `go vet` 全过，`android/arm64` 交叉编译通过 |
 | `app/libs/engine.aar` | ✅ 已生成（17.8 MB，含 arm64 + arm 的 `libgojni.so`） |
 | `app/` Kotlin + Compose 界面骨架 | ✅ 编译通过 |
-| **`xehn-<版本号>.apk`** | ✅ **已构建成功（`xehn-0.2.19.apk`，65.6 MB）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.9 MB）。产物名由 `app/build.gradle.kts` 的 `androidComponents` 统一改成 `xehn-<versionName>.apk` |
+| **`xehn-<版本号>.apk`** | ✅ **已构建成功（`xehn-0.2.20.apk`，65.7 MB）**，含 arm64 + arm 两个 ABI 的原生库（引擎里已带 Psiphon/QUIC/gVisor，aar 本身 17.9 MB）。产物名由 `app/build.gradle.kts` 的 `androidComponents` 统一改成 `xehn-<versionName>.apk` |
 | `WarpVpnService` | ✅ 前台服务 + 通知 + tun fd 接缝（**路由默认关闭**，见下） |
 | 环境（JDK/SDK/NDK/gomobile/Gradle） | ✅ `check-env.ps1` **12 项就绪 / 0 缺失** |
 | **真正建立隧道（P1，已接入）** | ✅ warpscout 引擎搬进 `engine/warp`，能建 WG/AWG 隧道并拿到真实出口 IP |
@@ -33,6 +33,7 @@
 | **0.2.17：分类二值化 / 测速真正出数** | ✅ 节点分类改为**只看家宽/机房**：ip-api + ipwho.is 对所有 IP 交叉验证，无强证据时按云厂商 ASN 启发式二分，不再出现「未分类」；测延迟的测速预算 2s→8s 且**从首字节开始计时**（原来 2s 连 TLS 都没完成，全部「速度未测」）；节点行改为「名称 ｜ 速度 ｜ 握手延迟」三列 |
 | **0.2.18：全量测速卡死修复** | ✅ 「测到第 8 个就不动」= 8 个 worker 全卡在测速（每节点一个 gVisor netstack + OpenVPN 包泵）；测速改为**并发上限 3**、每节点**硬超时**、关闭顺序改为「先关 dev 再关 client」、探测总预算 6→10 分钟、日志带单节点耗时 |
 | **0.2.19：测速绕过隧道 DNS** | ✅ 「握手成功但速度未测」的根因是测速端点在隧道内解析（VPN Gate 节点不转发 DNS）；改为**主机 DNS 解析 + 直连 IP + 固定 SNI**，并把失败原因（tcp/tls/没数据）写进日志 |
+| **0.2.20：首次启动注册 / 赛风修复 / 地区更新** | ✅ 首次启动即注册本机账号（之后才缓存，有日志）；**赛风改成「先建上游、再建 tun」**（提前建 tun 导致上游 14 个端点全「数据面不通」）；重试 3 次/150s → 2 次/90s（连接更快）；出口地区新增「更新列表」（WARP 前置跑一次 Psiphon 只取地区，首次为空自动拉一次） |
 | 装机运行 | ⏳ 需要一台开了 USB 调试的手机或模拟器（当前 `adb devices` 为空） |
 
 > P2 的意义：在这之前只有进程内的 gVisor 隧道，系统 VPN 根本没起来 ——

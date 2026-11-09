@@ -180,9 +180,34 @@ fun SettingsScreen(
         // AvailableEgressRegions —— 不是一张「全世界国家」表：桌面版手写的大表
         // 里有它根本不落地的国家，选中会连三分钟然后失败。
         var regionPicker by remember { mutableStateOf(false) }
-        val exitRegions = remember(settings.psiphon, regionPicker) {
-            if (settings.psiphon) EngineBridge.psiphonRegions(ctx) else emptyList()
+        var exitRegions by remember { mutableStateOf(emptyList<String>()) }
+        var regionUpdating by remember { mutableStateOf(false) }
+        var regionTouched by remember { mutableStateOf(false) }
+        val regionScope = rememberCoroutineScope()
+
+        fun updateRegions() {
+            if (regionUpdating) return
+            regionUpdating = true
+            regionScope.launch {
+                exitRegions = withContext(Dispatchers.IO) { EngineBridge.refreshPsiphonRegions(ctx) }
+                regionUpdating = false
+            }
         }
+
+        LaunchedEffect(settings.psiphon, regionPicker) {
+            if (!settings.psiphon) {
+                exitRegions = emptyList()
+                return@LaunchedEffect
+            }
+            exitRegions = withContext(Dispatchers.IO) { EngineBridge.psiphonRegions(ctx) }
+            // 首次打开而且列表为空：自动拉一次（用户要求「首次不为空」）。
+            // 只在第一次自动尝试，失败后不反复重试，避免每次弹窗都白等 30 秒。
+            if (regionPicker && exitRegions.isEmpty() && !regionTouched) {
+                regionTouched = true
+                updateRegions()
+            }
+        }
+
         ActionRow(
             title = "出口地区",
             subtitle = exitRegionSubtitle(settings.exitRegion, exitRegions, settings.psiphon),
@@ -191,13 +216,36 @@ fun SettingsScreen(
         if (regionPicker) {
             AlertDialog(
                 onDismissRequest = { regionPicker = false },
-                title = { Text("出口地区") },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("出口地区", modifier = Modifier.weight(1f))
+                        // 「更新列表」走 WARP 前置跑一次 Psiphon，只为拿它的可用地区。
+                        TextButton(onClick = { updateRegions() }, enabled = !regionUpdating) {
+                            Text(if (regionUpdating) "更新中…" else "更新列表")
+                        }
+                    }
+                },
                 text = {
                     Column(
                         Modifier
                             .heightIn(max = 420.dp)
                             .verticalScroll(rememberScrollState())
                     ) {
+                        if (regionUpdating) {
+                            Text(
+                                "正在经 WARP 获取 Psiphon 地区列表，通常 10–40 秒…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 6.dp),
+                            )
+                        } else if (exitRegions.isEmpty()) {
+                            Text(
+                                "还没有地区列表：点右上角「更新列表」从 Psiphon 获取（不需要先连接）。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(vertical = 6.dp),
+                            )
+                        }
                         RegionRow("自动（由 Psiphon 决定）", "") {
                             onChange(settings.copy(exitRegion = ""))
                             regionPicker = false

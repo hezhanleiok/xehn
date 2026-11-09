@@ -349,6 +349,20 @@ class WarpVpnService : VpnService() {
             e.setSocksListen(s.proxyListenAddr())
             EngineBridge.note("[vpn] 代理模式：监听 ${s.proxyListenAddr()}，不建立系统 VPN")
             EngineBridge.refresh(e)
+        } else if (psiphon) {
+            // 2) Psiphon 出口：同样**不提前建 tun**。
+            //
+            // 以前这里是提前 establish 的，结果上游 WARP 的 UDP 在「系统 VPN 刚
+            // 建立」的窗口里被丢：真机日志 14 个端点全是「握手成功、数据面不通」，
+            // 同一时刻 OpenVPN 出口用同一条 awg 上游却是通的 —— 差别只有建 tun 的
+            // 时机。现在改成上游就绪后由 psiphonTunProvider 回调建 tun。
+            e.setTunFD(0)
+            e.setVPNState(false)
+            e.setTimeout(s.timeoutSec.toLong())
+            e.setSocksListen("")
+            EngineBridge.installTunProvider(this, psiphonTunProvider)
+            EngineBridge.note("[vpn] Psiphon 出口：先建上游，就绪后再建系统 VPN")
+            EngineBridge.refresh(e)
         } else if (openvpn) {
             // 2) OpenVPN 出口：**不能提前建 tun**。
             //
@@ -936,6 +950,30 @@ class WarpVpnService : VpnService() {
     }
 
     /** 引擎的建 tun 回调（在 Go 的连接 goroutine 上调用）。 */
+    /**
+     * Psiphon 的建 tun 回调：**上游建好之后**才会被调用（见 engine/warp/psiphon.go）。
+     *
+     * 参数全部忽略 —— Psiphon 的 tun 用自己的固定地址与 1500 的 MTU，传进来的只是
+     * 占位值。顺序不能反：提前 establish 会让系统 VPN 立刻接管路由，那条 WARP
+     * 上游的 UDP 即使 protect 了也会在建立窗口里被丢（真机日志：14 个端点全部
+     * 「握手成功、数据面不通」）。
+     */
+    private val psiphonTunProvider = object : com.xiaohe.engine.TunProvider {
+        override fun establishTun(
+            address: String,
+            prefixLen: Long,
+            routesCSV: String,
+            dnsCSV: String,
+            mtu: Long,
+        ): Long = try {
+            val s = SettingsStore.load(this@WarpVpnService)
+            establishTun(s, psiphon = true, proto = s.proto).toLong()
+        } catch (t: Throwable) {
+            EngineBridge.note("[vpn] Psiphon 建 tun 异常：${t.javaClass.simpleName}: ${t.message}")
+            -1L
+        }
+    }
+
     private val openvpnTunProvider = object : com.xiaohe.engine.TunProvider {
         override fun establishTun(
             address: String,

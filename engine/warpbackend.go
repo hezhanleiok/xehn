@@ -690,6 +690,41 @@ func (b *warpBackend) savePsiphonRegions() {
 	_ = os.WriteFile(b.psiphonRegionsPath(), raw, 0o644)
 }
 
+// RefreshPsiphonRegions 通过 WARP 前置启动一次 Psiphon，只为拿到最新地区列表。
+//
+// 为什么需要它：Psiphon 的地区表是 tunnel-core 在运行中上报的，没有独立 API；
+// 从没连过 Psiphon 的设备上这张表是空的（第一次进「出口地区」什么都选不到）。
+// 这里用 RegionsOnly 模式跑一次：不接管流量、不需要 tun fd、不做出口测速。
+func (b *warpBackend) RefreshPsiphonRegions(ctx context.Context, report func(string)) ([]string, error) {
+	b.mu.Lock()
+	cfg := b.psiphonConfig
+	dns := b.psiphonDNS
+	b.mu.Unlock()
+	if cfg == "" {
+		return nil, errors.New("缺少官方 Psiphon client.config")
+	}
+	sess, err := warp.DialPsiphon(ctx, warp.PsiphonOptions{
+		ClientConfigJSON: cfg,
+		DNS:              dns,
+		DataDir:          filepath.Join(b.workDir, "psiphon"),
+		UnderlayProto:    "awg",
+		HandshakeTimeout: 3 * time.Second,
+		Budget:           70 * time.Second,
+		RegionsOnly:      true,
+		Report:           report,
+	})
+	if err != nil {
+		// 失败也把上次的列表返回去，总比一个空列表强。
+		if cached := warp.PsiphonRegions(); len(cached) > 0 {
+			return cached, err
+		}
+		return nil, err
+	}
+	defer sess.Close()
+	b.savePsiphonRegions()
+	return warp.PsiphonRegions(), nil
+}
+
 // SetPsiphonRegion 设置 Psiphon 的落地地区：""（或 "auto"）= 自动，否则 ISO-2。
 // 只影响下一次连接，理由见字段注释。
 func (b *warpBackend) SetPsiphonRegion(region string) {
@@ -758,7 +793,11 @@ func (b *warpBackend) connectPsiphon(
 		return Result{}, fmt.Errorf("缺少官方 Psiphon client.config（需随包提供，并调用 SetPsiphonConfig 喂入）")
 	}
 	if tunFD <= 0 {
-		return Result{}, fmt.Errorf("Psiphon 需要系统 VPN 的 tun fd，当前为 %d", tunFD)
+		// 允许 0：上游建好之后再通过 psiphonTunProvider 向 Android 要 tun fd。
+		// 提前建 tun 会让 VpnService 立刻接管路由，实测那条 WARP 上游的 UDP 即使
+		// protect 了也会在建立窗口里丢包（真机日志：14 个端点全部「握手成功、数据面
+		// 不通」），所以顺序必须是「先上游、后 tun」。
+		report("Psiphon：先建上游，再建系统 VPN")
 	}
 	// 地区预检：拿「最近一次上报」的列表先判一次。选了个它根本不去的国家，
 	// 这里直接说清楚并给出可选值，而不是等 tun 起来、180s 之后再失败。

@@ -102,6 +102,62 @@ object EngineBridge {
     }
 
     /**
+     * 通过 **WARP 前置**重新获取 Psiphon 可用出口地区，成功后落盘缓存。
+     *
+     * 阻塞（通常 10–40 秒：要起一条 WARP 上游再启动 Psiphon），必须在 IO 线程调用。
+     * 返回最新的地区列表；失败时返回上次缓存，不让界面变空。
+     */
+    fun refreshPsiphonRegions(context: Context): List<String> {
+        val raw = try {
+            engineOrCreate(context).refreshPsiphonRegions()
+        } catch (t: Throwable) {
+            note("[ui] 更新 Psiphon 地区失败：${t.message}")
+            return psiphonRegions(context)
+        }
+        return try {
+            val o = JSONObject(raw)
+            val arr = o.optJSONArray("regions")
+            val out = ArrayList<String>(arr?.length() ?: 0)
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i)
+                    if (s.isNotEmpty()) out.add(s)
+                }
+            }
+            if (o.optBoolean("ok", false)) {
+                note("[ui] Psiphon 地区列表已更新：${out.size} 个")
+                out
+            } else {
+                note(
+                    "[ui] 更新 Psiphon 地区失败：${o.optString("error", "未知原因")}" +
+                        if (out.isEmpty()) "" else "（显示上次的 ${out.size} 个）"
+                )
+                if (out.isEmpty()) psiphonRegions(context) else out
+            }
+        } catch (_: Exception) {
+            psiphonRegions(context)
+        }
+    }
+
+    /**
+     * 首次启动就把本机 WARP 账号注册好（注册之后才缓存，下一次直接读缓存）。
+     *
+     * 只在本地确实没有账号时才联网；已有账号立即返回。有日志可看，
+     * 界面上不会出现「悄悄注册」或「悄悄卡住」。
+     */
+    fun prepareAccountsOnFirstLaunch(context: Context, proto: String) {
+        val dir = java.io.File(context.filesDir, "engine")
+        val needWarp = !java.io.File(dir, "account.json").isFile
+        val needMasque = proto.startsWith("masque") && !java.io.File(dir, "masque.json").isFile
+        if (!needWarp && !needMasque) return
+        note(
+            "[ui] 首次启动：正在注册本机 WARP 账号" +
+                (if (needMasque) "（含 MASQUE 设备）" else "") + "，注册后缓存在本机…"
+        )
+        prepareAccounts(context, proto)
+    }
+
+    /**
      * 装上 socket 排除器。必须在建立系统 VPN **之前**装好：VPN 一起来，
      * 隧道自己发往 Cloudflare 的 UDP 就会先被自己的 VPN 抓走，
      * 表现是「VPN 钥匙出来了、界面显示已连接、网页打不开」。

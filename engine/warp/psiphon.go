@@ -71,12 +71,14 @@ const (
 	psiphonUnderlayFailLimit = 2
 )
 
-// 叠加失败后的重试：WG 被掐断是「这个网络」的常态，不是一次性的倒霉，所以必须
-// 换端点重试而不是一次定生死。3 次 × 总预算 150s 的取舍：够试到能活下来的端点，
-// 又不会让界面转半天（用户对「等很久才失败」的忍耐度是零）。
+// 叠加失败后的重试。
+//
+// 0.2.20 起从「3 次 / 150s」收紧到「2 次 / 90s」：之前那次 14 个端点全「数据面
+// 不通」，根因是提前建了系统 VPN（已修），不是端点不够多。用户明确要求连接时间
+// 要短，那就不能再用 150 秒去赌第三个端点。
 const (
-	psiphonMaxAttempts = 3
-	psiphonTotalBudget = 150 * time.Second
+	psiphonMaxAttempts = 2
+	psiphonTotalBudget = 90 * time.Second
 )
 
 // errUnderlayUnstable 标记「上游数据面不稳/被掐断」这一类失败：它值得换端点重试。
@@ -108,7 +110,11 @@ type PsiphonOptions struct {
 	// 这里。必须可写，否则 Commit 直接失败。
 	DataDir string
 	// TunFD 是 VpnService 建好的 tun 设备 fd，交给 Psiphon 的 packet tunnel。
+	// 0 表示"上游建好后再向 Android 要"（见 psiphonTunProvider）。
 	TunFD int
+	// RegionsOnly 只启动隧道、不接管流量、不做出口测速，拿到可用地区列表就返回。
+	// 用于「出口地区」里的「更新国家列表」：不需要 tun fd，也不需要真的上网。
+	RegionsOnly bool
 
 	// ---- 上游（基础协议隧道）----
 	UnderlayProto    string // wg | awg | masque | masque-h2 | wwarp，默认 awg
@@ -459,9 +465,33 @@ func buildPsiphonConfig(baseJSON string, tunFD int, dataDir, upstream, dns, regi
 // startPsiphon 装配配置、启动 controller 并等到就绪。
 //
 // readyTimeout 由调用方给：Psiphon 叠加会重试上游端点，单次尝试不能吃掉全部预算。
+// psiphonTunProvider 在**上游已经建好之后**才向 Android 要一个 tun fd。
+//
+// 顺序很重要：系统 VPN 一旦建立，VpnService 立刻接管全部路由，而我们这条
+// WARP 上游的 UDP 虽然被 protect，实测在「VPN 刚建立」的窗口里仍然会被丢掉
+// —— 真机日志里 Psiphon 上游连续 14 个端点全部「握手成功、数据面不通」，而同
+// 一刻 OpenVPN 出口（不提前建 tun）用的是同一条 awg 上游却是通的。
+// 所以 Psiphon 也改成「先建上游、再建 tun」。
+var psiphonTunProvider func() (int, error)
+
+// SetPsiphonTunProvider 安装「按需建系统 VPN」的回调（Kotlin 侧实现）。
+func SetPsiphonTunProvider(f func() (int, error)) { psiphonTunProvider = f }
+
 func startPsiphon(ctx context.Context, o PsiphonOptions, underlaySocks string, readyTimeout time.Duration) (*psiphonExit, error) {
-	if o.TunFD <= 0 {
-		return nil, fmt.Errorf("Psiphon 需要系统 tun fd，当前为 %d", o.TunFD)
+	if o.TunFD <= 0 && !o.RegionsOnly {
+		// 上游已经通了，现在才接管流量。
+		if psiphonTunProvider == nil {
+			return nil, fmt.Errorf("Psiphon 需要系统 tun fd，但 Android 侧没有安装建 tun 回调（当前 fd=%d）", o.TunFD)
+		}
+		fd, err := psiphonTunProvider()
+		if err != nil {
+			return nil, fmt.Errorf("建立系统 VPN 失败: %w", err)
+		}
+		if fd <= 0 {
+			return nil, fmt.Errorf("建立系统 VPN 失败（fd=%d）", fd)
+		}
+		o.TunFD = fd
+		o.report(fmt.Sprintf("系统 VPN 已建立（tun fd=%d），把流量交给 Psiphon", fd))
 	}
 	if o.DataDir == "" {
 		return nil, fmt.Errorf("Psiphon 缺少可写的数据目录")
@@ -690,6 +720,14 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	// 就绪之后看门狗收工：之后「出口还在不在」由会话自身的探测负责，
 	// 这里再探只会重复，还会把预算烧在一次已经成功的连接上。
 	watchCancel()
+
+	// 「只取地区列表」：隧道已就绪，列表已经上报，没必要接管流量或测出口。
+	if o.RegionsOnly {
+		under.psiphon = ex
+		under.tunFD = 0
+		o.report(fmt.Sprintf("Psiphon 上报可用地区 %d 个", len(PsiphonRegions())))
+		return under, used, nil
+	}
 
 	// 出口实测必须走 Psiphon 的 SOCKS：这样界面上的 IP/国家就是 Psiphon 的出口，
 	// 而不是上游 WARP 的 —— 桌面版历史上正是把这两个混在一起才「显示的不是」。
