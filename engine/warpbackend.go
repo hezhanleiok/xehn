@@ -787,9 +787,25 @@ func (b *warpBackend) ProbePsiphonRegions(
 	// Psiphon 每次上报的集合会变：日志里刷新列表时是 27 个，测速时只上报 25 个，
 	// 差的那两个（BR 等）每次都要白等十几秒才失败。拿到列表后直接跳过。
 	var known []string
+	// 总预算 110 秒（用户要求「2 分钟内」）。
+	//
+	// Psiphon 的 psi 是**进程内单例**，多个国家不能并行 —— 一个国家至少要花
+	// 「启动隧道 5–8s + 测速 1.5s」。所以 25 个国家在 2 分钟内跑不完是物理事实，
+	// 到点就停：已经测出来的照常显示，剩下的标「超时未测」，而不是让界面转 5 分钟。
+	deadline := time.Now().Add(110 * time.Second)
+	skippedByTime := 0
 	for i, region := range regions {
 		if ctx.Err() != nil {
 			break
+		}
+		if time.Now().After(deadline) {
+			p := PsiphonRegionProbe{Region: region, Error: "超时未测（2 分钟预算用尽）"}
+			out = append(out, p)
+			if sink != nil {
+				sink(p)
+			}
+			skippedByTime++
+			continue
 		}
 		if len(known) > 0 && !warp.RegionOffered(known, region) {
 			p := PsiphonRegionProbe{Region: region, Error: "本次会话不提供该地区"}
@@ -804,7 +820,7 @@ func (b *warpBackend) ProbePsiphonRegions(
 		p := PsiphonRegionProbe{Region: region}
 		// 15s 上限：成功的地区实测 6–10s 就绪，20s 以上基本都是真要失败 ——
 		// 拖满 45s 只会让「25 个国家」变成 10 分钟的白等。
-		ms, bps, perr := warp.ProbePsiphonRegion(ctx, cfg, dns, dir, upSocks, region, 15*time.Second, report)
+		ms, bps, perr := warp.ProbePsiphonRegion(ctx, cfg, dns, dir, upSocks, region, 8*time.Second, report)
 		p.MS, p.Bps = ms, bps
 		if perr != nil {
 			p.Error = shortErrStr(perr)
@@ -822,12 +838,23 @@ func (b *warpBackend) ProbePsiphonRegions(
 			known = warp.PsiphonRegions()
 			report(fmt.Sprintf("本次会话可用地区 %d 个，其余地区直接跳过", len(known)))
 		}
+		// 给 psi 一点时间停稳：只 Stop 不等待就立刻 Start，下一个国家经常
+		// 「15s 内没有建立隧道」或者「连上了但测不出速度」（真机日志 16:26
+		// 里 25 个国家一半失败，而 16:09 那版每个国家独立上游时都是 200–350 KB/s）。
+		select {
+		case <-ctx.Done():
+		case <-time.After(500 * time.Millisecond):
+		}
 		// 测完一个国家立刻推给界面：等 25 个国家全跑完再刷新，用户看到的就是
 		// 「一直转圈，最后一次性冒出一片失败」。
 		if sink != nil {
 			sink(p)
 		}
 	}
+	if skippedByTime > 0 {
+		report(fmt.Sprintf("地区测速：2 分钟预算用尽，%d 个地区未测完（已测的照常显示）", skippedByTime))
+	}
+
 	// 让 tunnel-core 彻底停稳再放行正式连接：它的 psi 是进程内单例，刚 Stop
 	// 完立刻 Start 会拿不到服务器列表（日志里就是 bytes:0）。
 	select {

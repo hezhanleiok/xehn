@@ -834,7 +834,9 @@ func ProbePsiphonRegion(
 		return time.Since(started).Milliseconds(), 0, err
 	}
 	ms := time.Since(started).Milliseconds()
-	bps := ProbeSpeedViaSocks(ctx, ex.SocksAddr(), 512<<10, 8*time.Second)
+	// 采样 256 KB、超时 6s：配合 128 KB 预热，一个国家约 1.5 秒测完 ——
+	// 「25 个国家 2 分钟内」的预算里，测速本身不能占太多。
+	bps := ProbeSpeedViaSocks(ctx, ex.SocksAddr(), 256<<10, 6*time.Second)
 	ex.stop()
 	return ms, bps, nil
 }
@@ -880,13 +882,14 @@ func ProbeSpeedViaSocks(ctx context.Context, socksAddr string, limit int64, time
 	defer resp.Body.Close()
 	buf := make([]byte, 64<<10)
 
-	// 预热：先丢掉 256 KB 再开始计时。
+	// 预热：先丢掉 128 KB 再开始计时。
 	//
-	// 不预热的话，前 512 KB 基本全在 TCP 慢启动里，测出来只有稳态的几分之一
-	// （真机日志：25 个国家全在 200–350 KB/s，看着像「赛风只有 2 Mbps」）。
-	// 正式出口测速（measureExitBps）一直是「1 MiB 预热 + 3 秒采样」，这里同理。
+	// 不预热的话，采样段基本全在 TCP 慢启动里，测出来只有稳态的几分之一。
+	// 但预热也不能太长：25 个国家串行测（Psiphon 的 psi 是进程内单例，不能让
+	// 多个国家并行），总时长必须压在 2 分钟内，所以这里按「128 KB 跳过慢启动 +
+	// 256 KB 采样」取一个够用又快的量。
 	var warm int64
-	for warm < 256<<10 {
+	for warm < 128<<10 {
 		n, rerr := resp.Body.Read(buf)
 		warm += int64(n)
 		if rerr != nil {
