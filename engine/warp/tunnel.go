@@ -30,10 +30,13 @@ type ipStack struct {
 // 单程 RTT ~250ms 时，吞吐 ≈ 窗口/RTT：8MB ⇒ 理论上限 ~256 Mbps，远高于
 // VPN Gate 节点本身能给到的带宽，所以再大只是白占内存（每条连接都可能吃满）。
 // 上游默认在 1MB 量级，实测把「WARP → 节点」这条链锁在 17 Mbps。
-// ⚠ 暂时关掉（0 = 用上游默认缓冲）。取值来自 2026-10-22 深夜的真机对照：
-// 打开 8MB 之后的构建出现「握手成功但数据面不通」，关掉之后恢复。
-// 要重新启用前必须先在真机验证：先 2MB 试，再逐步加，别直接上 8MB。
-const netstackTCPBufferMax = 0
+// 0.2.24 起开 2MB（按上面那条给自己留的建议）。
+//
+// 那次「打开 8MB 之后数据面不通」的真正原因是出口验证的 DialContext 丢掉了
+// 请求地址（见 pitfalls 第 19 节），跟缓冲大小无关；而且 0 的代价很实在：
+// 上游默认 1MB 量级，实测把「WARP → 节点」这条链锁在 17 Mbps —— 正是用户
+// 反馈的「赛风能连但很慢」。
+const netstackTCPBufferMax = 2 << 20
 
 func newIPStack(local []netip.Addr, mtu int) (tun.Device, *ipStack, error) {
 	// MTU 为 0 时 gVisor 连一个 IP 包都发不出去，表现正是「隧道握手成功、

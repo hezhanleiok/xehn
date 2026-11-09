@@ -967,7 +967,23 @@ class WarpVpnService : VpnService() {
             mtu: Long,
         ): Long = try {
             val s = SettingsStore.load(this@WarpVpnService)
-            establishTun(s, psiphon = true, proto = s.proto).toLong()
+            val fd = establishTun(s, psiphon = true, proto = s.proto)
+            if (fd > 0) {
+                tunFd = fd
+                // 必须回填引擎状态：首页那行「系统 VPN 未启用（流量不会走隧道）」
+                // 和出口看门狗（needRecover）读的都是它。Psiphon 分支是「先上游、
+                // 后建 tun」，startConnect 里那段回填根本没机会执行 —— 漏了这一步
+                // 就会出现「能上网、IP 也是赛风，界面却说没启用」。
+                EngineBridge.peek()?.let { e ->
+                    runCatching {
+                        e.setTunFD(fd.toLong())
+                        e.setVPNState(true)
+                    }
+                    EngineBridge.refresh(e)
+                }
+                EngineBridge.note("[vpn] Psiphon 系统 VPN 已启用（tun fd=$fd）")
+            }
+            fd.toLong()
         } catch (t: Throwable) {
             EngineBridge.note("[vpn] Psiphon 建 tun 异常：${t.javaClass.simpleName}: ${t.message}")
             -1L

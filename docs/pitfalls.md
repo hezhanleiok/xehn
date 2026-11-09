@@ -845,4 +845,39 @@ git show 3e9caba:engine/warp/tunnel.go | Select-String metaDialAddr
 4. `PrepareAccounts` 改用 `warp.SetCredsPaths()`，只设凭据路径，**不再清 metaAddr**；
 5. 保留上游 netstack MTU 固定 1280。
 
+---
+
+## 20. 0.2.24：赛风连上了，但界面说「系统 VPN 未启用」
+
+### 20.1 状态没回填（不是隧道的问题）
+
+0.2.20 把 Psiphon 改成「先上游、后 tun」之后，tun 是在 `psiphonTunProvider`
+里建的，而 `startConnect` 里那段「建完 tun 回填 `setTunFD` / `setVPNState(true)`」
+**根本没机会执行**。于是：
+
+- 隧道真的通（能上网、出口 IP 是 Psiphon 的 45.33.64.181）；
+- 引擎快照里 `vpn=false` → 首页显示「系统 VPN 未启用（流量不会走隧道）」；
+- 出口看门狗（`needRecover`）也不工作。
+
+修法：`psiphonTunProvider` 建完 tun 立即回填 `setTunFD` / `setVPNState(true)` 并
+`refresh`。
+
+> 顺带一句：首页的 ↑↓ 速率与总量在 Psiphon 模式下恒为 0 是正常的 —— tun fd 直接
+> 交给了 Psiphon 的 packet tunnel，引擎不经过任何数据包，统计不到。
+
+### 20.2 速度慢：netstack TCP 缓冲一直是 0
+
+`netstackTCPBufferMax = 0` 意味着 gVisor TCP 用上游默认缓冲（1MB 量级）。
+`tunnel.go` 里自己的注释写着：**「实测把 WARP→节点 这条链锁在 17 Mbps」** —— 和
+用户反馈的「能连但慢」完全吻合。
+
+当时关成 0 的理由是「开到 8MB 后出现握手成功但数据面不通」，而那件事的真正原因
+是出口验证的 DialContext 丢地址（第 19 节）。现在按注释里给自己留的建议：
+
+```go
+const netstackTCPBufferMax = 2 << 20   // 2MB ⇒ RTT 250ms 时约 64 Mbps
+```
+
+> 再往上（4/8MB）要真机对照，不要一次跳上去。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。
