@@ -770,6 +770,62 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	return under, used, nil
 }
 
+// ProbeSpeedViaSocks 经一个 SOCKS5 下载最多 limit 字节，返回字节/秒（0 = 测不出）。
+//
+// 用于「出口地区」里的测速：RegionsOnly 模式下 Psiphon 只有 SOCKS、没有 tun，
+// 但经 SOCKS 下载就是它真实落地时能给到的速度。
+func ProbeSpeedViaSocks(ctx context.Context, socksAddr string, limit int64, timeout time.Duration) int64 {
+	if socksAddr == "" || limit <= 0 {
+		return 0
+	}
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
+	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+	if err != nil {
+		return 0
+	}
+	cd, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return 0
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+				return cd.DialContext(dctx, network, addr)
+			},
+		},
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, probeSpeedURL, nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	start := time.Now()
+	var got int64
+	buf := make([]byte, 64<<10)
+	for got < limit {
+		n, rerr := resp.Body.Read(buf)
+		got += int64(n)
+		if rerr != nil {
+			break
+		}
+	}
+	d := time.Since(start).Seconds()
+	if got <= 0 || d < 0.3 {
+		return 0
+	}
+	return int64(float64(got) / d)
+}
+
 // probeViaSocks 通过一个本地 SOCKS5 真发一次请求，拿回出口 IP 与归属。
 //
 // 用 x/net/proxy 而不是自己写握手：它对域名走 ATYP_DOMAIN，也就是 DNS 在出口侧

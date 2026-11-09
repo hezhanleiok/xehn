@@ -139,6 +139,41 @@ object EngineBridge {
         }
     }
 
+    /** 一个赛风地区的实测结果（延迟 + 速度）。 */
+    data class PsiphonProbeUi(val ms: Long, val bps: Long, val ok: Boolean, val error: String = "")
+
+    /**
+     * 逐个国家实测赛风速度与延迟（经 WARP 前置）。**阻塞**，每个国家约 8–15 秒。
+     */
+    fun probePsiphonRegions(context: Context, regions: List<String>): Map<String, PsiphonProbeUi> {
+        if (regions.isEmpty()) return emptyMap()
+        val raw = try {
+            engineOrCreate(context).probePsiphonRegions(regions.joinToString(","))
+        } catch (t: Throwable) {
+            note("[ui] 地区测速失败：${t.message}")
+            return emptyMap()
+        }
+        return try {
+            val o = JSONObject(raw)
+            val arr = o.optJSONArray("results") ?: return emptyMap()
+            val out = LinkedHashMap<String, PsiphonProbeUi>(arr.length())
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                val region = r.optString("region")
+                if (region.isEmpty()) continue
+                out[region] = PsiphonProbeUi(
+                    ms = r.optLong("ms", 0),
+                    bps = r.optLong("bps", 0),
+                    ok = r.optBoolean("ok", false),
+                    error = r.optString("error"),
+                )
+            }
+            out
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
     /**
      * 首次启动就把本机 WARP 账号注册好（注册之后才缓存，下一次直接读缓存）。
      *

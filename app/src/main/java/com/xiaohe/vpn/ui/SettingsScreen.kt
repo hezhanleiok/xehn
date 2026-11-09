@@ -183,6 +183,10 @@ fun SettingsScreen(
         var exitRegions by remember { mutableStateOf(emptyList<String>()) }
         var regionUpdating by remember { mutableStateOf(false) }
         var regionTouched by remember { mutableStateOf(false) }
+        var regionProbing by remember { mutableStateOf(false) }
+        var regionProbes by remember {
+            mutableStateOf(mapOf<String, EngineBridge.PsiphonProbeUi>())
+        }
         val regionScope = rememberCoroutineScope()
 
         fun updateRegions() {
@@ -191,6 +195,17 @@ fun SettingsScreen(
             regionScope.launch {
                 exitRegions = withContext(Dispatchers.IO) { EngineBridge.refreshPsiphonRegions(ctx) }
                 regionUpdating = false
+            }
+        }
+
+        fun probeRegions() {
+            if (regionProbing || exitRegions.isEmpty()) return
+            regionProbing = true
+            regionScope.launch {
+                regionProbes = withContext(Dispatchers.IO) {
+                    EngineBridge.probePsiphonRegions(ctx, exitRegions)
+                }
+                regionProbing = false
             }
         }
 
@@ -219,8 +234,13 @@ fun SettingsScreen(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("出口地区", modifier = Modifier.weight(1f))
-                        // 「更新列表」走 WARP 前置跑一次 Psiphon，只为拿它的可用地区。
-                        TextButton(onClick = { updateRegions() }, enabled = !regionUpdating) {
+                        // 「测速」逐个国家走一遍 WARP 前置 + Psiphon，测完在行里显示
+                        // 速度与延迟。慢（每个 8–15 秒），但这是唯一能回答「哪个地区
+                        // 真的快」的办法。
+                        TextButton(onClick = { probeRegions() }, enabled = !regionProbing && !regionUpdating) {
+                            Text(if (regionProbing) "测速中…" else "测速")
+                        }
+                        TextButton(onClick = { updateRegions() }, enabled = !regionUpdating && !regionProbing) {
                             Text(if (regionUpdating) "更新中…" else "更新列表")
                         }
                     }
@@ -251,9 +271,16 @@ fun SettingsScreen(
                             regionPicker = false
                         }
                         exitRegions.forEach { cc ->
+                            val probe = regionProbes[cc]
+                            val extra = when {
+                                probe == null -> ""
+                                probe.ok -> "${probe.ms}ms · " + NodeSpeedStore.text(probe.bps)
+                                else -> "测速失败"
+                            }
                             RegionRow(
                                 "${flagEmoji(cc)} ${countryDisplayName(cc)}",
                                 if (cc == settings.exitRegion) "$cc ✓" else cc,
+                                extra = extra,
                             ) {
                                 onChange(settings.copy(exitRegion = cc))
                                 regionPicker = false
@@ -1173,7 +1200,7 @@ private fun classTagOf(cls: String): String = when (cls) {
 }
 
 @Composable
-private fun RegionRow(label: String, code: String, onClick: () -> Unit) {
+private fun RegionRow(label: String, code: String, extra: String = "", onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -1182,6 +1209,14 @@ private fun RegionRow(label: String, code: String, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        if (extra.isNotEmpty()) {
+            Text(
+                extra,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.width(8.dp))
+        }
         if (code.isNotEmpty()) {
             Text(
                 code,

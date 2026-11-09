@@ -727,6 +727,72 @@ func (b *warpBackend) RefreshPsiphonRegions(ctx context.Context, report func(str
 	return warp.PsiphonRegions(), nil
 }
 
+// PsiphonRegionProbe 是「某个地区」的实测结果。
+type PsiphonRegionProbe struct {
+	Region string `json:"region"`
+	// MS 是「从开始拨号到 Psiphon 就绪」的耗时，作为该地区的延迟参考。
+	MS  int64 `json:"ms,omitempty"`
+	Bps int64 `json:"bps,omitempty"`
+	OK  bool  `json:"ok"`
+	// Error 只在失败时有值。
+	Error string `json:"error,omitempty"`
+}
+
+// ProbePsiphonRegions 逐个地区实测：经 WARP 前置把 Psiphon 拉到该地区，再用它
+// 自己的 SOCKS 下载 512 KB 算速度。
+//
+// 用 RegionsOnly：不建 tun、不接管流量，所以可以在**未连接**状态下跑，也不会
+// 打断用户正在用的会话。代价是每个地区都要重新拨一次上游（约 8–15 秒）。
+func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string, report func(string)) []PsiphonRegionProbe {
+	b.mu.Lock()
+	cfg := b.psiphonConfig
+	dns := b.psiphonDNS
+	b.mu.Unlock()
+	out := make([]PsiphonRegionProbe, 0, len(regions))
+	if cfg == "" {
+		return out
+	}
+	for i, region := range regions {
+		if ctx.Err() != nil {
+			break
+		}
+		report(fmt.Sprintf("地区测速 %d/%d：%s…", i+1, len(regions), region))
+		p := PsiphonRegionProbe{Region: region}
+		started := time.Now()
+		sess, err := warp.DialPsiphon(ctx, warp.PsiphonOptions{
+			ClientConfigJSON: cfg,
+			DNS:              dns,
+			DataDir:          filepath.Join(b.workDir, "psiphon"),
+			EgressRegion:     region,
+			RegionsOnly:      true,
+			UnderlayProto:    "awg",
+			HandshakeTimeout: 3 * time.Second,
+			Budget:           60 * time.Second,
+			Report:           report,
+		})
+		if err != nil {
+			p.Error = err.Error()
+			if len(p.Error) > 90 {
+				p.Error = p.Error[:90]
+			}
+		} else {
+			p.MS = time.Since(started).Milliseconds()
+			if socks := sess.PsiphonSocks(); socks != "" {
+				p.Bps = warp.ProbeSpeedViaSocks(ctx, socks, 512<<10, 8*time.Second)
+			}
+			sess.Close()
+			p.OK = p.Bps > 0
+			if !p.OK {
+				p.Error = "连上了但测不出速度"
+			}
+		}
+		report(fmt.Sprintf("地区测速 %s：%s", region,
+			map[bool]string{true: fmt.Sprintf("≈%d KB/s", p.Bps/1024), false: "失败 " + p.Error}[p.OK]))
+		out = append(out, p)
+	}
+	return out
+}
+
 // SetPsiphonRegion 设置 Psiphon 的落地地区：""（或 "auto"）= 自动，否则 ISO-2。
 // 只影响下一次连接，理由见字段注释。
 func (b *warpBackend) SetPsiphonRegion(region string) {

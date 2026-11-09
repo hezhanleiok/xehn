@@ -438,6 +438,17 @@ func (s *Session) SocksAddr() string {
 }
 
 // Close 拆掉隧道与本地监听。
+// PsiphonSocks 返回 Psiphon 自己的本地 SOCKS 地址（没有则空串）。
+//
+// 「出口地区」里的测速要用它：RegionsOnly 模式不建 tun，但 Psiphon 的 SOCKS 已经
+// 可用，经它发请求就等价于「这个地区真实落地时的速度」。
+func (s *Session) PsiphonSocks() string {
+	if s == nil || s.psiphon == nil {
+		return ""
+	}
+	return s.psiphon.SocksAddr()
+}
+
 func (s *Session) Close() {
 	if s == nil {
 		return

@@ -86,8 +86,28 @@ func serveSOCKS(ctx context.Context, c net.Conn, tnet *netstack.Net, rules *Rule
 	if err := socksReply(c, socksOK); err != nil {
 		return
 	}
-	go io.Copy(remote, c)
-	io.Copy(c, remote)
+	pipeBoth(c, remote)
+}
+
+// pipeBoth 在两个连接之间双向转发。
+//
+// 不用裸 io.Copy：它是 32 KB 缓冲、而且完全不碰 TCP_NODELAY。Psiphon 的上游就是
+// 走这个 SOCKS（一条 OSSH TCP 穿过去），32 KB 的小缓冲 + Nagle 会把高 RTT 链路上
+// 的吞吐压得很低 —— 用户反馈「赛风能用但只有 2 Mbps」有这一份。
+func pipeBoth(a, b net.Conn) {
+	if ta, ok := a.(interface{ SetNoDelay(bool) error }); ok {
+		_ = ta.SetNoDelay(true)
+	}
+	if tb, ok := b.(interface{ SetNoDelay(bool) error }); ok {
+		_ = tb.SetNoDelay(true)
+	}
+	go copyStream(b, a)
+	copyStream(a, b)
+}
+
+func copyStream(dst, src net.Conn) {
+	buf := make([]byte, 128<<10)
+	_, _ = io.CopyBuffer(dst, src, buf)
 }
 
 // dialDirect 用本机网络（不进隧道）连目标并把两条连接对接起来。
@@ -103,8 +123,7 @@ func dialDirect(ctx context.Context, c net.Conn, target string) bool {
 	if err := socksReply(c, socksOK); err != nil {
 		return true
 	}
-	go io.Copy(remote, c)
-	io.Copy(c, remote)
+	pipeBoth(c, remote)
 	return true
 }
 

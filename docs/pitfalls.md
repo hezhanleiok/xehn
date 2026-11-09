@@ -880,4 +880,28 @@ const netstackTCPBufferMax = 2 << 20   // 2MB ⇒ RTT 250ms 时约 64 Mbps
 
 > 再往上（4/8MB）要真机对照，不要一次跳上去。
 
+---
+
+## 21. 0.2.25：赛风地区测速 + SOCKS 转发优化
+
+### 21.1 出口地区「测速」
+
+新增 `Engine.ProbePsiphonRegions(regionsCSV)`：逐个国家走一遍 **WARP 前置 + Psiphon**
+（`RegionsOnly`，不建 tun、不接管流量），拿到该地区的 SOCKS 后用
+`warp.ProbeSpeedViaSocks` 下载 512 KB 计算速度；`ms` 是「开始拨号 → Psiphon 就绪」
+的耗时。
+
+UI：出口地区弹窗右上角 **「测速」**，结果直接写在每个国家行上
+（`320ms · ≈1.2 MB/s`）。慢：每个国家 8–15 秒。
+
+### 21.2 SOCKS 转发：128 KB 缓冲 + TCP_NODELAY
+
+`serveSOCKS` / `dialDirect` 原来是裸 `io.Copy`（32 KB 缓冲、不碰 Nagle）。
+Psiphon 的整个上游都走这个 SOCKS，32 KB 的小缓冲 + Nagle 会把高 RTT 链路的吞吐
+压得很低。改成 `pipeBoth()`：两边 `SetNoDelay(true)`，`io.CopyBuffer` 用 128 KB。
+
+> 观察到但**没有改**的一点：Psiphon 的 tun MTU 是 1500，而它的上游 WARP 只有
+> 1280。内层 1500 的包在外层会被切成两段，理论上有约 10% 的效率损失。要不要
+> 降到 1280 需要真机对照（改小会让终端的 MSS 变小，可能反而更慢），先看测速数据。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。

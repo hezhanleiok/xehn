@@ -285,6 +285,27 @@ func (e *Engine) RefreshPsiphonRegions() string {
 	return string(b)
 }
 
+// ProbePsiphonRegions 逐个国家实测赛风的速度与延迟（经 WARP 前置）。
+//
+// BLOCKING：每个国家约 8–15 秒，27 个约 5–7 分钟。必须在后台线程调用。
+// Returns JSON: {"ok":true,"results":[{region,ms,bps,ok,error}]}
+func (e *Engine) ProbePsiphonRegions(regionsCSV string) string {
+	wb := e.warpBackendOf()
+	if wb == nil {
+		return `{"ok":false,"error":"引擎未安装"}`
+	}
+	regions := splitCSV(regionsCSV)
+	if len(regions) == 0 {
+		return `{"ok":false,"error":"没有要测试的地区"}`
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	e.sess.logf("[engine] 开始赛风地区测速：%d 个地区（经 WARP 前置）", len(regions))
+	results := wb.ProbePsiphonRegions(ctx, regions, func(s string) { e.sess.logf("[psiphon] %s", s) })
+	b, _ := json.Marshal(map[string]any{"ok": true, "results": results})
+	return string(b)
+}
+
 // PrepareAccounts 在建立系统 VPN **之前**把账号准备好（首次使用会现注册）。
 //
 // 为什么必须在 establish 之前：VPN 一建立，系统 DNS 就被路由进还没通的 tun，
