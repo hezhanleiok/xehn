@@ -138,6 +138,8 @@ type Engine struct {
 	tunFD       int
 	statsStop   chan struct{}
 	tunProvider TunProvider
+	// 地区测速的逐条回调（可空）。见 RegionProbeSink。
+	regionSink RegionProbeSink
 }
 
 // statsInterval is how often the data plane is sampled for the home screen's
@@ -191,6 +193,19 @@ func (e *Engine) SetPsiphonRegion(region string) {
 	if wb := e.warpBackendOf(); wb != nil {
 		wb.SetPsiphonRegion(region)
 	}
+}
+
+// RegionProbeSink 接收「赛风地区测速」的逐条结果：每测完**一个国家**回调一次，
+// 界面可以边测边显示，而不是等 25 个国家全跑完再一次性刷新。
+type RegionProbeSink interface {
+	OnRegionProbe(region string, ms int64, bps int64, ok bool, err string)
+}
+
+// SetRegionProbeSink 安装「地区测速」的逐条回调（每测完一个国家调一次）。
+func (e *Engine) SetRegionProbeSink(s RegionProbeSink) {
+	e.mu.Lock()
+	e.regionSink = s
+	e.mu.Unlock()
 }
 
 // SetTunProvider installs the callback that builds the Android system VPN for
@@ -301,7 +316,17 @@ func (e *Engine) ProbePsiphonRegions(regionsCSV string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	e.sess.logf("[engine] 开始赛风地区测速：%d 个地区（经 WARP 前置）", len(regions))
-	results := wb.ProbePsiphonRegions(ctx, regions, func(s string) { e.sess.logf("[psiphon] %s", s) })
+	e.mu.Lock()
+	rs := e.regionSink
+	e.mu.Unlock()
+	var cb func(p PsiphonRegionProbe)
+	if rs != nil {
+		cb = func(p PsiphonRegionProbe) {
+			rs.OnRegionProbe(p.Region, p.MS, p.Bps, p.OK, p.Error)
+		}
+	}
+	results := wb.ProbePsiphonRegions(ctx, regions,
+		func(s string) { e.sess.logf("[psiphon] %s", s) }, cb)
 	b, _ := json.Marshal(map[string]any{"ok": true, "results": results})
 	return string(b)
 }

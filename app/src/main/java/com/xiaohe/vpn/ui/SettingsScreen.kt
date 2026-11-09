@@ -201,10 +201,20 @@ fun SettingsScreen(
         fun probeRegions() {
             if (regionProbing || exitRegions.isEmpty()) return
             regionProbing = true
+            regionProbes = emptyMap()
+            // 引擎每测完一个国家就回调一次 —— 边测边显示，不用等全部跑完。
+            // 回调在引擎的后台线程上，必须切主线程改 Compose 状态。
+            val main = android.os.Handler(android.os.Looper.getMainLooper())
+            EngineBridge.regionProbeListener = { region, ms, bps, ok, err ->
+                main.post {
+                    regionProbes = regionProbes + (region to EngineBridge.PsiphonProbeUi(ms, bps, ok, err))
+                }
+            }
             regionScope.launch {
-                regionProbes = withContext(Dispatchers.IO) {
+                withContext(Dispatchers.IO) {
                     EngineBridge.probePsiphonRegions(ctx, exitRegions)
                 }
+                EngineBridge.regionProbeListener = null
                 regionProbing = false
             }
         }

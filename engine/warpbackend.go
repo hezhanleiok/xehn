@@ -748,7 +748,10 @@ type PsiphonRegionProbe struct {
 //
 // 用 RegionsOnly：不建 tun、不接管流量，所以可以在**未连接**状态下跑，也不会
 // 打断用户正在用的会话。代价是每个地区都要重新拨一次上游（约 8–15 秒）。
-func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string, report func(string)) []PsiphonRegionProbe {
+func (b *warpBackend) ProbePsiphonRegions(
+	ctx context.Context, regions []string,
+	report func(string), sink func(PsiphonRegionProbe),
+) []PsiphonRegionProbe {
 	b.mu.Lock()
 	cfg := b.psiphonConfig
 	dns := b.psiphonDNS
@@ -759,13 +762,14 @@ func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string,
 	}
 	b.probingRegions.Store(true)
 	defer b.probingRegions.Store(false)
-	// **一条上游复用给所有地区**（见 warp.ProbePsiphonRegion 的注释）。
+	// **一条上游复用给所有地区**（见 warp.OpenPsiphonUnderlay 的注释）。
 	// 每个地区都重建一条 WARP 上游，测完 27 个之后资源耗尽，紧接着的连接会
 	// 直接失败（真机日志 15:22：远程服务器列表 0 字节、1m29s 建不起隧道）。
 	report("地区测速：先建一条 WARP 上游（各地区共用）…")
-	under, err := warp.OpenUnderlay(ctx, warp.OpenVPNOptions{
+	under, err := warp.OpenPsiphonUnderlay(ctx, warp.PsiphonOptions{
 		UnderlayProto:    "awg",
 		HandshakeTimeout: 3 * time.Second,
+		VerifyTimeout:    10 * time.Second,
 		Budget:           60 * time.Second,
 		Report:           report,
 	})
@@ -785,7 +789,9 @@ func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string,
 		}
 		report(fmt.Sprintf("地区测速 %d/%d：%s…", i+1, len(regions), region))
 		p := PsiphonRegionProbe{Region: region}
-		ms, bps, perr := warp.ProbePsiphonRegion(ctx, cfg, dns, dir, upSocks, region, 45*time.Second, report)
+		// 15s 上限：成功的地区实测 6–10s 就绪，20s 以上基本都是真要失败 ——
+		// 拖满 45s 只会让「25 个国家」变成 10 分钟的白等。
+		ms, bps, perr := warp.ProbePsiphonRegion(ctx, cfg, dns, dir, upSocks, region, 15*time.Second, report)
 		p.MS, p.Bps = ms, bps
 		if perr != nil {
 			p.Error = shortErrStr(perr)
@@ -798,6 +804,11 @@ func (b *warpBackend) ProbePsiphonRegions(ctx context.Context, regions []string,
 		report(fmt.Sprintf("地区测速 %s：%s", region,
 			map[bool]string{true: fmt.Sprintf("≈%d KB/s", p.Bps/1024), false: "失败 " + p.Error}[p.OK]))
 		out = append(out, p)
+		// 测完一个国家立刻推给界面：等 25 个国家全跑完再刷新，用户看到的就是
+		// 「一直转圈，最后一次性冒出一片失败」。
+		if sink != nil {
+			sink(p)
+		}
 	}
 	// 让 tunnel-core 彻底停稳再放行正式连接：它的 psi 是进程内单例，刚 Stop
 	// 完立刻 Start 会拿不到服务器列表（日志里就是 bytes:0）。

@@ -4,6 +4,7 @@ import android.content.Context
 import com.xiaohe.engine.Engine_
 import com.xiaohe.engine.LogSink
 import com.xiaohe.engine.Protector
+import com.xiaohe.engine.RegionProbeSink
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -63,6 +64,19 @@ object EngineBridge {
             val dns = SettingsStore.load(context).dnsList().joinToString(",")
             e.setPsiphonConfig(cfg, dns)
         } ?: note("[ui] 缺少 assets/psiphon/client.config，Psiphon 出口将不可用")
+
+        // 地区测速的逐条回调：引擎每测完一个国家就调一次，界面可以边测边显示。
+        e.setRegionProbeSink(object : RegionProbeSink {
+            override fun onRegionProbe(
+                region: String,
+                ms: Long,
+                bps: Long,
+                ok: Boolean,
+                err: String,
+            ) {
+                regionProbeListener?.invoke(region, ms, bps, ok, err)
+            }
+        })
 
         e.setLogSink(object : LogSink {
             override fun onLog(line: String) {
@@ -138,6 +152,13 @@ object EngineBridge {
             psiphonRegions(context)
         }
     }
+
+    /**
+     * 地区测速的逐条结果回调（在引擎的后台线程上调用，界面要自己切主线程）。
+     * 设置页在开始测速前装上、结束后清掉。
+     */
+    @Volatile
+    var regionProbeListener: ((String, Long, Long, Boolean, String) -> Unit)? = null
 
     /** 一个赛风地区的实测结果（延迟 + 速度）。 */
     data class PsiphonProbeUi(val ms: Long, val bps: Long, val ok: Boolean, val error: String = "")

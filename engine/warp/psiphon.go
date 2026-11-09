@@ -770,6 +770,40 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	return under, used, nil
 }
 
+// OpenPsiphonUnderlay 建一条**带本地 SOCKS 端口**的 WARP 上游，供「地区测速」
+// 在多个国家之间复用。
+//
+// 不能用 OpenUnderlay：那个是给「经 WARP 拨 OpenVPN 节点」用的，不监听 SOCKS，
+// 而 Psiphon 必须有一个上游 SOCKS 才能挂上去（真机现象：复用它建上游，随后
+// 每个端点都「数据面不通」，因为根本没有 SOCKS 可给 Psiphon）。
+func OpenPsiphonUnderlay(ctx context.Context, o PsiphonOptions) (*Session, error) {
+	saved := tunFD
+	tunFD = 0
+	sess, err := Dial(ctx, Options{
+		Proto:            o.UnderlayProto,
+		Endpoint:         o.UnderlayEndpoint,
+		Prefer:           o.UnderlayPrefer,
+		IPv6:             o.IPv6,
+		Sample:           2,
+		HandshakeTimeout: o.HandshakeTimeout,
+		VerifyTimeout:    o.VerifyTimeout,
+		Budget:           o.Budget,
+		SocksListen:      psiphonUnderlayListen,
+		SocksRequired:    true,
+		NoHedge:          true,
+		Report:           o.Report,
+	})
+	tunFD = saved
+	if err != nil {
+		return nil, err
+	}
+	if sess.SocksAddr() == "" {
+		sess.Close()
+		return nil, errors.New("上游起来了但本地 SOCKS 端口没开（Psiphon 没有载体）")
+	}
+	return sess, nil
+}
+
 // ProbePsiphonRegion 用**一条已经就绪的上游 SOCKS** 把 Psiphon 拉到指定地区，
 // 测一次下载速度后停掉。返回 (就绪耗时 ms, 字节/秒, error)。
 //

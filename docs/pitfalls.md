@@ -945,4 +945,31 @@ Psiphon 的整个上游都走这个 SOCKS，32 KB 的小缓冲 + Nagle 会把高
 UI 也加了进度：`测速中… 3/27`（从引擎日志里取），27 个地区要 5 分钟以上，没有
 进度看起来就是卡死。
 
+---
+
+## 23. 0.2.27：测速「全部失败」是我用错了上游函数
+
+真机日志（2026-11-09 15:49）：
+
+```
+[psiphon] 地区测速：先建一条 WARP 上游（各地区共用）…
+[psiphon] 8.35.211.16:2408  握手成功，验证出口… 数据面不通（隧道内请求超时）
+[psiphon] 8.35.211.157:2408 握手成功，验证出口… 数据面不通（隧道内请求超时）
+```
+
+0.2.26 为了「一条上游复用」调了 `warp.OpenUnderlay` —— 但那个函数是给**「经
+WARP 拨 OpenVPN 节点」**用的，它的 `Dial` 参数里**没有 `SocksListen`**。也就是说
+这条上游根本没有本地 SOCKS，Psiphon 无处挂载，紧接着的验证自然全灭。
+
+修法：新增 `warp.OpenPsiphonUnderlay`（`Dial` + `SocksListen: 127.0.0.1:0` +
+`SocksRequired: true`），和单国测速 `dialPsiphonOnce` 走的是同一条路径。
+
+另外两点：
+
+- **每国上限 45s → 15s**。成功的地区实测 6–10s 就绪；拖满 45s 的地区基本就是要
+  失败，白等只会让 25 个国家变成十分钟。
+- **边测边显示**：新增 `RegionProbeSink` 接口，引擎每测完一个国家回调一次
+  （`OnRegionProbe(region, ms, bps, ok, err)`），Kotlin 切主线程更新那一行。以前是
+  等全部跑完才一次性刷新，看起来就是「一直转圈，最后冒出一片失败」。
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。
