@@ -783,9 +783,22 @@ func (b *warpBackend) ProbePsiphonRegions(
 	upSocks := under.SocksAddr()
 	dir := filepath.Join(b.workDir, "psiphon")
 
+	// known 是**本次会话**真正能用的地区（第一次成功启动后拿到）。
+	// Psiphon 每次上报的集合会变：日志里刷新列表时是 27 个，测速时只上报 25 个，
+	// 差的那两个（BR 等）每次都要白等十几秒才失败。拿到列表后直接跳过。
+	var known []string
 	for i, region := range regions {
 		if ctx.Err() != nil {
 			break
+		}
+		if len(known) > 0 && !warp.RegionOffered(known, region) {
+			p := PsiphonRegionProbe{Region: region, Error: "本次会话不提供该地区"}
+			report(fmt.Sprintf("地区测速 %s：跳过（本次会话不提供）", region))
+			out = append(out, p)
+			if sink != nil {
+				sink(p)
+			}
+			continue
 		}
 		report(fmt.Sprintf("地区测速 %d/%d：%s…", i+1, len(regions), region))
 		p := PsiphonRegionProbe{Region: region}
@@ -804,6 +817,11 @@ func (b *warpBackend) ProbePsiphonRegions(
 		report(fmt.Sprintf("地区测速 %s：%s", region,
 			map[bool]string{true: fmt.Sprintf("≈%d KB/s", p.Bps/1024), false: "失败 " + p.Error}[p.OK]))
 		out = append(out, p)
+		// 第一次成功之后，把本次会话的可用地区记下来（见上面 known 的注释）。
+		if known == nil && perr == nil {
+			known = warp.PsiphonRegions()
+			report(fmt.Sprintf("本次会话可用地区 %d 个，其余地区直接跳过", len(known)))
+		}
 		// 测完一个国家立刻推给界面：等 25 个国家全跑完再刷新，用户看到的就是
 		// 「一直转圈，最后一次性冒出一片失败」。
 		if sink != nil {

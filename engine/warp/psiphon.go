@@ -878,9 +878,24 @@ func ProbeSpeedViaSocks(ctx context.Context, socksAddr string, limit int64, time
 		return 0
 	}
 	defer resp.Body.Close()
+	buf := make([]byte, 64<<10)
+
+	// 预热：先丢掉 256 KB 再开始计时。
+	//
+	// 不预热的话，前 512 KB 基本全在 TCP 慢启动里，测出来只有稳态的几分之一
+	// （真机日志：25 个国家全在 200–350 KB/s，看着像「赛风只有 2 Mbps」）。
+	// 正式出口测速（measureExitBps）一直是「1 MiB 预热 + 3 秒采样」，这里同理。
+	var warm int64
+	for warm < 256<<10 {
+		n, rerr := resp.Body.Read(buf)
+		warm += int64(n)
+		if rerr != nil {
+			break
+		}
+	}
+
 	start := time.Now()
 	var got int64
-	buf := make([]byte, 64<<10)
 	for got < limit {
 		n, rerr := resp.Body.Read(buf)
 		got += int64(n)
