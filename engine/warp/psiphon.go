@@ -567,6 +567,26 @@ func DialPsiphon(ctx context.Context, o PsiphonOptions) (*Session, error) {
 	protos := underlayProtos(o.UnderlayProto)
 	var lastErr error
 	tried := 0
+
+	// ① 先直连。
+	//
+	// Psiphon 本身就是抗审查隧道，直连是它的设计用法 —— 对照 Aether 的日志：
+	// `starting psiphon with no tunnel underneath it`，2 秒拿到地区、6 秒就绪。
+	// 只有直连失败（网络把 Psiphon 服务器也拦了）才退到「WARP 前置」。
+	directBudget := 45 * time.Second
+	if r := time.Until(deadline); r < directBudget {
+		directBudget = r
+	}
+	if directBudget > 5*time.Second {
+		if sess, err := dialPsiphonDirect(ctx, o, directBudget); err == nil {
+			return sess, nil
+		} else {
+			lastErr = err
+			tried++
+			o.report(fmt.Sprintf("Psiphon 直连没成功（%s），改走 WARP 前置…", shortErr(err)))
+		}
+	}
+
 	for pi, proto := range protos {
 		o.UnderlayProto = proto
 		skip := ""
@@ -614,6 +634,28 @@ func DialPsiphon(ctx context.Context, o PsiphonOptions) (*Session, error) {
 	return nil, fmt.Errorf("%w（共试了 %d 次上游）%s", lastErr, tried, underlayHint(o.UnderlayProto))
 }
 
+// dialPsiphonDirect 直接叠加 Psiphon（**不建 WARP 上游**），是最快的一条路。
+//
+// 与 Aether 的做法一致：它的日志里就是 `starting psiphon with no tunnel
+// underneath it`，2 秒拿到可用地区、6 秒出口就绪。
+func dialPsiphonDirect(ctx context.Context, o PsiphonOptions, remaining time.Duration) (*Session, error) {
+	readyTimeout := psiphonReadyTimeout
+	if remaining > 0 && remaining < readyTimeout {
+		readyTimeout = remaining
+	}
+	o.report(fmt.Sprintf("Psiphon 直连（不建上游隧道），等就绪上限 %s…", readyTimeout.Round(time.Second)))
+	ex, err := startPsiphon(ctx, o, "", readyTimeout)
+	if err != nil {
+		return nil, err
+	}
+	ip, country, ok := probeViaSocks(ctx, ex.SocksAddr(), o.VerifyTimeout)
+	if !ok {
+		ex.stop()
+		return nil, fmt.Errorf("Psiphon 直连已建立但出口验证失败（SOCKS %s）", ex.SocksAddr())
+	}
+	return &Session{ExitIP: ip, Country: country, psiphon: ex, tunFD: o.TunFD}, nil
+}
+
 // dialPsiphonOnce 是一次完整的「拨上游 → 叠加 Psiphon → 出口实测」。
 //
 // 返回的 used 是本次用到的上游端点：失败时上层要靠它把端点排除掉再重试。
@@ -632,9 +674,17 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 		budget = remaining
 	}
 	savedTunFD := tunFD
+	savedMTU := tunMTU
 	tunFD = 0 // 系统 tun fd 这一轮归 Psiphon 的 packet tunnel，上游退成 netstack
-	// 诊断：上游是 netstack 模式，MTU 为 0 会让 gVisor 一个包都发不出去（真机
-	// 「握手成功、数据面全不通」的一种成因），所以把这两个值写进日志。
+	// 上游是 WARP：netstack 必须按 WARP 的 **1280** 建。
+	//
+	// 绝不能沿用 Psiphon 自己 tun 的 1500：1500 的包 WARP 封不进去，握手（小包）
+	// 能过、数据（大包）一个字节都发不出。真机日志就是这一条 ——
+	// `netstack 数据面（全局 tunFD 0→0, tunMTU 1500）` 之后 14 个端点全部
+	// 「握手成功、数据面不通」；而同一批端点在没有 Psiphon 会话残留时（tunMTU
+	// 还是 1280）是通的。
+	tunMTU = 1280
+	defer func() { tunMTU = savedMTU }()
 	o.report(fmt.Sprintf("Psiphon 上游：netstack 数据面（全局 tunFD %d→0, tunMTU %d）", savedTunFD, tunMTU))
 	under, err := Dial(ctx, Options{
 		Proto:            underlayProto,

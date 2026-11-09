@@ -757,4 +757,37 @@ UI：出口地区弹窗右上角「更新列表」；**首次打开且列表为�
 > 「先更新再连接」连不上，就说明残留状态那一层还没清干净，把新日志里
 > `netstack 数据面（… tunMTU …）` 那行发过来即可定位。
 
+---
+
+## 18. 0.2.22：赛风直连优先 + 上游 MTU 固定 1280
+
+日志里那行诊断直接给出了答案：
+
+```
+[tunnel] Psiphon 上游：netstack 数据面（全局 tunFD 0→0, tunMTU 1500）
+[tunnel] 8.6.112.156:2408 握手成功，验证出口… 数据面不通（隧道内请求超时）
+```
+
+**`tunMTU 1500`**：WARP 的 MTU 是 1280，而 gVisor netstack 被设成 Psiphon 自己
+tun 的 1500 —— 每个包都超出 WARP 能承载的大小，握手（小包）能过，数据（大包）
+一个字节也发不出去。对照 Aether 的日志：它根本不做这层上游
+（`starting psiphon with no tunnel underneath it`），2 秒拿到地区、6 秒就绪。
+
+两处改动（A+B）：
+
+- **A：直连优先**。`DialPsiphon` 先跑 `dialPsiphonDirect`（不建上游，45 秒上限），
+  失败才退到原有的「WARP 前置」。直连路径与 Aether 完全一致 —— Psiphon 本就是
+  抗审查隧道，直连是它的设计用法。
+- **B：上游 netstack 固定 1280**。`dialPsiphonOnce` 里 `tunMTU = 1280`（defer 还原），
+  不再让 Psiphon 的 1500 泄漏到上游。
+
+预期日志：
+
+```
+[psiphon] Psiphon 直连（不建上游隧道），等就绪上限 3m0s…
+[psiphon] Psiphon can leave from: AT AU BE …        ← 约 2 秒
+[psiphon] Psiphon 隧道已建立（1 条）
+[psiphon] Psiphon 出口 … (…)
+```
+
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。
