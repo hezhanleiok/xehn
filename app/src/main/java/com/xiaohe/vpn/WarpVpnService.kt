@@ -1107,7 +1107,7 @@ class WarpVpnService : VpnService() {
      * 换点前先 [closeTun]：新 tun 建立时旧的一定要先关掉，否则旧 fd 会一直挂在
      * 系统 VPN 上，几次之后 fd 号被复用，谁关谁都说不清了。
      */
-    private fun establishTun(s: AppSettings, psiphon: Boolean, proto: String): Int = try {
+    private fun establishTun(s: AppSettings, psiphon: Boolean, proto: String): Int {
         // MASQUE 的 tun MTU 必须比普通模式小：每个 IP 包会封装成一个 CONNECT-IP
         // DATAGRAM（+ contextID + QUIC + UDP + IP 头），1280 的内层包在外层 v6
         // 路径上直接超限被丢 —— 见 engine/warp/masque.go 的 masqueMaxTunMTU。
@@ -1116,40 +1116,78 @@ class WarpVpnService : VpnService() {
             proto.startsWith("masque") -> masqueTunMtu(s)
             else -> s.mtu
         }
-        val b = Builder()
-            .setSession(getString(R.string.app_name))
-            .setMtu(mtu)
-            .addAddress(TUN_ADDR_V4, 32)
-            // 阻塞模式：wireguard 在独立 goroutine 上读设备，这正是它期望的语义。
-            .setBlocking(true)
 
-        // 路由策略：VpnService 只有一种表达方式 —— **加了路由的网段才进 tun**，
-        // 没加的直接走物理网卡。三种规则模式就是三份路由集合。
-        applyRoutePolicy(b, s)
-
-        if (s.ipv6 || s.dnsGuard) {
-            // 不给 ::/0 配地址就路由 v6 会把 v6 流量丢进黑洞。
-            b.addAddress(TUN_ADDR_V6, 128)
-            b.addRoute("::", 0)
+        // 候选地址（2026-11-11 用户日志：masque / masque-x2 反复
+        // `establish 异常: Cannot set address`，而 wg / awg 同一时刻正常）。
+        //
+        // 根因是**上一个 tun 接口还没被系统回收**时，新接口再配同一个地址会被拒。
+        // 每次都一样的是 v6 地址 `fd00:1:...`，所以它最容易撞；v4 的 172.16.0.2
+        // **不能换**（引擎的 netstack 设备地址固定是它，换了回程包在内核里没有归属，
+        // 等于连上就断），能换的只有「要不要 v6」+「等一会儿再试」。
+        val variants = buildList {
+            add(TunVariant(TUN_ADDR_V4, true, "默认地址 + v6"))
             if (!s.ipv6) {
-                // DNS 防泄漏连带把 v6 抓进来（fail closed）：不抓的时候，凡是走 v6
-                // 的连接（包括 v6 解析器）都从物理网卡直连出去 —— 这本身就是泄露，
-                // 而且 leak 测试会把它算在「DNS 泄露」名下。
-                EngineBridge.note("[dns] IPv6 未开启，但防泄漏已把 ::/0 抓进隧道（不会走物理网卡）")
+                add(TunVariant(TUN_ADDR_V4, false, "不带 v6"))
+                add(TunVariant(TUN_ADDR_V4, false, "不带 v6，等旧接口回收后重试"))
             }
         }
-        applyDnsGuard(b, s, emptyList())
-        applySplit(b, s)
+        var last: Throwable? = null
+        for ((i, v) in variants.withIndex()) {
+            if (i == variants.size - 1) {
+                // 最后一组先等 400ms：系统回收旧 tun 是异步的，紧接着 establish
+                // 就是日志里那串「连续 Cannot set address」的成因。
+                runCatching { Thread.sleep(400) }
+            }
+            try {
+                val b = Builder()
+                    .setSession(getString(R.string.app_name))
+                    .setMtu(mtu)
+                    .setBlocking(true)
+                vpnStep("addAddress(${v.addr}/32)") { b.addAddress(v.addr, 32) }
 
-        // 新的一步之前先把上一个 tun 关掉：fd 只归本类所有。
-        closeTun()
-        val pfd = b.establish() ?: return -1
-        tunPfd = pfd
-        tunFd = pfd.fd
-        pfd.fd
-    } catch (t: Throwable) {
-        EngineBridge.note("[vpn] establish 异常: ${t.message}")
-        -1
+                // 路由策略：VpnService 只有一种表达方式 —— **加了路由的网段才进 tun**，
+                // 没加的直接走物理网卡。三种规则模式就是三份路由集合。
+                vpnStep("路由策略(${s.rulePolicy})") { applyRoutePolicy(b, s) }
+
+                if (v.withV6) {
+                    // 不给 ::/0 配地址就路由 v6 会把 v6 流量丢进黑洞。
+                    vpnStep("addAddress($TUN_ADDR_V6)") { b.addAddress(TUN_ADDR_V6, 128) }
+                    vpnStep("addRoute(::/0)") { b.addRoute("::", 0) }
+                    if (!s.ipv6) {
+                        // DNS 防泄漏连带把 v6 抓进来（fail closed）：不抓的时候，凡是走 v6
+                        // 的连接（包括 v6 解析器）都从物理网卡直连出去 —— 这本身就是泄露，
+                        // 而且 leak 测试会把它算在「DNS 泄露」名下。
+                        EngineBridge.note("[dns] IPv6 未开启，但防泄漏已把 ::/0 抓进隧道（不会走物理网卡）")
+                    }
+                }
+                vpnStep("DNS") { applyDnsGuard(b, s, emptyList()) }
+                vpnStep("分应用") { applySplit(b, s) }
+
+                // 新的一步之前先把上一个 tun 关掉：fd 只归本类所有。
+                closeTun()
+                val pfd = b.establish()
+                if (pfd == null) {
+                    EngineBridge.note("[vpn] establish 返回 null（VPN 授权可能已被撤销）")
+                    continue
+                }
+                tunPfd = pfd
+                tunFd = pfd.fd
+                EngineBridge.note(
+                    "[vpn] 系统 VPN 已启用（tun fd=${pfd.fd}, MTU=$mtu" +
+                        (if (i > 0) "，第 ${i + 1} 组：${v.label}" else "") + "）"
+                )
+                return pfd.fd
+            } catch (t: Throwable) {
+                last = t
+                EngineBridge.note(
+                    "[vpn] establish 失败（${i + 1}/${variants.size} ${v.label}）：" +
+                        "${t.javaClass.simpleName}: ${t.message}" +
+                        if (i + 1 < variants.size) "，换下一组再试" else ""
+                )
+            }
+        }
+        EngineBridge.note("[vpn] establish 异常: ${last?.message}")
+        return -1
     }
 
     /**

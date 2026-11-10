@@ -5,6 +5,13 @@
 
 ---
 
+## 0.2.38
+
+- **修复 masque / masque-h2 / masque-x2 反复 `establish 异常: Cannot set address`**：
+  WARP/MASQUE/Psiphon 共用的 `establishTun` 之前只有一组固定地址（`172.16.0.2` + `fd00::1`），
+  上一个 tun 接口没回收时必然撞车；现在按「带 v6 → 不带 v6 → 不带 v6 且等 400ms」三档重试。
+  （0.2.37 只覆盖了 OpenVPN 出口那条路径。）
+
 ## 0.2.37
 
 - **关闭 gVisor 接收缓冲自适应，改固定大窗口（会话 8 MiB / 测速栈 4 MiB）**。
