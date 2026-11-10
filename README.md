@@ -136,8 +136,18 @@ xehn-android/
 ## 七、许可与第三方
 
 安卓版**在进程内链接了** `psiphon-tunnel-core`（GPL-3.0）——APK 里没有子进程可起，
-桌面版那套「独立进程 + 本地端口」搬不过来。
+桌面版那套「独立进程 + 本地端口」搬不过来，这是 Psiphon 出口在 Android 上唯一可行的形态。
+因此**本项目的分发需遵循 GPL-3.0**，源码随仓库提供。
 
-- 完整许可证：[`third_party/GPL-3.0.txt`](third_party/GPL-3.0.txt)
-- 本地改动过的源码副本（`qpack`、`tailscale-netlink` 等）在 `engine/third_party/`，
-  每个目录的 README 写明了改动原因，随源码一同分发。
+第三方组件与许可证声明：
+
+| 组件 | 许可证 | 位置 |
+|---|---|---|
+| psiphon-tunnel-core | GPL-3.0 | Go 依赖（见 `engine/go.mod`） |
+| amneziawg-go / wireguard-go | MIT | Go 依赖 |
+| gVisor | Apache-2.0 | Go 依赖 |
+| mihomo（openvpn 客户端等） | GPL-3.0 | `engine/third_party/mihomo/`（本地副本，README 说明改动） |
+| qpack | MIT | `engine/third_party/qpack/`（含 LICENSE.md） |
+| tailscale-netlink | BSD-3-Clause | `engine/third_party/tailscale-netlink/`（含 LICENSE） |
+
+`engine/third_party/` 下每份本地源码副本都带有说明其改动原因的 README，随源码一同分发。
