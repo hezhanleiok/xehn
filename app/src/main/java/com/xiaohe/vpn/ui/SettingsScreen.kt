@@ -58,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import com.xiaohe.vpn.AppSettings
 import com.xiaohe.vpn.EngineBridge
 import com.xiaohe.vpn.LANG_OPTIONS
+import com.xiaohe.vpn.LocalNetwork
 import com.xiaohe.vpn.NodeSpeedStore
 import com.xiaohe.vpn.PROTOCOLS
 import com.xiaohe.vpn.ProtoOption
@@ -367,6 +368,12 @@ fun SettingsScreen(
                 selectedNodeId = settings.openvpnNodeId,
                 refreshing = refreshing,
                 probing = probing,
+                // 刷新进度：引擎每走一步都写一行 [vpngate]（候选端点/握手/换协议），
+                // 取最后一条显示 —— 抓一轮 20–60 秒，只写「刷新中…」看不出在干什么。
+                refreshNote = if (refreshing) {
+                    engineState.logs.lastOrNull { it.contains("[vpngate]") }
+                        ?.substringAfter("[vpngate] ")?.trim().orEmpty()
+                } else "",
                 progress = probeProgress?.let { line ->
                     val n = line.substringAfter("握手测试 ", "").substringBefore("：", "")
                     if (n.isEmpty()) "" else "已测 $n"
@@ -519,9 +526,24 @@ fun SettingsScreen(
             checked = settings.proxyLan,
             onChange = { onChange(settings.copy(proxyLan = it, localProxy = settings.localProxy || it)) },
         )
+        // 监听在 0.0.0.0 时不能把它直接显示给用户：局域网里的电脑要填的是手机的
+        // 真实 IP。引擎回填的是**实际**监听地址（端口可能是系统临时给的），
+        // 没连上时才退回到设置里的预期值。
+        val lanIp = LocalNetwork.ipv4(ctx)
+        val listened = state.socks.ifBlank { settings.proxyListenAddr() }
+        val shownAddr = if (listened.startsWith("0.0.0.0:")) {
+            lanIp.ifBlank { "0.0.0.0" } + listened.removePrefix("0.0.0.0")
+        } else {
+            listened
+        }
         InfoRow(
-            if (state.socks.isNotBlank()) "正在监听" else "连接后监听",
-            state.socks.ifBlank { settings.proxyListenAddr() },
+            when {
+                state.socks.isNotBlank() -> "正在监听"
+                state.isConnected && (settings.localProxy || settings.proxyLan) ->
+                    "没有监听（看日志里的「本地 SOCKS 监听失败」）"
+                else -> "连接后监听"
+            },
+            shownAddr,
         )
         ActionRow(
             "局域网共享",
@@ -553,9 +575,18 @@ fun SettingsScreen(
         )
         SettingText(
             title = "自定义 DNS",
-            subtitle = "逗号分隔",
+            subtitle = "逗号分隔；留空则用 1.1.1.1",
             value = settings.dns,
             onChange = { onChange(settings.copy(dns = it)) },
+        )
+        SettingSwitch(
+            title = "DNS 防泄漏",
+            subtitle = "剔除国内解析器 + 强制 DNS 走隧道 + 不放过 IPv6 绕过。" +
+                "出口是节点（OpenVPN/赛风）时解析器在节点那一侧，测试显示一致；" +
+                "WARP 直连时出口 IP 常被判成 CN 而 Cloudflare 解析器判成 US，" +
+                "测试会报「不一致」—— 那是归属地判定，查询本身没有出隧道",
+            checked = settings.dnsGuard,
+            onChange = { onChange(settings.copy(dnsGuard = it)) },
         )
         // 「不下发 DNS」已移除：它会和上面的自定义 DNS 互相打脸（填了地址却不下发），
         // 而且实测系统解析器在部分网络里会把查询泄漏到墙外。要「跟随系统」就把
@@ -1002,6 +1033,8 @@ private fun OpenVpnNodePicker(
     selectedNodeId: String,
     refreshing: Boolean,
     probing: Boolean,
+    /** 刷新进度（引擎最近一行 [vpngate] 日志）；空 = 还没有进度可显示。 */
+    refreshNote: String,
     /** 探测进度（如「37/98」）；空 = 还没有进度可显示。 */
     progress: String,
     onRefresh: () -> Unit,
@@ -1048,6 +1081,15 @@ private fun OpenVpnNodePicker(
                         "正在测真实握手 + 下载速度（不建 VPN）：" + progress.ifEmpty { "建 WARP 上游…" } +
                             "；每个节点握手后用 4 路并发下载（与 speedtest 同口径），" +
                             "测完按实测速度重排，期间可以关掉这个窗口",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 4.dp),
+                    )
+                }
+                if (refreshing) {
+                    Text(
+                        "正在刷新节点…" + (if (refreshNote.isEmpty()) "" else " $refreshNote") +
+                            "（经 WARP 抓取，20–60 秒；失败会自动换协议重试）",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 4.dp),

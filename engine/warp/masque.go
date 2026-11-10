@@ -1336,8 +1336,9 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 			o.report(fmt.Sprintf("出口 %s (%s)", s.ExitIP, s.Country))
 		}
 		}
-		if o.SocksListen != "" && tn.stack() != nil {
-			if !s.startSocks(ctx, o.SocksListen, o.report, o.Rules) && o.SocksRequired {
+		// 与 session.go 一致：fd 模式也要开本地 SOCKS（本地代理 / 局域网共享）。
+		if o.SocksListen != "" {
+			if !s.startSocksAt(ctx, o.SocksListen, o.report, o.Rules, o.SocksInternal) && o.SocksRequired {
 				return nil, fmt.Errorf("本地 SOCKS 端口 %s 起不来，而它这次是必需的（后续流程要连它）", o.SocksListen)
 			}
 		}

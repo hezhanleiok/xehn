@@ -76,7 +76,22 @@ data class AppSettings(
     val openvpnNodeLabel: String = "",
     val ipv6: Boolean = false,
     val mtu: Int = 1280,
-    val dns: String = "1.1.1.1, 223.5.5.5",
+    // 默认只下发 Cloudflare：223.5.5.5 之类的国内解析器会被 leak 测试判成
+    // 「DNS 泄露」，而且「绕过大陆」分流会把它们排除在隧道之外（真泄露）。
+    val dns: String = "1.1.1.1",
+    /**
+     * DNS 防泄漏开关（默认开）。
+     *
+     * 开启后建系统 VPN 时：
+     *  1. 只下发「出口侧」解析器（服务器 push 的优先，其次用户列表里剔除国内公共
+     *     解析器后的部分，最后兜底 1.1.1.1）—— 223.5.5.5 / 114.114.114.114 这类
+     *     国内解析器会被 `ipleak` 之类的站点直接判定为「DNS 泄露」；
+     *  2. 给每个解析器加一条 /32（/128）主机路由，保证它们在**黑名单分流**下也
+     *     进隧道，而不是从物理网卡直连出去；
+     *  3. 即使没开 IPv6，也把 ::/0 抓进 tun（fail closed）：不抓 v6 时，解析器
+     *     走 v6 的查询会绕过隧道，是最常见的「明明开了 VPN 还泄露」的原因。
+     */
+    val dnsGuard: Boolean = true,
     val dnsOff: Boolean = false,
     val autoConnect: Boolean = false,
     val rescan: Boolean = false,
@@ -140,6 +155,7 @@ object SettingsStore {
             ipv6 = p.getBoolean("ipv6", d.ipv6),
             mtu = p.getInt("mtu", d.mtu),
             dns = p.getString("dns", d.dns) ?: d.dns,
+            dnsGuard = p.getBoolean("dnsGuard", d.dnsGuard),
             dnsOff = p.getBoolean("dnsOff", d.dnsOff),
             autoConnect = p.getBoolean("autoConnect", d.autoConnect),
             rescan = p.getBoolean("rescan", d.rescan),
@@ -172,6 +188,7 @@ object SettingsStore {
             putBoolean("ipv6", s.ipv6)
             putInt("mtu", s.mtu)
             putString("dns", s.dns)
+            putBoolean("dnsGuard", s.dnsGuard)
             putBoolean("dnsOff", s.dnsOff)
             putBoolean("autoConnect", s.autoConnect)
             putBoolean("rescan", s.rescan)

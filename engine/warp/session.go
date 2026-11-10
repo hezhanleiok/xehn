@@ -82,6 +82,9 @@ type Options struct {
 	// 或者开在别人手里，tunnel-core 只会一遍遍拨一个死端口，最后报「隧道一个
 	// 都建立不起来」，看不出真正原因是本地端口。
 	SocksRequired bool
+	// SocksInternal 表示这个监听只给内部流程用（目前只有 Psiphon 的上游），
+	// 不是「本地代理 / 局域网共享」给用户的入口 —— 界面不该显示它的地址。
+	SocksInternal bool
 	// MTU 覆盖这次拨号的隧道 MTU（0 = 按协议默认）。
 	// 只有 MASQUEX2 的外层用它：外层要装得下内层 1200 字节的 QUIC 初始包，
 	// 必须比内层大，见 masque_nest.go 的 masqueX2OuterMTU。
@@ -108,8 +111,15 @@ type Options struct {
 // 桌面版的历史 bug 就是拿「基础协议端点的国家」当出口国家，结果 Psiphon 出口
 // 在澳洲却显示成别的国家。
 type Session struct {
-	tn       tunnel
-	ln       net.Listener
+	tn tunnel
+	// ln 是「内部」监听：目前只有 Psiphon 的上游用它（tunnel-core 必须有一个
+	// 本地 SOCKS 才能挂上去）。它对用户没有意义，地址也不会暴露给界面。
+	ln net.Listener
+	// userLn 是**面向用户**的监听（本地代理 / 局域网共享）。
+	//
+	// 单独一个字段是必要的：Psiphon 会话里两个监听同时存在，界面要显示的是
+	// 「局域网里的电脑能不能连」的那一个（可能是 0.0.0.0），而不是内部那条。
+	userLn   net.Listener
 	Endpoint string
 	ExitIP   string
 	Country  string
@@ -256,11 +266,11 @@ func dialWGTunnel(ctx context.Context, o Options, run protoRun) (*Session, error
 			} else {
 				o.report(fmt.Sprintf("出口 %s (%s)", s.ExitIP, s.Country))
 			}
-			// 本地 SOCKS 只在 netstack 模式有意义：那时系统不知道隧道存在，
-			// 需要一个本地入口。fd 模式下整个系统已经走隧道了，再开一个端口
-			// 只是多一个没人用的监听。
-			if o.SocksListen != "" && tn.stack() != nil {
-				if !s.startSocks(ctx, o.SocksListen, o.report, o.Rules) && o.SocksRequired {
+			// 本地 SOCKS 两种模式都要开：仅代理模式是唯一入口，fd 模式是
+			// 「本地代理 / 局域网共享」的入口（以前这里按 stack() != nil 跳过，
+			// 导致 VPN 模式的开关形同虚设）。
+			if o.SocksListen != "" {
+				if !s.startSocksAt(ctx, o.SocksListen, o.report, o.Rules, o.SocksInternal) && o.SocksRequired {
 					// 端口是后续流程的必经之路（Psiphon 上游）：不能静默降级，
 					// 否则调用方会拿到一条「隧道通了、但没人能用」的会话。
 					return nil, fmt.Errorf("本地 SOCKS 端口 %s 起不来，而它这次是必需的（后续流程要连它）", o.SocksListen)
@@ -394,20 +404,43 @@ func (s *Session) applyMeta(body string) {
 	}
 }
 
-// startSocks 在本地开一个 SOCKS5，把流量导进这条隧道的 netstack。
+// startSocks 在本地开一个 SOCKS5，把流量导进这条会话的出口。
 //
-// 注意：没有 VpnService 之前，这只有 App 自己能连（别的应用不走它），
-// 它的价值是「证明隧道真的能过真实流量」，以及给下一步 VpnService 复用。
+// 两种模式都要开：
+//   - 仅代理（netstack）：这是用户唯一的入口；
+//   - 系统 VPN（fd）：这是「本地代理 / 局域网共享」的入口 —— 以前这里有一句
+//     `tn.stack() != nil`，而 fd 模式的隧道根本没有 netstack，于是设置了也永远
+//     不起监听（真机现象：界面写「本地代理已开启」，电脑连 1080 却连不上）。
+//
 // 返回 false 表示监听没起来（端口被占、地址不可用）。调用方按 SocksRequired
 // 决定是「只写日志继续」还是「整次拨号失败」。
 func (s *Session) startSocks(ctx context.Context, listen string, report func(string), rules *RuleSet) bool {
+	return s.startSocksAt(ctx, listen, report, rules, false)
+}
+
+// startSocksAt 是 startSocks 的实现，internal 区分「内部上游 SOCKS」与
+// 「面向用户的本地代理」（两者可能同时存在，见 Session.userLn）。
+func (s *Session) startSocksAt(
+	ctx context.Context, listen string, report func(string), rules *RuleSet, internal bool,
+) bool {
+	path := s.socksPath()
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		report(fmt.Sprintf("本地 SOCKS 监听失败（%s：%v），隧道仍然可用", listen, err))
 		return false
 	}
-	s.ln = ln
-	report("本地 SOCKS5 已监听 " + ln.Addr().String())
+	if internal {
+		s.ln = ln
+	} else {
+		s.userLn = ln
+	}
+	scope := "仅本机"
+	if host, _, herr := net.SplitHostPort(ln.Addr().String()); herr == nil && host != "" {
+		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
+			scope = "局域网可访问"
+		}
+	}
+	report(fmt.Sprintf("本地 SOCKS5 已监听 %s（%s）", ln.Addr().String(), scope))
 	if rules.RuleCount() > 0 || rules.Policy() != PolicyGlobal {
 		report(fmt.Sprintf("分流：策略=%s，自定义规则 %d 条", rules.Policy(), rules.RuleCount()))
 	}
@@ -417,24 +450,55 @@ func (s *Session) startSocks(ctx context.Context, listen string, report func(str
 			if err != nil {
 				return
 			}
-			go serveSOCKS(ctx, conn, s.tn.stack().tnet, rules)
+			go serveSOCKS(ctx, conn, path, rules)
 		}
 	}()
 	return true
 }
 
+// socksPath 选出这条会话的本地 SOCKS 拨号路径（见 socks.go 的 socksPath）。
+func (s *Session) socksPath() socksPath {
+	// Psiphon 会话：最终出口是 psiphon 自己，必须经它的本地 SOCKS 链式出去。
+	// 这条路径在两种模式下都成立，而且不用管 tun 到底在不在。
+	if s.psiphon != nil {
+		if addr := s.psiphon.SocksAddr(); addr != "" {
+			if d, ok := socks5DialFunc(addr); ok {
+				return socksPath{dial: d}
+			}
+		}
+	}
+	if s.tn != nil {
+		// OpenVPN 节点出口：数据面是「系统 tun fd + 包泵」，`tn` 只是它的上游
+		// WARP（有 netstack）。这里必须用宿主 dial —— 它会被系统路由进 tun，
+		// 也就是真的走这条节点；用 tn 的 netstack 就绕开了节点，出口地区全错。
+		if s.ovpn == nil {
+			if st := s.tn.stack(); st != nil {
+				return socksPath{dial: st.tnet.DialContext, inTunnel: true, tnet: st.tnet}
+			}
+		}
+	}
+	// fd 模式：普通 dial 会被系统路由进 tun（引擎自己不是 VPN 例外）。
+	// 这里**不要** protect 这些 socket —— protect 之后流量会绕开隧道走物理网卡，
+	// 那等于用户以为在用代理、实际是直连。
+	d := &net.Dialer{Timeout: socksDialTimeout}
+	return socksPath{dial: d.DialContext}
+}
+
 // SocksAddr 返回本地 SOCKS 监听地址（没开则为空）。
 //
-// Psiphon 会话返回的是 **Psiphon 自己的** SOCKS：那才是这一轮真正的出口入口，
-// 上游那条只是它的载体，暴露给上层没有意义。
+// 优先级：面向用户的监听（可能是 0.0.0.0，局域网可连）→ Psiphon 自己的 SOCKS
+// （只绑 127.0.0.1）→ 内部上游监听。界面要显示的是「别人到底能不能连上」的那个。
 func (s *Session) SocksAddr() string {
+	if s.userLn != nil {
+		return s.userLn.Addr().String()
+	}
 	if s.psiphon != nil {
 		return s.psiphon.SocksAddr()
 	}
-	if s.ln == nil {
-		return ""
+	if s.ln != nil {
+		return s.ln.Addr().String()
 	}
-	return s.ln.Addr().String()
+	return ""
 }
 
 // Close 拆掉隧道与本地监听。
@@ -452,6 +516,10 @@ func (s *Session) PsiphonSocks() string {
 func (s *Session) Close() {
 	if s == nil {
 		return
+	}
+	if s.userLn != nil {
+		_ = s.userLn.Close()
+		s.userLn = nil
 	}
 	if s.ln != nil {
 		_ = s.ln.Close()

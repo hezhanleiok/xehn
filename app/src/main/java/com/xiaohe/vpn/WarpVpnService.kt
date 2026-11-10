@@ -61,6 +61,25 @@ class WarpVpnService : VpnService() {
         private const val TUN_ADDR_V6 = "fd00:1:fd00:1:fd00:1:fd00:1"
 
         /**
+         * 已知会被 leak 测试判成「DNS 泄露」的国内公共解析器。
+         *
+         * 不按网段判断（大陆网段表可能还没下载、而且会误伤用户自己搭的解析器），
+         * 只列这些「一定会把查询落到国内」的公共地址。用户如果确实想用它们，把
+         * 设置里的「DNS 防泄漏」关掉即可 —— 那时候列表原样下发。
+         */
+        private val LEAKY_RESOLVERS = setOf(
+            "223.5.5.5", "223.6.6.6",           // 阿里
+            "114.114.114.114", "114.114.115.115", // 114DNS
+            "119.29.29.29", "182.254.116.116", "182.254.116.117", // DNSPod
+            "180.76.76.76",                    // 百度
+            "1.2.4.8", "210.2.4.8",            // 世纪互联/CNNIC
+            "117.50.10.10", "117.50.11.11",    // 下一代
+            "52.80.66.66", "101.226.4.6", "123.125.81.6", // 电信/联通/百度
+            "180.184.1.1", "180.184.2.2",      // 字节
+            "218.30.118.6", "202.96.128.86", "202.96.134.133", // 各地电信
+        )
+
+        /**
          * Psiphon packet tunnel 的 MTU（tunnel-core 的 DEFAULT_MTU）。
          *
          * Psiphon 会往 tun 写最多 1500 字节的包，而内核会按接口 MTU 丢弃过大的包 ——
@@ -104,6 +123,17 @@ class WarpVpnService : VpnService() {
          * 现在取 1160，1 个包正好 1 个外层段。直连模式下这也是个稳妥值。
          */
         private const val OPENVPN_TUN_MTU = 1160
+
+        /**
+         * OpenVPN 出口时系统 tun 上用的**本机地址**（不是节点下发的那个）。
+         *
+         * 192.0.2.0/24 是 RFC 5737 的 TEST-NET-1（保留给文档），任何真实网络都不会
+         * 分配，所以永远不会和物理网卡/运营商网段冲突。节点下发的 10.211.x.x 在
+         * 引擎的包泵里做一对一替换（出去换源、回来换目的），对节点完全透明。
+         *
+         * 必须与 `engine/warp/openvpn.go` 的 `openVPNLocalSurrogate` 一致。
+         */
+        private const val OPENVPN_TUN_LOCAL = "192.0.2.111"
 
         /** 看门狗多久看一次快照。 */
         private const val WATCHDOG_TICK_MS = 5_000L
@@ -359,7 +389,10 @@ class WarpVpnService : VpnService() {
             e.setTunFD(0)
             e.setVPNState(false)
             e.setTimeout(s.timeoutSec.toLong())
-            e.setSocksListen("")
+            // 本地代理 / 局域网共享：Psiphon 自己的 SOCKS 只绑回环，引擎会在
+            // 出口就绪后另开一个面向用户的监听（链式经 Psiphon）。以前这里是
+            // 直接写 ""，等于在 Psiphon 出口下彻底关掉了这个功能。
+            e.setSocksListen(if (s.localProxy || s.proxyLan) s.proxyListenAddr() else "")
             EngineBridge.installTunProvider(this, psiphonTunProvider)
             EngineBridge.note("[vpn] Psiphon 出口：先建上游，就绪后再建系统 VPN")
             EngineBridge.refresh(e)
@@ -374,7 +407,8 @@ class WarpVpnService : VpnService() {
             e.setTunFD(0)
             e.setVPNState(false)
             e.setTimeout(s.timeoutSec.toLong())
-            e.setSocksListen("")
+            // 同上：节点出口下也要能开本地代理 / 局域网共享（拨号走这条节点）。
+            e.setSocksListen(if (s.localProxy || s.proxyLan) s.proxyListenAddr() else "")
             EngineBridge.installTunProvider(this, openvpnTunProvider)
             EngineBridge.note("[vpn] OpenVPN 出口：先握手拿地址，再建系统 VPN")
             EngineBridge.refresh(e)
@@ -885,6 +919,18 @@ class WarpVpnService : VpnService() {
         return node.cc + tag + num
     }
 
+    /** 建 tun 的一种本机地址组合（见 establishOpenVpnTun 的候选列表）。 */
+    private data class TunVariant(val addr: String, val withV6: Boolean, val label: String)
+
+    /** 建 tun 的每一步都带上上下文抛错：日志里能直接看出是哪一步被系统拒绝。 */
+    private inline fun vpnStep(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            throw IllegalStateException("$what 被拒绝：${t.message}", t)
+        }
+    }
+
     /**
      * 引擎在 OpenVPN 握手完成后回调这里，用服务器下发的参数建系统 VPN。
      *
@@ -897,56 +943,105 @@ class WarpVpnService : VpnService() {
         routesCsv: String,
         dnsCsv: String,
         mtu: Int,
-    ): Int = try {
+    ): Int {
         val s = SettingsStore.load(this)
-        val b = Builder()
-            .setSession(getString(R.string.app_name))
-            .setMtu(if (mtu in 576..9000) mtu else OPENVPN_TUN_MTU)
-            .addAddress(address, prefixLen)
-            .setBlocking(true)
+        val tunMtu = if (mtu in 576..9000) mtu else OPENVPN_TUN_MTU
+        // 服务器 push 的 DNS 在隧道另一头，优先级最高；没有才用用户列表。
+        val pushedDns = dnsCsv.split(',', ';').map { it.trim() }.filter { it.isNotEmpty() }
 
-        // 路由策略复用同一套三档（全局/绕过大陆/黑名单）。服务器 push 的
-        // 明细路由不单独加：VPN Gate 的语义就是「全机走它」，加明细反而会把
-        // 默认路由漏掉。
-        applyRoutePolicy(b, s)
-
-        val pushedDns = dnsCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
-        if (!s.dnsOff) {
-            val dns = pushedDns.ifEmpty { s.dnsList().ifEmpty { listOf("1.1.1.1", "223.5.5.5") } }
-            dns.forEach { runCatching { b.addDnsServer(it) } }
+        // 本机 tun **不用**节点下发的地址（节点认它下发的那个，但系统经常拒绝配它：
+        // 真机日志里 /32、/24、/16 全被 Vpn.jniSetAddresses 拒绝）。这里改用保留
+        // 地址，再由引擎在包泵里做一对一替换（engine/warp/iprewrite.go）。
+        //
+        // 但**地址不能写死**：0.2.33 用 192.0.2.111/32 也被拒（同样一句
+        // Cannot set address），说明撞的是「上一个 tun 接口残留的同一地址」，
+        // 而且 v6 地址 fd00::1 每次都一样、最容易撞。所以这里按「越来越不可能撞」
+        // 的顺序试几组，每组都换一个地址 + 可选关掉 v6：
+        //
+        //   ① 192.0.2.111 + v6      —— 正常情况，v6 也抓进来（防泄漏）
+        //   ② 192.0.2.111 不带 v6   —— v6 地址残留导致被拒
+        //   ③ 192.0.2.<随机> 不带 v6 —— v4 地址残留导致被拒
+        //   ④ 198.18.0.<随机> 不带 v6 —— 整个网段都被系统记着
+        //
+        // 成功的那个地址会回填给引擎（setOpenVPNLocalAddr），包泵按它做替换，
+        // 所以走哪一组都不影响连通性。
+        val variants = buildList {
+            add(TunVariant(OPENVPN_TUN_LOCAL, true, "保留地址 + v6"))
+            if (!s.ipv6) {
+                add(TunVariant(OPENVPN_TUN_LOCAL, false, "保留地址，不带 v6"))
+                add(TunVariant("192.0.2.${20 + (Math.random() * 220).toInt()}", false, "换地址，不带 v6"))
+                add(TunVariant("198.18.0.${20 + (Math.random() * 220).toInt()}", false, "换网段，不带 v6"))
+            }
         }
-        applySplit(b, s)
+        var last: Throwable? = null
+        for ((i, v) in variants.withIndex()) {
+            tunEstablishCount++
+            EngineBridge.note(
+                "[vpn] 第 $tunEstablishCount 次 establish（${i + 1}/${variants.size} " +
+                    "${v.label}：tun=${v.addr}/32，节点下发=$address/$prefixLen, " +
+                    "MTU=$tunMtu, 分流=${s.rulePolicy}）…"
+            )
+            try {
+                val b = Builder()
+                    .setSession(getString(R.string.app_name))
+                    .setMtu(tunMtu)
+                    .setBlocking(true)
 
-        // establish 之前先写一行：如果进程死在里面（原生崩溃不会走 catch），
-        // 日志就停在「准备 establish」而不会停在「已启用」—— 一眼能分清。
-        tunEstablishCount++
-        EngineBridge.note(
-            "[vpn] 第 $tunEstablishCount 次 establish（$address/$prefixLen, " +
-                "MTU=${if (mtu in 576..9000) mtu else OPENVPN_TUN_MTU}, 分流=${s.rulePolicy}）…"
-        )
-        // 换点会反复走到这里：先把上一个 tun 关掉，再建新的。fd 的所有权始终在
-        // 本类（tunPfd），引擎只借用 —— 否则同一个 fd 号被两边各关一次，就是
-        // 真机日志里那个 fdsan SIGABRT。
-        closeTun()
-        val pfd = b.establish() ?: return -1
-        tunPfd = pfd
-        val fd = pfd.fd
-        tunFd = fd
-        EngineBridge.peek()?.let { e ->
-            // 必须回填 tun fd：引擎的延迟探测与出口看门狗（needRecover）只在
-            // tunFD>0 时工作 —— 漏掉这一步会得到「能上网但永远不会自动重连」。
-            e.setTunFD(fd.toLong())
-            e.setVPNState(true)
-            EngineBridge.refresh(e)
+                // 每一步都带上下文抛：失败时日志能直接看出是「地址被拒」还是
+                // 「路由/分应用被拒」，不用再猜。
+                vpnStep("addAddress(${v.addr}/32)") { b.addAddress(v.addr, 32) }
+
+                // 路由策略复用同一套三档（全局/绕过大陆/黑名单）。
+                vpnStep("路由策略(${s.rulePolicy})") { applyRoutePolicy(b, s) }
+
+                // 防泄漏：v6 不抓就是一条绕过隧道直连的路。这一组没带 v6 时，
+                // 只是这一轮不抓（v6 地址被系统记着），IPv4 的 DNS 仍然强制走隧道。
+                if (v.withV6) {
+                    vpnStep("addAddress($TUN_ADDR_V6)") { b.addAddress(TUN_ADDR_V6, 128) }
+                    vpnStep("addRoute(::/0)") { b.addRoute("::", 0) }
+                }
+                vpnStep("DNS") { applyDnsGuard(b, s, pushedDns) }
+                vpnStep("分应用") { applySplit(b, s) }
+
+                // 换点会反复走到这里：先把上一个 tun 关掉，再建新的。fd 的所有权始终在
+                // 本类（tunPfd），引擎只借用 —— 否则同一个 fd 号被两边各关一次，就是
+                // 真机日志里那个 fdsan SIGABRT。
+                closeTun()
+                val pfd = b.establish()
+                if (pfd == null) {
+                    last = IllegalStateException("establish 返回 null（VPN 授权可能已被撤销）")
+                    continue
+                }
+                tunPfd = pfd
+                val fd = pfd.fd
+                tunFd = fd
+                EngineBridge.peek()?.let { e ->
+                    // 必须回填 tun fd：引擎的延迟探测与出口看门狗（needRecover）只在
+                    // tunFD>0 时工作 —— 漏掉这一步会得到「能上网但永远不会自动重连」。
+                    e.setTunFD(fd.toLong())
+                    // 告诉引擎 tun 上实际用的地址，包泵据此做地址替换。
+                    e.setOpenVPNLocalAddr(v.addr)
+                    e.setVPNState(true)
+                    EngineBridge.refresh(e)
+                }
+                EngineBridge.note(
+                    "[vpn] OpenVPN 系统 VPN 已启用（tun=${v.addr}/32 ← 节点 $address, " +
+                        "tun fd=$fd, MTU=$tunMtu${if (v.withV6) "" else "，本轮未抓 v6"}）"
+                )
+                return fd
+            } catch (t: Throwable) {
+                last = t
+                val cause = t.cause?.message
+                EngineBridge.note(
+                    "[vpn] establish 失败（${t.javaClass.simpleName}: ${t.message}" +
+                        (if (cause.isNullOrBlank()) "" else " / $cause") + "）"
+                )
+            }
         }
         EngineBridge.note(
-            "[vpn] OpenVPN 系统 VPN 已启用（$address/$prefixLen, tun fd=$fd, " +
-                "MTU=${if (mtu in 576..9000) mtu else OPENVPN_TUN_MTU}）"
+            "[vpn] OpenVPN 建 tun 失败（已试 ${variants.size} 种地址组合）：${last?.message}"
         )
-        fd
-    } catch (t: Throwable) {
-        EngineBridge.note("[vpn] OpenVPN 建 tun 失败: ${t.message}")
-        -1
+        return -1
     }
 
     /** 引擎的建 tun 回调（在 Go 的连接 goroutine 上调用）。 */
@@ -1032,15 +1127,18 @@ class WarpVpnService : VpnService() {
         // 没加的直接走物理网卡。三种规则模式就是三份路由集合。
         applyRoutePolicy(b, s)
 
-        if (s.ipv6) {
+        if (s.ipv6 || s.dnsGuard) {
             // 不给 ::/0 配地址就路由 v6 会把 v6 流量丢进黑洞。
             b.addAddress(TUN_ADDR_V6, 128)
             b.addRoute("::", 0)
+            if (!s.ipv6) {
+                // DNS 防泄漏连带把 v6 抓进来（fail closed）：不抓的时候，凡是走 v6
+                // 的连接（包括 v6 解析器）都从物理网卡直连出去 —— 这本身就是泄露，
+                // 而且 leak 测试会把它算在「DNS 泄露」名下。
+                EngineBridge.note("[dns] IPv6 未开启，但防泄漏已把 ::/0 抓进隧道（不会走物理网卡）")
+            }
         }
-        if (!s.dnsOff) {
-            val dns = s.dnsList().ifEmpty { listOf("1.1.1.1", "223.5.5.5") }
-            dns.forEach { runCatching { b.addDnsServer(it) } }
-        }
+        applyDnsGuard(b, s, emptyList())
         applySplit(b, s)
 
         // 新的一步之前先把上一个 tun 关掉：fd 只归本类所有。
@@ -1247,10 +1345,110 @@ class WarpVpnService : VpnService() {
     }
 
     /**
+     * DNS 防泄漏：决定这次下发哪些解析器，并把它们钉进隧道。
+     *
+     * 为什么需要（用户实测：VPN 模式连上后 ipleak 报 DNS 泄露）：
+     *  - 默认列表里有 **223.5.5.5（阿里 DNS）**，查询哪怕走了隧道，落地解析器也是
+     *    国内的，测试站点直接判泄露；
+     *  - 「绕过大陆」分流会把 CN 网段从 tun 里排除，223.5.5.5 正好在 CN 里 ——
+     *    查询根本不进隧道，从物理网卡直发，这是**真泄露**，不是显示问题；
+     *  - 「黑名单」分流只抓规则里写 proxy 的网段，默认路由不加，DNS 一样直连。
+     *
+     * 所以防泄漏做三件事：
+     *  1. 剔除已知的国内公共解析器（出口侧解析器优先：服务器 push 的 > 用户列表 > 1.1.1.1）；
+     *  2. 给每个解析器加一条 /32（/128）主机路由，任何分流策略下都进隧道；
+     *  3. 永不下发空列表 —— 空列表时系统会退回物理网络的 DNS，那等于没开 VPN。
+     *
+     * 返回实际下发的列表（调用方可用于日志）。
+     */
+    private fun applyDnsGuard(b: Builder, s: AppSettings, pushed: List<String>): List<String> {
+        if (s.dnsOff && !s.dnsGuard) {
+            EngineBridge.note("[dns] 未下发 DNS（用户关闭，且防泄漏也关着）")
+            return emptyList()
+        }
+
+        // 候选来源的优先级，是为了让「解析器所在国家」和「出口所在国家」一致 ——
+        // 这正是所有 leak 测试的判定标准：
+        //   ① 服务器 push 的（解析器就在出口那台机器上，必然同国）；
+        //   ② 用户自己填的（默认 1.1.1.1：抗污染，且始终在隧道内解析）。
+        //
+        // 注意**不要**退回「物理网络的 DNS」：国内运营商的解析器虽然能让
+        // 「出口 CN / 解析器 CN」对上，但它的递归查询本身在墙内，被污染的域名
+        // 会拿到错误 IP —— 那是拿「上网能不能用」换一个测试分数。
+        var candidates = pushed
+        var source = "服务器下发"
+        if (candidates.isEmpty()) {
+            candidates = s.dnsList()
+            source = "用户设置"
+        }
+
+        val dropped: List<String>
+        val kept: List<String>
+        if (s.dnsGuard) {
+            // 服务器下发里如果带「私有解析器」（10/8 等），它就是出口那台机器上的
+            // 解析器，一定和出口同国 —— 只留它。混进 8.8.8.8 这类公共解析器，
+            // leak 测试就会报「部分请求由另一个国家完成」。
+            val priv = if (source == "服务器下发") candidates.filter { isPrivateIp(it) } else emptyList()
+            val pool = if (priv.isNotEmpty()) priv else candidates
+            dropped = pool.filter { it in LEAKY_RESOLVERS }
+            kept = pool.filter { it !in LEAKY_RESOLVERS }
+        } else {
+            dropped = emptyList()
+            kept = candidates
+        }
+        val dns = kept.ifEmpty { listOf("1.1.1.1") }
+        var added = 0
+        for (addr in dns) {
+            if (runCatching { b.addDnsServer(addr) }.isSuccess) added++
+        }
+        if (s.dnsGuard) {
+            // 主机路由：黑名单/绕过大陆这两档都不会给「公网解析器」留默认路由，
+            // 不显式加的话，DNS 就从物理网卡直连出去。
+            var routed = 0
+            for (addr in dns) {
+                // 只处理 IP 字面量：对主机名调 getByName 会触发一次真实解析，
+                // 而这里正在配 DNS —— 递归解析、还会把日志卡住。
+                val ip = ipLiteral(addr) ?: continue
+                val literal = ip.hostAddress ?: continue
+                val bits = if (ip.address.size == 4) 32 else 128
+                if (runCatching { b.addRoute(literal, bits) }.isSuccess) routed++
+            }
+            EngineBridge.note(
+                "[dns] 防泄漏：下发 ${dns.joinToString(",")}（来源：$source，" +
+                    "$routed 条主机路由强制走隧道）" +
+                    if (dropped.isEmpty()) "" else "，已剔除国内解析器 ${dropped.joinToString("/")}"
+            )
+        } else {
+            EngineBridge.note("[dns] 下发 ${dns.joinToString(",")}（来源：$source，防泄漏已关闭）")
+        }
+        if (added < dns.size) {
+            EngineBridge.note("[dns] 有 ${dns.size - added} 个解析器格式无效，系统将忽略它们")
+        }
+        return dns
+    }
+
+    /** 只把 IP 字面量转成地址，主机名一律返回 null（避免触发一次真实解析）。 */
+    private fun ipLiteral(s: String): InetAddress? {
+        val v4 = Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")
+        if (!v4.matches(s) && !s.contains(':')) return null
+        return runCatching { InetAddress.getByName(s) }.getOrNull()
+    }
+
+    /** 私有 / 保留地址：代表「解析器就在隧道另一头的那个内网里」。 */
+    private fun isPrivateIp(s: String): Boolean {
+        val ip = ipLiteral(s) ?: return false
+        if (ip.isSiteLocalAddress || ip.isLoopbackAddress || ip.isLinkLocalAddress) return true
+        val b = ip.address
+        // 100.64.0.0/10（运营商级 NAT，很多节点也用它）
+        return b.size == 4 && (b[0].toInt() and 0xFF) == 100 && (b[1].toInt() and 0xC0) == 64
+    }
+
+    /**
      * 分应用：直接用 VpnService 的原生白/黑名单，等价于电脑版「分应用」三档，
      * 而且内核层生效，没有 mihomo 规则匹配的开销。
      */
     private fun applySplit(b: Builder, s: AppSettings) {
+
         val apps = s.splitAppList().filter { it != packageName }
         if (s.splitMode == "off" || apps.isEmpty()) return
         var applied = 0

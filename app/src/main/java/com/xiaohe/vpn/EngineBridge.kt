@@ -494,8 +494,12 @@ private fun VpnState.merge(raw: String): VpnState {
     } catch (_: Exception) {
         return this
     }
+    val st = o.optString("state", state)
     return copy(
-        state = o.optString("state", state),
+        state = st,
+        // 本地 SOCKS 的真实监听地址（引擎填的）。断开后要清掉，
+        // 否则界面会一直显示一个早就不存在的端口。
+        socks = if (st == "connected" || st == "connecting") o.optString("socks", socks) else "",
         proto = o.optString("proto", proto),
         endpoint = o.optString("endpoint", endpoint),
         exitIp = o.optString("exitIP", exitIp),
@@ -654,7 +658,12 @@ data class VpnState(
     val localCountry: String = "",
     /** assets/account.json 是否成功载入（设置页「关于」用它说明要不要联网注册）。 */
     val accountBuiltIn: Boolean = false,
-    /** 隧道自带的本地 SOCKS5 地址（只有 netstack 模式才有）。 */
+    /**
+     * 本地 SOCKS5 的**实际**监听地址（引擎回的，端口可能是系统临时分配的）。
+     *
+     * 两种模式都有：仅代理模式是唯一入口，VPN 模式是「本地代理 / 局域网共享」
+     * 的入口。空串 = 没开或没起来。
+     */
     val socks: String = "",
     val logs: List<String> = emptyList(),
 ) {

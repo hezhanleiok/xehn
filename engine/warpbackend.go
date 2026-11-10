@@ -45,8 +45,9 @@ type warpBackend struct {
 	// Psiphon 期望的落地地区（"" = 自动，否则 ISO-2 大写）。只影响下一次连接：
 	// tunnel-core 的 EgressRegion 是启动参数，改不了运行中的会话。
 	psiphonRegion string
-	// 本地 SOCKS5 监听地址（"host:port"，"" = 不开）。只有 netstack 模式才有意义：
-	// 「仅代理」模式靠它给用户一个入口；VPN 模式整个系统已经在隧道里，多开端口没用。
+	// 本地 SOCKS5 监听地址（"host:port"，"" = 不开）。
+	// 「仅代理」模式靠它给用户一个入口；VPN 模式它是「本地代理 / 局域网共享」的
+	// 入口（以前这里被 `stack() != nil` 挡住，VPN 模式下等于永远不开）。
 	socksListen string
 	// 分流规则（仅代理模式执行）。nil = 全部走隧道。
 	rules *warp.RuleSet
@@ -146,15 +147,21 @@ func (b *warpBackend) RefreshVPNGateNodes(ctx context.Context, report func(strin
 	b.accountJSON = raw
 	b.mu.Unlock()
 
-	nodes, err := warp.FetchVPNGate(ctx, warp.VPNGateFetchOptions{
-		UnderlayProto:    "awg",
-		UnderlayPrefer:   b.preferEndpoint("awg"),
-		HandshakeTimeout: handshake,
-		// 40s：vpngate.net 经 WARP 到日本再回源，实测经常 20s 以上；
-		// 20s 会在「其实能拉到」的情况下报超时。
-		Timeout: 40 * time.Second,
-		Report:  report,
-	})
+	fetch := func() ([]warp.VPNGateNode, error) {
+		return warp.FetchVPNGate(ctx, warp.VPNGateFetchOptions{
+			UnderlayProto:    "awg",
+			UnderlayPrefer:   b.preferEndpoint("awg"),
+			HandshakeTimeout: handshake,
+			// 40s：vpngate.net 经 WARP 到日本再回源，实测经常 20s 以上；
+			// 20s 会在「其实能拉到」的情况下报超时。
+			Timeout: 40 * time.Second,
+			Report:  report,
+		})
+	}
+	nodes, err := fetch()
+	// 这里**不重置账号**：账号是启动时注册好、缓存在本机的，用户明确不接受
+	// 「每次刷新都重新注册一台设备」。刷新失败时只报告原因（协议回退已经在
+	// dialFetchUnderlay 里做过），把「换协议」和「换账号」彻底分开。
 	if err != nil {
 		return 0, err
 	}
@@ -246,6 +253,7 @@ func (b *warpBackend) connectOpenVPN(
 	ids := append([]string(nil), b.openvpnIDs...)
 	country := b.openvpnCountry
 	prepare := b.openvpnTun
+	socksListen := b.socksListen
 	b.mu.Unlock()
 
 	if len(ids) == 0 {
@@ -288,7 +296,9 @@ func (b *warpBackend) connectOpenVPN(
 			VerifyTimeout:    10 * time.Second,
 			Budget:           60 * time.Second,
 			PrepareTun:       prepare,
-			Report:           report,
+			// 本地代理 / 局域网共享（节点出口时也要能开）。
+			SocksListen: socksListen,
+			Report:      report,
 		})
 		if err == nil {
 			b.rememberEndpoint(req.Proto, sess.Endpoint)
@@ -316,7 +326,10 @@ func (b *warpBackend) connectOpenVPN(
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有任何可用节点配置")
 	}
-	return Result{}, fmt.Errorf("试了 %d 个 OpenVPN 节点都失败（最后一个错误：%v）", tried, lastErr)
+	// %w 不是笔误：外层要靠 errors.Is 区分「节点/系统侧失败」和「WARP 账号失效」。
+	// 用 %v 的时候，「Android 侧建 tun 失败」会被当成账号问题，两次之后把好账号删了
+	// —— 用户看到的就是「每次启动都在重新注册 WARP 账号」。
+	return Result{}, fmt.Errorf("试了 %d 个 OpenVPN 节点都失败（最后一个错误：%w）", tried, lastErr)
 }
 
 // openvpnFailTTL 是节点失败记忆的有效期。
@@ -1001,6 +1014,7 @@ func (b *warpBackend) connectPsiphon(
 	clientConfig := b.psiphonConfig
 	dns := b.psiphonDNS
 	region := b.psiphonRegion
+	socksListen := b.socksListen
 	b.mu.Unlock()
 	if clientConfig == "" {
 		return Result{}, fmt.Errorf("缺少官方 Psiphon client.config（需随包提供，并调用 SetPsiphonConfig 喂入）")
@@ -1036,7 +1050,10 @@ func (b *warpBackend) connectPsiphon(
 		HandshakeTimeout: handshake,
 		VerifyTimeout:    8 * time.Second,
 		Budget:           60 * time.Second,
-		Report:           report,
+		// 本地代理 / 局域网共享：Psiphon 自己的 SOCKS 只绑回环，必须由引擎
+		// 另开一个面向用户的监听（见 warp/psiphon.go）。
+		SocksListen: socksListen,
+		Report:      report,
 	})
 	if err != nil {
 		return Result{}, err
@@ -1079,8 +1096,19 @@ func (b *warpBackend) Connect(ctx context.Context, req Request, report func(stri
 		// 账号失效的兜底：Cloudflare 注销设备后，用旧凭据握手会一直失败，
 		// 表象和「网络不通」完全一样。连续两次整体失败就把本地账号缓存删掉，
 		// 下次连接自动重新注册一台设备 —— 用户不需要知道有「账号」这回事。
+		//
+		// 「Android 侧建 tun 失败」不计入：隧道已经通了，账号是好的，删了只会
+		// 多一次注册（真机日志 12:10：固定节点全卡在 tun 上，账号却被重置）。
+		// 只有「基础 WARP 隧道」自己的失败才可能与账号有关：节点出口（OpenVPN /
+		// Psiphon）连不上是节点或网络的事，算到账号头上就会「每次启动都在重新注册」
+		// 一台新设备（真机日志：4 次固定节点失败之后账号被删掉）。
+		accountRelated := !errors.Is(err, errTunEstablish) &&
+			!strings.Contains(err.Error(), "OpenVPN 节点") &&
+			!strings.Contains(err.Error(), "Psiphon")
 		b.mu.Lock()
-		b.accountFailStreak++
+		if accountRelated {
+			b.accountFailStreak++
+		}
 		streak := b.accountFailStreak
 		b.mu.Unlock()
 		if streak >= 2 {

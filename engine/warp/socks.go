@@ -11,6 +11,7 @@ import (
 	"time"
 
 	netstack "github.com/xhwarp/android-engine/warp/netstackx"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -47,7 +48,21 @@ const (
 	socksDialTimeout = 10 * time.Second
 )
 
-func serveSOCKS(ctx context.Context, c net.Conn, tnet *netstack.Net, rules *RuleSet) {
+// socksPath 描述「这个本地 SOCKS 把连接拨到哪里」。
+//
+// 三种会话各有一条路，必须分开，否则要么用不了、要么绕开出口：
+//   - 仅代理 + WARP：隧道在 netstack 里，拨号必须走 netstack，域名也要在隧道内解析
+//     （宿主解析会用到本机 DNS，既是泄露、又可能拿到本地不可用的 IP）；
+//   - Psiphon：最终出口是 psiphon 自己，必须经它自己的本地 SOCKS 链式出去；
+//   - 系统 VPN（fd 模式）：引擎进程不在 VPN 的例外列表里，普通 dial 会被系统路由
+//     进 tun，也就是走这条隧道。**不能** protect 这些 socket，否则会绕开隧道。
+type socksPath struct {
+	dial     func(ctx context.Context, network, addr string) (net.Conn, error)
+	inTunnel bool
+	tnet     *netstack.Net
+}
+
+func serveSOCKS(ctx context.Context, c net.Conn, path socksPath, rules *RuleSet) {
 	defer c.Close()
 	target, err := socksHandshake(c)
 	if err != nil {
@@ -72,12 +87,14 @@ func serveSOCKS(ctx context.Context, c net.Conn, tnet *netstack.Net, rules *Rule
 		return
 	}
 
-	target, err = resolveInTunnel(dialCtx, tnet, target)
-	if err != nil {
-		socksReply(c, socksRefused)
-		return
+	if path.inTunnel && path.tnet != nil {
+		target, err = resolveInTunnel(dialCtx, path.tnet, target)
+		if err != nil {
+			socksReply(c, socksRefused)
+			return
+		}
 	}
-	remote, err := tnet.DialContext(dialCtx, "tcp", target)
+	remote, err := path.dial(dialCtx, "tcp", target)
 	if err != nil {
 		socksReply(c, socksRefused)
 		return
@@ -87,6 +104,25 @@ func serveSOCKS(ctx context.Context, c net.Conn, tnet *netstack.Net, rules *Rule
 		return
 	}
 	pipeBoth(c, remote)
+}
+
+// socks5DialFunc 把「另一个本地 SOCKS5」包装成拨号函数，用于链式出去。
+//
+// 目前只有 Psiphon 会话用它：它的出口藏在 tunnel-core 自己的 SOCKS 后面，
+// 我们自己起的监听必须经它转发，否则会在 WARP 上游就落地（地区不对）。
+func socks5DialFunc(addr string) (func(ctx context.Context, network, target string) (net.Conn, error), bool) {
+	if addr == "" {
+		return nil, false
+	}
+	d, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+	if err != nil {
+		return nil, false
+	}
+	cd, ok := d.(proxy.ContextDialer)
+	if !ok {
+		return nil, false
+	}
+	return cd.DialContext, true
 }
 
 // pipeBoth 在两个连接之间双向转发。

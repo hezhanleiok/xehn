@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -649,30 +650,105 @@ func fetchVPNGateTextWithFallback(ctx context.Context, o VPNGateFetchOptions) (s
 }
 
 // dialFetchUnderlay 起一条只用于抓取的 WARP netstack 会话（tunFD=0）。
+//
+// 会按「用户选的协议 → awg → wg → masque」依次退。真机日志（2026-11-10 16:06）
+// 里出现过「20 个端点全部握手成功、但数据面一个字节都过不去」，随后
+// `8.35.211.155 / 8.39.125.209` 也是同样症状 —— 这是典型的「握手小包能过、数据大包
+// 被掐」，换一种传输（wg 的裸 UDP、或 masque 的 HTTP/3）通常立刻就好。
+// 刷新节点是「什么都还没开始」的第一步，卡在这里等于整个功能不可用，必须自己找路。
 func dialFetchUnderlay(ctx context.Context, o VPNGateFetchOptions) (*Session, error) {
 	saved := tunFD
 	tunFD = 0
+	defer func() { tunFD = saved }()
+
 	handshake := o.HandshakeTimeout
 	if handshake <= 0 {
 		handshake = 3 * time.Second
 	}
-	sess, err := Dial(ctx, Options{
-		Proto:            o.UnderlayProto,
-		Endpoint:         o.UnderlayEndpoint,
-		Prefer:           o.UnderlayPrefer,
-		IPv6:             o.IPv6,
-		Sample:           2,
-		HandshakeTimeout: handshake,
-		VerifyTimeout:    8 * time.Second,
-		Budget:           60 * time.Second,
-		NoHedge:          true,
-		Report:           o.Report,
-	})
-	tunFD = saved
-	if err != nil {
-		return nil, err
+	protos := protoFallbacks(o.UnderlayProto)
+	var lastErr error
+	for i, proto := range protos {
+		if ctx.Err() != nil {
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			break
+		}
+		// 首个协议给 30s（够握手 3s + 两三个端点验证 8s），后面的 15s 一档：
+		// 换协议只是为了「换条路」，不需要再把整条路重跑一遍。
+		// 总上限 75s —— 外层还有「重置账号再试一次」，加起来仍在 3 分钟预算内。
+		budget := 15 * time.Second
+		if i == 0 {
+			budget = 30 * time.Second
+		}
+		if left, ok := remainingBudget(ctx, 75*time.Second); ok && left < budget {
+			budget = left
+		}
+		if budget < 4*time.Second {
+			break
+		}
+		if i > 0 {
+			o.report(fmt.Sprintf("换 %s 再试一次上游…", proto))
+		}
+		sess, err := Dial(ctx, Options{
+			Proto:            proto,
+			Endpoint:         o.UnderlayEndpoint,
+			Prefer:           o.UnderlayPrefer,
+			IPv6:             o.IPv6,
+			Sample:           2,
+			HandshakeTimeout: handshake,
+			VerifyTimeout:    8 * time.Second,
+			Budget:           budget,
+			NoHedge:          true,
+			Report:           o.Report,
+		})
+		if err == nil {
+			if proto != o.UnderlayProto {
+				o.report(fmt.Sprintf("%s 上游不通，改用 %s 成功", o.UnderlayProto, proto))
+			}
+			return sess, nil
+		}
+		lastErr = err
+		o.report(fmt.Sprintf("%s 上游失败：%v", proto, err))
 	}
-	return sess, nil
+	if lastErr == nil {
+		lastErr = errors.New("没有可用的上游协议")
+	}
+	return nil, lastErr
+}
+
+// protoFallbacks 给出「从首选协议开始」的尝试顺序（去重）。
+func protoFallbacks(preferred string) []string {
+	out := make([]string, 0, 4)
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		for _, x := range out {
+			if x == p {
+				return
+			}
+		}
+		out = append(out, p)
+	}
+	add(preferred)
+	add(protoAWG)
+	add(protoWG)
+	add(protoMASQUE)
+	// masque-h2 走 TCP/443：运营商整体封 UDP 时，只有它有机会通。
+	add(protoMASQUEH2)
+	return out
+}
+
+// remainingBudget 返回「总上限 cap 与 ctx 截止时间」里剩下的那个。
+func remainingBudget(ctx context.Context, cap time.Duration) (time.Duration, bool) {
+	left := cap
+	if dl, ok := ctx.Deadline(); ok {
+		if d := time.Until(dl); d < left {
+			left = d
+		}
+	}
+	return left, true
 }
 
 // fetchVPNGateText 抓 CSV 原文。stack 非 nil 时所有连接都走隧道 netstack。

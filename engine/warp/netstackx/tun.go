@@ -77,7 +77,7 @@ func CreateNetTUNBuffered(localAddresses, dnsServers []netip.Addr, mtu, maxBuffe
 		// incomingPacket 带缓冲：下行突发时 wireguard-go 的收包协程一次只取一个包，
 		// 无缓冲 channel 会让 gVisor 的 notify 协程逐包等它，来不及消费就整段丢包。
 		// 64 个包（≈ 80 KB）足够吸收一次突发，又不占内存。
-		incomingPacket: make(chan *buffer.View, 64),
+		incomingPacket: make(chan *buffer.View, 256),
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
@@ -87,20 +87,25 @@ func CreateNetTUNBuffered(localAddresses, dnsServers []netip.Addr, mtu, maxBuffe
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
 	if maxBuffer > 0 {
-		// 接收缓冲自适应必须显式打开：gVisor 的 ModerateRecvBuf 里有一句
-		// `if e.RcvAutoParams.Disabled { return }`，也就是**关着的时候窗口永远
-		// 停在 Default，Max 设多大都没用**。这正是「窗口 1 MiB / RTT 400ms ≈
-		// 20 Mbps，再怎么调 Max 也上不去」的根因（用户反馈「OpenVPN 出口只有几兆」）。
-		moderateOpt := tcpip.TCPModerateReceiveBufferOption(true)
-		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &moderateOpt); optErr != nil {
-			return nil, nil, fmt.Errorf("could not enable TCP receive buffer moderation: %v", optErr)
-		}
-		// 起点 1 MiB（慢启动阶段不抖），上限由调用方按「这条链要跑多快」决定。
-		recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 << 10, Default: 1 << 20, Max: maxBuffer}
+		// **不再开接收缓冲自适应（moderation），改成固定大窗口**。
+		//
+		// 为什么改回来（2026-11-10 真机数据）：
+		//   · WARP 上游自身（4 条 gVisor TCP 流打到 Cloudflare 边缘）能跑 36 MB/s；
+		//   · 同一个栈上**一条**长连接（OpenVPN 的 TCP 载体）打到韩国节点只有
+		//     0.6–0.9 MB/s，而且十几个不同节点都是这个量级 —— 像是被窗口钉住，
+		//     不像节点带宽。
+		//   gVisor 的 ModerateRecvBuf 是「只有本轮拷给用户的字节比上一轮多，才
+		//   把窗口往上抬」，是正反馈：窗口小 → 拷得少 → 不长。低 RTT 的短连接
+		//   看不出问题（36 MB/s 那组），高 RTT 的长连接就被压在几十 KB。
+		//
+		// 固定窗口：Default = Max = 调用方给的上限，gVisor 会据此在握手时协商
+		// 窗口缩放（>64 KiB 才会开），BDP 一次给足。缓冲是按实际到达的数据
+		// 分配段的，不是一上来就吃掉 maxBuffer 那么多内存。
+		recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 << 10, Default: maxBuffer, Max: maxBuffer}
 		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &recvOpt); optErr != nil {
 			return nil, nil, fmt.Errorf("could not set TCP receive buffer: %v", optErr)
 		}
-		sendOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 64 << 10, Default: 1 << 20, Max: maxBuffer}
+		sendOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 64 << 10, Default: maxBuffer, Max: maxBuffer}
 		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt); optErr != nil {
 			return nil, nil, fmt.Errorf("could not set TCP send buffer: %v", optErr)
 		}
@@ -189,15 +194,20 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 }
 
 func (tun *netTun) WriteNotify() {
-	pkt := tun.ep.Read()
-	if pkt == nil {
-		return
+	// 一次通知把队列里**所有**待发往下游的包都取出来，而不是只取一个。
+	//
+	// 上游 wireguard-go 的版本是「一个通知取一个包」，在 MTU 1280、10 万 pps 时
+	// 等于每个包都要走一遍 notify → channel → 读协程的握手；突发时队列越积越多，
+	// 表现为下行被压在十几兆上不去。批量取包把这层开销摊薄到「一次通知 N 个包」。
+	for {
+		pkt := tun.ep.Read()
+		if pkt == nil {
+			return
+		}
+		view := pkt.ToView()
+		pkt.DecRef()
+		tun.incomingPacket <- view
 	}
-
-	view := pkt.ToView()
-	pkt.DecRef()
-
-	tun.incomingPacket <- view
 }
 
 func (tun *netTun) Close() error {

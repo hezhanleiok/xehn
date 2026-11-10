@@ -59,6 +59,10 @@ type Snapshot struct {
 	// 重新 establish。这里只把判断结果写进快照，由 WarpVpnService 的看门狗执行
 	// 「断开 → 换端点 → 重连」。界面看到它就该提示正在重连。
 	NeedRecover bool `json:"needRecover"`
+
+	// Socks 是本地 SOCKS5 的真实监听地址（"" = 没开）。只在 StatusJSON 里填充：
+	// 端口可能是内核临时分配的，界面必须读这个值，不能自己拼设置里的地址。
+	Socks string `json:"socks,omitempty"`
 }
 
 // session is the one piece of state the engine owns. It replaces the Windows

@@ -115,6 +115,10 @@ type PsiphonOptions struct {
 	// RegionsOnly 只启动隧道、不接管流量、不做出口测速，拿到可用地区列表就返回。
 	// 用于「出口地区」里的「更新国家列表」：不需要 tun fd，也不需要真的上网。
 	RegionsOnly bool
+	// SocksListen 是**面向用户**的本地 SOCKS5 监听地址（本地代理 / 局域网共享）。
+	// 空 = 不开。Psiphon 自己的 SOCKS 只绑 127.0.0.1，局域网连不上，所以必须
+	// 由我们另开一个并链式转发（见 dialPsiphonOnce 的结尾）。
+	SocksListen string
 
 	// ---- 上游（基础协议隧道）----
 	UnderlayProto    string // wg | awg | masque | masque-h2 | wwarp，默认 awg
@@ -664,6 +668,8 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 		// 这个端口是 Psiphon 唯一的上游入口：bind 失败必须让整次尝试失败，
 		// 否则隧道看起来通了、Psiphon 却一个字节也发不出去。
 		SocksRequired: true,
+		// 它是内部入口，不是给用户/局域网的本地代理（那是下面单独开的那一个）。
+		SocksInternal: true,
 		// 上游只有一个本地 SOCKS 端口，不能并发拨号（见 Options.NoHedge）。
 		NoHedge: true,
 		Report:  o.Report,
@@ -767,6 +773,17 @@ func dialPsiphonOnce(ctx context.Context, o PsiphonOptions, skip string, remaini
 	// 否则断开后系统 VPN 一直挂着 —— 见 session.go 的 Session.tunFD。
 	under.tunFD = o.TunFD
 	o.report(fmt.Sprintf("Psiphon 出口 %s (%s)", ip, country))
+
+	// 面向用户的本地 SOCKS（本地代理 / 局域网共享）。
+	//
+	// Psiphon 自己的 SOCKS 只绑 127.0.0.1，同一 Wi-Fi 的电脑根本连不上；
+	// 上游那条又是内部监听。所以要在这里再开一个，**链式经 Psiphon 的 SOCKS**
+	// 出去（见 socksPath），否则局域网借到的是 WARP 上游的出口，地区就错了。
+	if o.SocksListen != "" {
+		if !under.startSocksAt(ctx, o.SocksListen, o.report, nil, false) {
+			o.report("注意：Psiphon 已连接，但本地代理端口没起来（局域网共享不可用）")
+		}
+	}
 	return under, used, nil
 }
 
@@ -790,6 +807,7 @@ func OpenPsiphonUnderlay(ctx context.Context, o PsiphonOptions) (*Session, error
 		Budget:           o.Budget,
 		SocksListen:      psiphonUnderlayListen,
 		SocksRequired:    true,
+		SocksInternal:    true,
 		NoHedge:          true,
 		Report:           o.Report,
 	})

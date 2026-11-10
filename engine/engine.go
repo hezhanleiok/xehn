@@ -211,6 +211,22 @@ func (e *Engine) SetRegionProbeSink(s RegionProbeSink) {
 // SetTunProvider installs the callback that builds the Android system VPN for
 // the OpenVPN exit. Must be called before Connect; without it the OpenVPN exit
 // reports a clear error instead of silently falling back to WARP.
+// errTunEstablish 表示「隧道已经通了，但 Android 侧建系统 VPN 失败」。
+//
+// 它必须和「握手/上游失败」区分开：账号重置那套兜底是按「连续两次连接失败」
+// 触发的，而建 tun 失败跟 WARP 账号毫无关系 —— 真机日志 12:10 里 4 次固定节点
+// 全卡在 tun 上，结果 2 次之后把好好的账号删了，下一轮还得重新注册。
+var errTunEstablish = errors.New("Android 侧建 tun 失败")
+
+// SetOpenVPNLocalAddr 告诉引擎「系统 tun 实际用的是哪个本机地址」。
+//
+// OpenVPN 出口的数据面是「系统 tun + 包泵」，节点只认它下发的地址，而 tun 上放的是
+// 一个本机保留地址（见 warp/iprewrite.go）。上层每次 establish 成功后调用一次，
+// 包泵据此把源地址换成节点地址、把回程包的目的地址换回来。
+func (e *Engine) SetOpenVPNLocalAddr(addr string) {
+	warp.SetOpenVPNLocalAddr(addr)
+}
+
 func (e *Engine) SetTunProvider(p TunProvider) {
 	e.mu.Lock()
 	e.tunProvider = p
@@ -223,7 +239,7 @@ func (e *Engine) SetTunProvider(p TunProvider) {
 		fd := p.EstablishTun(t.Address, t.PrefixLen,
 			strings.Join(t.Routes, ","), strings.Join(t.DNS, ","), t.MTU)
 		if fd <= 0 {
-			return 0, fmt.Errorf("Android 侧建 tun 失败（address %s/%d）", t.Address, t.PrefixLen)
+			return 0, fmt.Errorf("%w（address %s/%d）", errTunEstablish, t.Address, t.PrefixLen)
 		}
 		return fd, nil
 	})
@@ -232,7 +248,7 @@ func (e *Engine) SetTunProvider(p TunProvider) {
 	warp.SetPsiphonTunProvider(func() (int, error) {
 		fd := p.EstablishTun("172.16.0.2", 32, "0.0.0.0/0", "", 1500)
 		if fd <= 0 {
-			return 0, fmt.Errorf("Android 侧建 Psiphon tun 失败")
+			return 0, fmt.Errorf("%w（Psiphon）", errTunEstablish)
 		}
 		return fd, nil
 	})
@@ -443,7 +459,8 @@ func (e *Engine) RefreshVPNGateNodes() string {
 
 // SetSocksListen 设置本地 SOCKS5 监听地址，形如 "127.0.0.1:1080"；"" 表示不开。
 //
-// 只有「仅代理」模式需要：VPN 模式整个系统已经在隧道里，没有本地入口这回事。
+// 两种模式都要用：仅代理模式它是唯一入口；VPN 模式它是「本地代理 / 局域网共享」
+// 的入口（拨号经宿主栈，会被系统路由进 tun，所以出去的就是这条隧道）。
 // 传 "0.0.0.0:port" 就是允许局域网访问（SOCKS5 无认证，调用方要提醒用户）。
 func (e *Engine) SetSocksListen(addr string) {
 	if wb := e.warpBackendOf(); wb != nil {
@@ -758,7 +775,14 @@ func (e *Engine) stopStats() {
 // bound Status() Snapshot would simply not exist on the Kotlin side. Kotlin
 // parses this with the platform's org.json - no extra dependency.
 func (e *Engine) StatusJSON() string {
-	b, err := json.Marshal(e.sess.snapshot())
+	snap := e.sess.snapshot()
+	// 本地 SOCKS 的真实监听地址（连接后才有，端口可能是内核临时给的）。
+	// 界面靠它显示「正在监听 x.x.x.x:port」，也是局域网共享唯一的可信来源 ——
+	// 以前界面只显示设置里填的地址，端口没起来也照显，用户根本没法判断。
+	if wb := e.warpBackendOf(); wb != nil {
+		snap.Socks = wb.SocksAddr()
+	}
+	b, err := json.Marshal(snap)
 	if err != nil {
 		// A Snapshot is all basic types; failing to encode it is not something
 		// the UI could act on, so answer with a valid object carrying the state.

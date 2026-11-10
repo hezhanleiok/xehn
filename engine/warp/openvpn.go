@@ -246,6 +246,11 @@ type OpenVPNOptions struct {
 	// 这是本流程唯一需要回调 Android 的地方（VpnService.Builder 只能在 Java 侧调）。
 	PrepareTun func(OpenVPNTun) (int, error)
 
+	// SocksListen 是面向用户的本地 SOCKS5（本地代理 / 局域网共享）；空 = 不开。
+	// 监听用**宿主** dial：fd 模式下它会被系统路由进 tun，也就是走这条 OpenVPN
+	// 出口；仅代理模式下宿主 dial 就是直连（OpenVPN 出口本来也不支持仅代理）。
+	SocksListen string
+
 	Report func(string)
 }
 
@@ -291,6 +296,33 @@ func (t *tunDeviceStream) Write(p []byte) (int, error) {
 // Close 什么都不做：netstack 设备由调用方关闭。
 func (t *tunDeviceStream) Close() error { return nil }
 
+// openVPNLocalSurrogate 是系统 tun 默认使用的本机地址（192.0.2.0/24 = RFC 5737 的
+// TEST-NET-1，任何真实网络都不会分配）。
+//
+// 但**不能写死**：真机日志（2026-11-10 16:40）里 192.0.2.111/32 同样被系统拒绝
+// （Vpn.jniSetAddresses: Cannot set address），说明撞的不是「网段」，而是上一个
+// tun 接口还没回收时残留的同一个地址。所以上层会带一串候选地址挨个试，成功之后
+// 用 SetOpenVPNLocalAddr 告诉我们实际用了哪个 —— 包泵按这个地址做替换。
+var ovpnLocalAddr atomic.Value // string
+
+// SetOpenVPNLocalAddr 记录系统 tun 实际使用的本机地址（上层 establish 成功后调用）。
+func SetOpenVPNLocalAddr(addr string) {
+	ovpnLocalAddr.Store(addr)
+}
+
+// openVPNLocalAddrNow 返回当前 tun 的本机地址（未设置或非法时 ok=false）。
+func openVPNLocalAddrNow() (netip.Addr, bool) {
+	v, _ := ovpnLocalAddr.Load().(string)
+	if v == "" {
+		return netip.Addr{}, false
+	}
+	a, err := netip.ParseAddr(v)
+	if err != nil || !a.Is4() {
+		return netip.Addr{}, false
+	}
+	return a, true
+}
+
 // openvpnExit 是一条已经跑起来的 OpenVPN 数据面。
 type openvpnExit struct {
 	client *ovpn.Client
@@ -298,6 +330,11 @@ type openvpnExit struct {
 	file   packetStream
 	cancel context.CancelFunc
 	once   sync.Once
+
+	// natTo 是节点下发的地址。tun 侧的本机地址由上层用 SetOpenVPNLocalAddr 告诉我们
+	// （每次 establish 可能不同），包泵每包读一次全局值。
+	// 零值 = 不做替换（测速用的 netstack 路径就是这样）。
+	natTo netip.Addr
 
 	txBytes atomic.Uint64 // 写进 tun 的字节 = 从节点收下来的
 	rxBytes atomic.Uint64 // 从 tun 读出的字节 = 发往节点的
@@ -339,7 +376,14 @@ func (e *openvpnExit) startPump(ctx context.Context) {
 			n, err := e.file.Read(buf)
 			if n > 0 {
 				e.rxBytes.Add(uint64(n))
-				if werr := e.client.WriteIPPacket(pumpCtx, buf[:n]); werr != nil {
+				pkt := buf[:n]
+				// tun 上的源地址是本机保留地址，节点只认它下发的那个 → 出去时换掉。
+				if e.natTo.IsValid() {
+					if local, ok := openVPNLocalAddrNow(); ok {
+						rewriteIPv4Addr(pkt, true, local, e.natTo)
+					}
+				}
+				if werr := e.client.WriteIPPacket(pumpCtx, pkt); werr != nil {
 					return
 				}
 			}
@@ -358,6 +402,13 @@ func (e *openvpnExit) startPump(ctx context.Context) {
 			pkt, err := e.client.ReadIPPacket(pumpCtx)
 			if err != nil {
 				return
+			}
+			// 节点发回来的目的地址是它下发的那个 → 换回 tun 上的本机地址，
+			// 否则内核没有这张网卡、包会被直接丢掉（表现是「连上了、什么都打不开」）。
+			if e.natTo.IsValid() {
+				if local, ok := openVPNLocalAddrNow(); ok {
+					rewriteIPv4Addr(pkt, false, e.natTo, local)
+				}
 			}
 			if _, werr := e.file.Write(pkt); werr != nil {
 				return
@@ -480,11 +531,31 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	// 认为自己是 owner —— 换点几次后必然撞上 fdsan abort（真机 SIGABRT 闪退）。
 	f := newPacketFile(fd)
 	ex := &openvpnExit{client: client, file: f}
+	// 一对一地址替换（见 iprewrite.go）：系统 tun 上放的是本机保留地址（由上层
+	// 挑，成功后 SetOpenVPNLocalAddr 告诉我们），而节点认的是它下发的地址。
+	// 出去的包换成下发的，回来的包换回来。
+	if peer, peerErr := netip.ParseAddr(tun.Address); peerErr == nil {
+		ex.natTo = peer
+		local := "未上报"
+		if a, ok := openVPNLocalAddrNow(); ok {
+			local = a.String()
+		}
+		o.report(fmt.Sprintf("数据面地址替换：tun %s ↔ 节点 %s（节点侧看到的仍是它分配的地址）",
+			local, tun.Address))
+	}
 	ex.startPump(context.Background())
 
 	sess := under
 	sess.ovpn = ex
 	sess.tunFD = fd
+
+	// 本地代理 / 局域网共享：监听不在隧道里（TCP 监听是宿主的事），拨号由
+	// socksPath 决定 —— fd 模式下宿主 dial 会被系统路由进 tun，正好走这条节点。
+	if o.SocksListen != "" {
+		if !sess.startSocksAt(ctx, o.SocksListen, o.report, nil, false) {
+			o.report("注意：节点已连接，但本地代理端口没起来（局域网共享不可用）")
+		}
+	}
 
 	// ⑤ 出口验证：此时 App 自己的流量已经被系统路由进新的 tun，所以一次普通
 	//    HTTPS 请求就是端到端验证（握手成功 ≠ 能过数据）。
@@ -787,6 +858,53 @@ func probeDownloadBps(stack *ipStack, budget time.Duration) (int64, string) {
 	return speedProbeVia(ctx, open, probeSpeedHost, speedProbeStreams, speedProbeWarmup, speedProbeWindow)
 }
 
+// diagUnderlaySpeed 量一次「WARP 上游自身」的下载吞吐（每个进程只量一次）。
+//
+// 为什么需要它：用户反馈「同一个韩国节点，桌面版 WARP 前置能跑 100 Mbps，
+// 手机上只有几兆」。桌面版那套是 mihomo 内核（外层走系统内核 TCP），我们外层是
+// 用户态 gVisor TCP —— 到底是上游本身慢、还是这一层慢，必须先量出来，否则所有
+// 优化都是猜。日志里一行：
+//
+//	[diag] WARP 上游自身吞吐 ≈ 8200 KB/s（4 流 1.5s）
+//
+// 判据：这一行要是也只有几百 KB/s，瓶颈在上游/运营商，换节点没用；
+// 要是几 MB/s 而节点只有几百 KB/s，问题才在 OpenVPN 传输这一层。
+func diagUnderlaySpeed(ctx context.Context, stack *ipStack, report func(string)) {
+	if stack == nil || report == nil {
+		return
+	}
+	if !diagUpstreamOnce.CompareAndSwap(false, true) {
+		return
+	}
+	ip := lookupProbeSpeedIP()
+	open := func(d context.Context) (net.Conn, error) {
+		addr := net.JoinHostPort(probeSpeedHost, "443")
+		if ip != "" {
+			addr = net.JoinHostPort(ip, "443")
+		}
+		return stack.tnet.DialContext(d, "tcp", addr)
+	}
+	measure := func(streams int) int64 {
+		dctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		bps, _ := speedProbeVia(dctx, open, probeSpeedHost, streams,
+			600*time.Millisecond, 1200*time.Millisecond)
+		return bps
+	}
+	one := measure(1)
+	four := measure(speedProbeStreams)
+	if one <= 0 && four <= 0 {
+		report("诊断：WARP 上游吞吐测不出来（下载没数据）")
+		return
+	}
+	// 单流 / 四流一起报：单流远低于四流 → 每条流的窗口/拥塞控制在拖后腿；
+	// 两者接近且都很低 → 整条 WARP 链路被限速（换节点没用）。
+	report(fmt.Sprintf("诊断：WARP 上游 1 流 ≈ %d KB/s，4 流 ≈ %d KB/s",
+		one/1024, four/1024))
+}
+
+var diagUpstreamOnce atomic.Bool
+
 // dialOpenVPNUpstream 起 WARP 上游 → 经它拨节点 → 完成 OpenVPN 握手。
 //
 // 上游**只有这一条**：不进 WARP 的「直连节点」模式在 0.2.3 被删掉了 ——
@@ -812,6 +930,10 @@ func dialOpenVPNUpstream(
 		under.Close()
 		return nil, nil, nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
 	}
+	// 一次性诊断：量「WARP 上游自己」能跑多快（每个进程只量一次）。
+	// 这是判断「慢在上游还是慢在节点/OpenVPN 传输」的唯一可靠办法 ——
+	// 用户的桌面版同样节点能跑 100 Mbps，说明节点本身不慢，必须先把上游量清楚。
+	diagUnderlaySpeed(ctx, stack, o.Report)
 
 	// TCP/UDP 都走 gVisor，系统的路由表完全不参与，所以这一步在系统 VPN
 	// 建起来之前就能完成。

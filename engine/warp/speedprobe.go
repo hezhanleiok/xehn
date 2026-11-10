@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,9 @@ import (
 //	③ 单流的窗口上限 = min(本端缓窗, 对端缓窗) / RTT，物理上封顶。
 //
 // speedtest 用的是 4–8 条并发流，所以它给出的数字才是「这条线路能给多少」。
-// 这里照同一口径来：默认 4 流、预热 800ms、稳态窗口 2s，取窗口内所有流的总字节数。
+// 这里照同一口径来：默认 4 流、预热 800ms、窗口 2s；窗口内每 250ms 采一次
+// 累计字节，丢掉前两个区间后取**中位数**（见函数内注释：不能直接用总字节 ÷ 时长，
+// 否则本端接收缓冲里预热阶段攒下的几 MB 会被算进窗口，读数虚高一个数量级）。
 const (
 	speedProbeStreams   = 4
 	speedProbeWarmup    = 800 * time.Millisecond
@@ -213,22 +216,73 @@ func speedProbeVia(
 		wg.Wait()
 		return 0, "测速被取消"
 	}
-	base := total.Load()
-	start := time.Now()
-	_ = sleepCtx(ctx, window)
-	got := total.Load() - base
-	d := time.Since(start)
+	// 采样：每 250ms 取一次累计字节，算出**每个区间的瞬时速率**，最后取中位数。
+	//
+	// 为什么不再用「窗口总字节 ÷ 窗口时长」（0.2.30 的做法）：预热结束时，每条流在
+	// 本端（gVisor / 内核）的接收缓冲里已经攒了几 MB（测速栈缓冲上限 4 MiB，4 条流
+	// 就是十几 MB）。这些字节其实是**窗口开始前**就收到的，却会在窗口前半段被飞快
+	// 读出来并计入窗口 —— 一条 2 MB/s 的链路能报出 17 MB/s（真机日志里一批 kr/jp
+	// 节点都是这个量级，用户直接质疑「十几兆正常不」）。
+	//
+	// 逐区间采样后，前两个区间（排空缓冲）被丢掉，中位数只反映稳态速率；中位数对
+	// 「某条流提前读完」这类掉速也免疫。
+	const tick = 250 * time.Millisecond
+	prev, prevAt := total.Load(), time.Now()
+	rates := make([]float64, 0, 16)
+	deadline := time.Now().Add(window)
+	for {
+		wait := tick
+		if left := time.Until(deadline); left < wait {
+			wait = left
+		}
+		if !sleepCtx(ctx, wait) {
+			stop()
+			wg.Wait()
+			return 0, "测速被取消"
+		}
+		now := time.Now()
+		cur := total.Load()
+		// 只收长度正常的区间：窗口末尾那个「补零」的区间只有几微秒，除出来的
+		// 速率会是几十 GB/s 的野值（中位数能挡住，但没必要留）。
+		if dt := now.Sub(prevAt).Seconds(); dt >= 0.15 {
+			rates = append(rates, float64(cur-prev)/dt)
+		}
+		prev, prevAt = cur, now
+		if !now.Before(deadline) {
+			break
+		}
+	}
 
 	stop()
 	wg.Wait()
 
-	if d < 400*time.Millisecond {
+	if len(rates) < 2 {
 		return 0, "样本太短"
 	}
-	if got <= 0 {
+	// 丢掉前两个区间（≈0.5s）：缓冲排空 + 慢启动尾巴。
+	if len(rates) > 4 {
+		rates = rates[2:]
+	}
+	med := medianRate(rates)
+	if med <= 0 {
 		return 0, "预热后没有新数据"
 	}
-	return int64(float64(got) / d.Seconds()), ""
+	return int64(med), ""
+}
+
+// medianRate 取中位数：对偶发的掉速/抖动免疫，比平均值更接近「稳态能跑多少」。
+func medianRate(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	cp := make([]float64, len(v))
+	copy(cp, v)
+	sort.Float64s(cp)
+	n := len(cp)
+	if n%2 == 1 {
+		return cp[n/2]
+	}
+	return (cp[n/2-1] + cp[n/2]) / 2
 }
 
 // sleepCtx 睡满 d，ctx 提前结束就返回 false。

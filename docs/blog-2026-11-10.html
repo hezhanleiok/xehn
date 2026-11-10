@@ -1,0 +1,259 @@
+<!-- 直接粘贴到 Blogger「HTML 视图」。所有样式都写成内联，避免被主题覆盖；不含脚本/iframe/表单。 -->
+<div style="font-size:16px;line-height:1.85;max-width:100%;word-break:break-word;">
+
+  <p style="margin:0 0 18px;">
+    这两天把 <strong>0.2.30 → 0.2.37</strong> 全部重做了一遍。起因很直接：测速数字不可信、固定节点连不上、
+    OpenVPN 出口只有几兆、DNS 被判定泄露。下面按「问题 → 根因 → 改法 → 结果」逐条写，
+    文末有下载地址与项目仓库。
+  </p>
+
+  <blockquote style="margin:0 0 22px;padding:14px 18px;border-left:4px solid #2f6feb;background:rgba(47,111,235,0.08);">
+    <p style="margin:0;">
+      一句话总结：<strong>不是节点慢，是我们在建隧道、算数字、选 DNS 这三件事上都踩了坑。</strong>
+      坑一个个填掉之后，同一批节点的读数与能不能连，终于对得上了。
+    </p>
+  </blockquote>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    一、测速：从「数字不可信」到「数字能对上」
+  </h2>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">1. 单流测速把好节点测成了烂节点</h3>
+  <p style="margin:0 0 14px;">
+    之前用「一条流 + 2 秒窗口」测下载。真机日志里日本家宽节点显示
+    <code style="padding:1px 6px;border-radius:4px;background:rgba(128,128,128,0.15);">≈79 KB/s</code>，
+    而同一个节点用 speedtest 实测下行 <strong>17 Mbps（≈2 MB/s）</strong> —— 差了 25 倍。
+  </p>
+  <p style="margin:0 0 14px;">
+    原因不是节点，是测法：单流在 200–400ms RTT 的跨境链路上会同时被三件事拖死 ——
+    慢启动、丢一个包窗口就腰斩、以及「窗口 ÷ RTT」的物理上限。speedtest 用的是 4–8 条并发流，
+    它给的是「这条线路能给多少」，不是「一条流能给多少」。
+  </p>
+  <p style="margin:0 0 14px;">
+    <strong>改法：</strong>4 条并发流 + 800ms 预热 + 稳态采样；节点测速、地区测速、兜底路径全部走同一套口径。
+  </p>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">2. 又出现了「十几兆/秒」的假高速</h3>
+  <p style="margin:0 0 14px;">
+    换成多流之后，一批韩国节点报出 10–17 MB/s，比桌面版还快 —— 明显不对。
+    根因是「窗口内总字节 ÷ 窗口时长」这个算法：预热结束时，每条流在本端缓冲里已经攒了几 MB，
+    这些字节是<strong>窗口开始前</strong>收到的，却会在窗口前半段被飞快读出来并计入窗口。
+  </p>
+  <p style="margin:0 0 14px;">
+    <strong>改法：</strong>每 250ms 采样一次，丢掉前两个区间（排空缓冲 + 慢启动尾巴），其余取<strong>中位数</strong>。
+  </p>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">3. 列表排版：成功不再出现「握手」两个字，但也绝不伪装成功</h3>
+  <p style="margin:0 0 10px;">
+    旧列表把「握手结果」和「速度」分两处存，速度那份是「上次连上它时」的旧值，于是出现过
+    「握手成功、只有延迟、速度是别人的」这种自相矛盾的行。现在一行只显示一列结果：
+  </p>
+  <table style="width:100%;border-collapse:collapse;margin:0 0 16px;font-size:15px;">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:10px 12px;border:1px solid rgba(128,128,128,0.3);background:rgba(128,128,128,0.12);">状态</th>
+        <th style="text-align:left;padding:10px 12px;border:1px solid rgba(128,128,128,0.3);background:rgba(128,128,128,0.12);">显示</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">握手成功且测到速度</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);"><code>≈2.0 MB/s · 3214ms</code></td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">握手成功但下不动数据</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);"><strong>测速失败</strong>（标红）</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">握手失败</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);"><strong>握手失败</strong>（标红）</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">还没测</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">未测</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    二、OpenVPN 出口下行：几兆 → 十几兆 → 几十兆
+  </h2>
+  <p style="margin:0 0 14px;">
+    这是这轮花时间最多的地方，一共四处叠加：
+  </p>
+  <ol style="margin:0 0 14px;padding-left:22px;">
+    <li style="margin-bottom:10px;">
+      <strong>接收窗口自适应默认是关的。</strong>gVisor 的 <code>ModerateRecvBuf</code> 第一句就是
+      「关着就直接返回」，所以「最大缓冲」设成多少都不生效，窗口永远停在默认值 ——
+      1 MiB 窗口 / 300ms RTT ≈ 20 Mbps 封顶，正是「几兆到十几兆」的来源。
+    </li>
+    <li style="margin-bottom:10px;">
+      <strong>OpenVPN over TCP 没关 Nagle。</strong>协议是「一个 IP 包一次写」，1217 字节小于 MSS，
+      在 Nagle 眼里是「小段」，高 RTT 下要等 ACK 才发下一段。
+    </li>
+    <li style="margin-bottom:10px;">
+      <strong>每读一个包就分配 64 KB。</strong>下行 1 万包/秒 = 每秒 640 MB 垃圾，GC 直接把吞吐压在几兆。
+    </li>
+    <li style="margin-bottom:10px;">
+      <strong>netstack 一次通知只取一个包。</strong>突发时队列越积越多，下行被通知开销摊薄。
+      现在改成一次排空队列，并把待发队列从 64 加深到 256。
+    </li>
+  </ol>
+  <p style="margin:0 0 14px;">
+    再加一处「先量清楚再优化」：每次启动第一次连 OpenVPN 出口时，先用同一条 WARP 上游量一次它自己的吞吐，
+    日志里能看到单流/四流两个数。实测结果很关键 ——
+  </p>
+  <pre style="margin:0 0 16px;padding:14px 16px;overflow-x:auto;border-radius:8px;background:#1e2228;color:#e6e6e6;font-size:14px;line-height:1.6;"><code>[tunnel] 诊断：WARP 上游自身吞吐 ≈ 36719 KB/s（4 流）   ← 约 294 Mbps
+[tunnel] OpenVPN 出口 218.48.52.240 (KR)
+[vpn]    出口实测速度 ≈ 854 KB/s                          ← 约 6.8 Mbps</code></pre>
+  <p style="margin:0 0 14px;">
+    也就是说 <strong>WARP 这一层完全不是瓶颈</strong>（和单层 WireGuard 测出的 200–700 Mbps 一致），
+    问题在它后面那一段：一条长连接 + 高 RTT + 窗口没给足。0.2.37 已经把窗口自适应关掉、
+    改成固定大窗口（4/8 MiB），并在握手时协商窗口缩放。
+  </p>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    三、连接：固定节点总是失败的两个真实原因
+  </h2>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">1. 系统拒绝给 tun 配地址</h3>
+  <p style="margin:0 0 14px;">
+    日志里四次固定节点都停在同一句：
+  </p>
+  <pre style="margin:0 0 14px;padding:14px 16px;overflow-x:auto;border-radius:8px;background:#1e2228;color:#e6e6e6;font-size:14px;line-height:1.6;"><code>IllegalArgumentException: Cannot set address
+    at com.android.server.connectivity.Vpn.jniSetAddresses(Native Method)
+    at com.android.server.Vpn.establish(Vpn.java:1860)</code></pre>
+  <p style="margin:0 0 14px;">
+    VPN Gate 下发的是 <code>10.211.x.x</code>，而 10.0.0.0/8 同时是家用宽带和运营商 CGNAT 最常用的网段，
+    撞上就被系统拒绝；换前缀（/32 → /24 → /16）也一样被拒。
+  </p>
+  <p style="margin:0 0 14px;">
+    <strong>改法：</strong>系统 tun 上放 <code>192.0.2.111</code>（RFC 5737 的 TEST-NET-1，任何真实网络都不会分配），
+    由引擎在包泵里做一对一地址替换 —— 出去的包把源地址换成节点下发的，回来的再换回来，
+    节点侧看到的仍是它分配的地址，回程 NAT 照旧。之后又发现 v6 地址 <code>fd00::1</code>
+    会因为上一个接口残留被拒，于是改成四组候选地址依次尝试（带 v6 / 不带 v6 / 换地址 / 换网段）。
+  </p>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">2. 每次启动都在「重新注册」WARP 账号</h3>
+  <p style="margin:0 0 14px;">
+    根因是一处 <code>%v</code> 的笔误：错误包装把「建 tun 失败」这条链切断了，
+    于是账号重置逻辑把它当成「WARP 账号失效」，两次之后就把好账号删掉、下次重新注册一台设备。
+  </p>
+  <p style="margin:0 0 14px;">
+    <strong>改法：</strong>改成 <code>%w</code> 保留错误链；只有「基础 WARP 隧道自身」失败才计入账号失败；
+    刷新节点失败<strong>不再重置账号</strong>。
+  </p>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    四、DNS 防泄漏 与 本地代理
+  </h2>
+  <ul style="margin:0 0 14px;padding-left:22px;">
+    <li style="margin-bottom:10px;">
+      <strong>DNS 防泄漏（默认开）：</strong>剔除已知的国内公共解析器（阿里 / 114 / DNSPod / 百度等），
+      给每个下发的解析器加 /32 主机路由强制走隧道，防「绕过大陆」分流把 DNS 放出去；
+      没开 IPv6 时也把 <code>::/0</code> 抓进 tun（fail closed）。
+      服务器下发的 DNS 里若带私有地址，只保留它 —— 解析器就在出口那台机器上，测试显示的国家自然一致。
+    </li>
+    <li style="margin-bottom:10px;">
+      <strong>本地代理 / 局域网共享：</strong>VPN 模式下以前根本不会起监听（判断条件是 netstack 存在，
+      而系统 VPN 模式的隧道没有 netstack）。现在两种模式都会监听，Psiphon / OpenVPN 出口还会
+      另开一个面向局域网的端口并链式经出口转发；界面显示的是<strong>真实</strong>监听地址，
+      监听在 0.0.0.0 时自动换成手机的局域网 IP。
+    </li>
+  </ul>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    五、刷新节点：不再「一直失败」
+  </h2>
+  <p style="margin:0 0 14px;">
+    抓取列表要先起一条临时 WARP 隧道。之前只试一种传输，遇到「20 个端点全握手失败」或
+    「握手成功、数据面不通」就整块功能不可用。现在按
+    <strong>用户选的协议 → awg → wg → masque → masque-h2（TCP/443）</strong> 依次退，
+    每种 15–30 秒，总上限 75 秒；对话框里也会实时显示进度（抓取到哪一步、正在换哪种协议）。
+  </p>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    六、赛风地区测速：全部地区都要测
+  </h2>
+  <p style="margin:0 0 14px;">
+    以前是串行（同一进程只能跑一条 Psiphon 隧道），2 分钟预算只够测前 10 个国家。
+    现在每个地区各起一条独立的 tunnel 实例，4 路并发，27 个国家约 1 分钟全部测完，
+    进度与结果实时推给界面。
+  </p>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    七、版本对照
+  </h2>
+  <table style="width:100%;border-collapse:collapse;margin:0 0 18px;font-size:15px;">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:10px 12px;border:1px solid rgba(128,128,128,0.3);background:rgba(128,128,128,0.12);">版本</th>
+        <th style="text-align:left;padding:10px 12px;border:1px solid rgba(128,128,128,0.3);background:rgba(128,128,128,0.12);">主要内容</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);white-space:nowrap;">0.2.30</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">4 路并发测速口径；OpenVPN 下行窗口 / Nagle / 每包 64KB 分配；赛风地区并发全测</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);white-space:nowrap;">0.2.31</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">本地代理 / 局域网共享在 VPN 模式下修好；DNS 防泄漏（剔除国内解析器 + 强制主机路由 + v6 fail-closed）</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);white-space:nowrap;">0.2.32</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">测速改成逐区间采样取中位数（去掉假高速）；tun 地址前缀阶梯</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);white-space:nowrap;">0.2.33 / 0.2.34</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">tun 地址替换（一对一 NAT）；刷新节点协议回退；不再误删 WARP 账号</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);white-space:nowrap;">0.2.35</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">四组候选地址自动尝试（连 v6 都算在内，解决「固定节点全失败」）；刷新进度说明</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);white-space:nowrap;">0.2.36 / 0.2.37</td>
+        <td style="padding:10px 12px;border:1px solid rgba(128,128,128,0.3);">netstack 批量取包；WARP 上游单流/四流吞吐诊断；接收窗口改回固定大窗口（4/8 MiB）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 style="font-size:22px;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,0.25);">
+    八、下载与反馈
+  </h2>
+  <p style="margin:0 0 16px;">
+    最新构建（Android 8.0+，arm64 / armeabi-v7a）。两个下载地址内容相同，任选其一即可：
+  </p>
+  <ul style="margin:0 0 18px;padding-left:22px;">
+    <li style="margin-bottom:10px;">
+      <a href="__DOWNLOAD_URL_1__" style="color:#2f6feb;text-decoration:none;font-weight:600;border-bottom:1px dashed #2f6feb;">下载地址一</a>
+    </li>
+    <li style="margin-bottom:10px;">
+      <a href="__DOWNLOAD_URL_2__" style="color:#2f6feb;text-decoration:none;font-weight:600;border-bottom:1px dashed #2f6feb;">下载地址二</a>
+    </li>
+    <li style="margin-bottom:10px;">
+      <a href="__GITHUB_URL__" style="color:#2f6feb;text-decoration:none;font-weight:600;border-bottom:1px dashed #2f6feb;">GitHub 项目仓库</a>（源码 / 更新日志 / 问题反馈）
+    </li>
+  </ul>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">使用小提示</h3>
+  <ul style="margin:0 0 16px;padding-left:22px;">
+    <li style="margin-bottom:8px;">节点列表里的「测延迟 + 速度」是<strong>真实 OpenVPN 握手 + 真下载</strong>，不建系统 VPN，可以随时中断。</li>
+    <li style="margin-bottom:8px;">测完按实测速度重排；标红的是真的连不上，不是没测。</li>
+    <li style="margin-bottom:8px;">固定节点连不上时，日志会写清卡在哪一步（地址被拒 / 握手失败 / 上游起不来），方便定位。</li>
+    <li style="margin-bottom:8px;">「DNS 防泄漏」开启后，节点出口下解析器在节点那一侧，泄露检测应显示与出口同国。</li>
+  </ul>
+
+  <h3 style="font-size:18px;margin:22px 0 10px;">已知限制（还在做）</h3>
+  <ul style="margin:0 0 16px;padding-left:22px;">
+    <li style="margin-bottom:8px;">WARP 直连模式下，出口 IP 常被判成中国、Cloudflare 解析器被判成美国，泄露检测会报「国家不一致」——那是归属地判定，查询本身没有出隧道。</li>
+    <li style="margin-bottom:8px;">OpenVPN 出口的上限仍受「单条长连接 + 高 RTT」限制，距离桌面版（内核 TCP + 批处理）还有差距，下一步做批量 I/O。</li>
+  </ul>
+
+  <p style="margin:26px 0 0;padding-top:16px;border-top:1px solid rgba(128,128,128,0.25);font-size:14px;opacity:0.75;">
+    以上改动都来自真机日志逐条定位，不是「调大参数碰运气」。遇到问题请附上日志里的
+    <code>[tunnel]</code> / <code>[probe]</code> / <code>[vpn]</code> 行，定位会快很多。
+  </p>
+
+</div>
