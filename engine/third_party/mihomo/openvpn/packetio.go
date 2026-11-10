@@ -56,6 +56,14 @@ type streamPacketIO struct {
 type datagramPacketIO struct {
 	conn           connIO
 	recoverableUDP bool
+	// scratch 是 ReadPacket 的复用缓冲。只有 PacketMux 的单一物理读协程会调它
+	// （见 mux.go: "Run is the sole physical reader"），所以不需要锁。
+	//
+	// 以前每个包都 make([]byte, 64KB)：下行 100 Mbps / 1160 字节包 ≈ 每秒 1 万包，
+	// 也就是每秒 640 MB 垃圾，GC 把整条链路压在几兆 —— 这是「OpenVPN 出口下行
+	// 只有几兆、好一点十几兆」的主要元凶之一。改成「复用 64KB 读缓冲 + 按实际
+	// 长度拷一份」后，垃圾量降到 1/55。
+	scratch []byte
 }
 
 func NewDatagramPacketIO(conn connIO) PacketIO {
@@ -64,9 +72,17 @@ func NewDatagramPacketIO(conn connIO) PacketIO {
 }
 
 func (d *datagramPacketIO) ReadPacket() ([]byte, error) {
-	buf := make([]byte, 64*1024)
-	n, err := d.conn.Read(buf)
-	return buf[:n], err
+	if d.scratch == nil {
+		d.scratch = make([]byte, 64*1024)
+	}
+	n, err := d.conn.Read(d.scratch)
+	if n <= 0 {
+		return nil, err
+	}
+	// 必须拷贝：scratch 下个包就会被覆盖，而上一个包还要交给解密协程。
+	packet := make([]byte, n)
+	copy(packet, d.scratch[:n])
+	return packet, err
 }
 
 func (d *datagramPacketIO) WritePacket(packet []byte) error {

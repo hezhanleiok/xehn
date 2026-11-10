@@ -504,7 +504,9 @@ func newMasqueTunnel(h2 bool, mtu int, report func(string)) (*masqueTunnel, erro
 		if lerr != nil {
 			return nil, lerr
 		}
-		dev, stack, err = newIPStack(local, mtu)
+		// 会话级缓冲：这条 netstack 可能承载整条带宽（MASQUE 作为 OpenVPN /
+		// Psiphon 的上游时，外层连接就跑在它上面）。
+		dev, stack, err = newIPStackBuffered(local, mtu, netstackSessionBufferMax)
 		if err != nil {
 			return nil, err
 		}

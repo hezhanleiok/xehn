@@ -1032,3 +1032,80 @@ Psiphon 的 `psi` 是**进程内单例**，两个国家不能同时跑（`psi.St
 一个停稳的窗口。
 
 > 查法：解压 APK 取 `libgojni.so` / `classes*.dex`，转 Latin1 后按 UTF-8 字节做 `IndexOf`（PowerShell 一行即可），比逐个装上试快得多。
+
+---
+
+## 26. 0.2.30：测速口径、节点行排版、OpenVPN 下行、赛风地区全测
+
+四个问题来自同一份真机日志（2026-11-09 17:03）。前三个是「数字不可信」，
+第四个是「只测了一部分」。
+
+### 26.1 单流测速与 speedtest 差 25 倍（必须多流）
+
+日志：`jp-219.75.197.22-1596 握手成功 3434ms · ≈79 KB/s`，而同一节点用 speedtest
+实测下行 **17 Mbps**（≈2 MB/s）。差的不是节点，是测法：
+
+- 单流在「手机 → WARP → 跨境节点」这条 200–400ms RTT 的链路上会同时被三件事拖死：
+  慢启动（2 秒窗口基本全在爬坡）、丢一个包 cwnd 腰斩、以及「窗口/RTT」的物理上限；
+- speedtest 用的是 4–8 条并发流，它给出的是**线路能给多少**，不是**一条流能给多少**。
+
+修法：`engine/warp/speedprobe.go` 的 `speedProbeVia`——**4 条并发 HTTP 流 +
+预热 800ms + 稳态窗口 2s**，取窗口内所有流的总字节数。节点测速、赛风地区测速、
+串行兜底路径全部走它，保证「同一个数字」的口径一致。
+
+> 判据：日志里同一节点从「≈79 KB/s」变成与 speedtest 同量级（MB/s 级）。
+
+### 26.2 节点行排版：成功不再出现「握手」两个字
+
+旧文案是 `握手 3341ms` + 单独一列速度，两个数字来自**不同的存储**（握手来自
+`NodeProbeStore`、速度来自 `NodeSpeedStore`，后者是「上次连上它时」的出口速度，
+6 小时有效）。于是出现「握手成功、只有延迟、速度是别人的」这种行 —— 用户明确
+不接受。
+
+现在的排版（`SettingsScreen.kt` 的 `OpenVpnNodeRow`）：左边节点名，右边一列：
+
+| 状态 | 显示 |
+|---|---|
+| 握手成功且有速度 | `≈2.0 MB/s · 3214ms`（**不出现「握手」**） |
+| 握手成功但一个字节都下不来 | `测速失败`（标红，不再伪装成成功） |
+| 握手失败 | `握手失败`（标红） |
+| 没测过 | `未测`（有历史实测速度时会带上） |
+
+配套：`NodeProbeStore.Probe` 增加 `bps` 字段（`ms|ok|bps|at`，3 段旧格式按 bps=0
+兼容读取），`VpnGateNode.probeBps` 只代表**这一次探测**测到速度。
+
+### 26.3 OpenVPN 出口下行只剩几兆：三处叠加
+
+用户反馈「以前有 100 兆，现在几兆，好的十几兆」。逐个查下来是三处：
+
+1. **gVisor 的接收缓冲自适应默认是关的**（最致命）。`tcpip.TCPReceiveBufferSizeRangeOption`
+   的 `Max` 只在自适应打开时才有意义 —— `endpoint.go` 的 `ModerateRecvBuf` 第一句就是
+   `if e.RcvAutoParams.Disabled { return }`。所以 0.2.24 把 Max 从 0 调到 2 MiB 根本没生效，
+   窗口永远停在 `Default`（1 MiB）：1 MiB / 400ms ≈ **20 Mbps 封顶**，正是「几兆到十几兆」。
+   修法：`netstackx/tun.go` 里显式 `TCPModerateReceiveBufferOption(true)`，并把正式会话的
+   Max 提到 **8 MiB**（8 MiB / 0.3s ≈ 213 Mbps），测速用的临时栈 4 MiB。
+2. **OpenVPN over TCP 没关 Nagle**。协议是「一个 IP 包一次 Write」，1217 字节 < MSS 1240，
+   在 Nagle 眼里是「小段」，高 RTT 下要等 ACK 才发下一段。修法：`dialThroughStack`
+   里对 TCP 连接 `SetNoDelay(true)`。
+3. **每包 64 KB 分配**。`datagramPacketIO.ReadPacket` 每读一个包就 `make([]byte, 64*1024)`：
+   1160 字节的包、每秒 1 万包 = 每秒 640 MB 垃圾，GC 直接把吞吐压在几兆。
+   修法：复用 64 KB scratch 缓冲，只按实际长度拷一份（垃圾降到 1/55）。
+   另外把 `netstackx` 的 `incomingPacket` 从无缓冲改成 64 缓冲，突发时不再逐包阻塞。
+
+### 26.4 赛风地区：串行只能测前 10 个 → 每个地区一条 controller
+
+`MobileLibrary/psi` 的 `controller` 是**进程内全局变量**，串行 27 个地区（每个 8–10 秒）
+在 110 秒预算里只够跑前 10 个，剩下的只能标「超时未测」。
+
+修法：`engine/warp/psiphon_region.go` 直接用 tunnel-core 的 `psiphon` 包 ——
+`NewController` 是实例级的，`OpenDataStore`/`CloseDataStore` 是**引用计数**的
+（`psiphon/dataStore.go` 明确支持嵌套打开），所以 4 个地区可以并行。
+27 个地区 4 路并发 ≈ 1 分钟跑完，**全部地区都有结果**。
+
+三个边界：
+
+- 建 controller 的准备工作（Commit / OpenDataStore / NewController）用
+  `psiphonSetupMu` 串起来 —— `Commit` 里那段 `if !FileExists { os.Mkdir }` 并发会撞车；
+- notice writer 是进程级的，测速期间 `MutePsiphonNotices()` 静音，正式连接时
+  `psi.Start` 会重新装上自己的 writer；
+- 所有地区都是「基础设施起不来」时，自动回退到原来的串行实现（慢，但不会整块失效）。

@@ -454,13 +454,14 @@ func (b *warpBackend) TestOpenVPNNodes(
 			// 握手 + 真下载：只测握手的话，界面上「3341ms」这种数字看不出
 			// 「能握手但只有几 KB/s」的节点，而那正是用户最需要筛掉的。
 			//
-			// 预算 6s 是**整条 HTTP 请求**（DNS+TCP+TLS+首字节+2s 下载窗口）：
-			// 经「WARP → 日本节点 → CF」，光 TLS 就要好几秒，2s 一定测不出来
-			//（0.2.16 之前就是这么全变成「速度未测」的）。
-			// 测速本身还有并发槽位（见 warp.measureThroughOpenVPN），所以这里
-			// 给 6s 而不是 8s：全量 97 个节点时总时长才不至于超过预算。
+			// 预算 12s 是**整次测速**（每条流各自 TCP+TLS+首字节，然后预热 0.8s +
+			// 采样 2s）。2026-11-09 起测速改成「4 条并发流 + 稳态窗口」，与
+			// speedtest 同口径：单流在跨境链路上只能测到真实值的几十分之一
+			//（真机：日本家宽节点单流 70 KB/s，speedtest 实测 17 Mbps）。
+			// 时间从这个预算里出，所以给 12s；测速本身还有并发槽位
+			//（见 warp.measureThroughOpenVPN）。
 			started := time.Now()
-			d, bps, stage, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 6*time.Second)
+			d, bps, stage, perr := warp.ProbeOpenVPNSpeed(ctx, under, cfg, probeTimeout, 12*time.Second)
 			p := OpenVPNProbe{ID: id, MS: d.Milliseconds(), Bps: bps, OK: perr == nil}
 			if perr == nil && bps <= 0 {
 				// 「握手成功但没测到速度」必须说清是哪一步失败：DNS/TCP/TLS 还是
@@ -743,11 +744,16 @@ type PsiphonRegionProbe struct {
 	Error string `json:"error,omitempty"`
 }
 
-// ProbePsiphonRegions 逐个地区实测：经 WARP 前置把 Psiphon 拉到该地区，再用它
-// 自己的 SOCKS 下载 512 KB 算速度。
+// ProbePsiphonRegions 实测**全部**地区的速度：经 WARP 前置把 Psiphon 拉到该地区，
+// 再用多流并发下载算稳态吞吐（与 speedtest 同口径）。
 //
-// 用 RegionsOnly：不建 tun、不接管流量，所以可以在**未连接**状态下跑，也不会
-// 打断用户正在用的会话。代价是每个地区都要重新拨一次上游（约 8–15 秒）。
+// 并发不是优化而是必需：`MobileLibrary/psi` 的 controller 是进程内单例，串行测
+// 27 个地区（每个 8–10 秒）在 2 分钟预算里只能跑完前 10 个 —— 用户明确要求
+// 「全部都要测、时间不能变长、可以并发」。所以这里用 tunnel-core 的 psiphon 包
+// 直接起多个 controller（实例级，datastore 引用计数支持并存），3–4 路并行。
+//
+// 用 RegionsOnly 的等价物：不建 tun、不接管流量，所以可以在**未连接**状态下跑，
+// 也不会打断用户正在用的会话。
 func (b *warpBackend) ProbePsiphonRegions(
 	ctx context.Context, regions []string,
 	report func(string), sink func(PsiphonRegionProbe),
@@ -757,16 +763,23 @@ func (b *warpBackend) ProbePsiphonRegions(
 	dns := b.psiphonDNS
 	b.mu.Unlock()
 	out := make([]PsiphonRegionProbe, 0, len(regions))
-	if cfg == "" {
+	if cfg == "" || len(regions) == 0 {
 		return out
 	}
 	b.probingRegions.Store(true)
 	defer b.probingRegions.Store(false)
+
+	// 总预算 120 秒（用户要求「2 分钟内」）。并发 4 路时 27 个地区约 7 轮，
+	// 每轮「就绪 2–6s + 测速 3s」，正常 60–80 秒跑完；到点还没轮到的直接标
+	// 「超时未测」，不让界面无限转。
+	budgetCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
 	// **一条上游复用给所有地区**（见 warp.OpenPsiphonUnderlay 的注释）。
 	// 每个地区都重建一条 WARP 上游，测完 27 个之后资源耗尽，紧接着的连接会
 	// 直接失败（真机日志 15:22：远程服务器列表 0 字节、1m29s 建不起隧道）。
 	report("地区测速：先建一条 WARP 上游（各地区共用）…")
-	under, err := warp.OpenPsiphonUnderlay(ctx, warp.PsiphonOptions{
+	under, err := warp.OpenPsiphonUnderlay(budgetCtx, warp.PsiphonOptions{
 		UnderlayProto:    "awg",
 		HandshakeTimeout: 3 * time.Second,
 		VerifyTimeout:    10 * time.Second,
@@ -779,19 +792,61 @@ func (b *warpBackend) ProbePsiphonRegions(
 		}
 		return out
 	}
-	defer under.Close()
 	upSocks := under.SocksAddr()
 	dir := filepath.Join(b.workDir, "psiphon")
+	report(fmt.Sprintf("地区测速：%d 个地区并发测（每路 4 流并发下载，与 speedtest 同口径）…", len(regions)))
 
-	// known 是**本次会话**真正能用的地区（第一次成功启动后拿到）。
-	// Psiphon 每次上报的集合会变：日志里刷新列表时是 27 个，测速时只上报 25 个，
-	// 差的那两个（BR 等）每次都要白等十几秒才失败。拿到列表后直接跳过。
+	// 并发测速：每个地区一条独立 controller（见 warp/psiphon_region.go）。
+	results, parallelOK := warp.ProbePsiphonRegionsConcurrent(
+		budgetCtx, cfg, dir, upSocks, dns, regions,
+		4, 10*time.Second,
+		report,
+		func(r warp.PsiphonRegionResult) {
+			if sink == nil {
+				return
+			}
+			sink(PsiphonRegionProbe{
+				Region: r.Region, MS: r.MS, Bps: r.Bps,
+				OK: r.Err == "" && r.Bps > 0, Error: r.Err,
+			})
+		},
+	)
+	if parallelOK {
+		for _, r := range results {
+			out = append(out, PsiphonRegionProbe{
+				Region: r.Region, MS: r.MS, Bps: r.Bps,
+				OK: r.Err == "" && r.Bps > 0, Error: r.Err,
+			})
+		}
+		okCount := 0
+		for _, p := range out {
+			if p.OK {
+				okCount++
+			}
+		}
+		report(fmt.Sprintf("地区测速完成：%d 个地区里 %d 个测到速度（全部地区都已测）", len(out), okCount))
+		under.Close()
+		coolDownPsiphon(budgetCtx)
+		return out
+	}
+
+	// 兜底：并发设施整体不可用时退回串行（慢，但功能不会整块失效）。
+	under.Close()
+	return b.probePsiphonRegionsSerial(budgetCtx, regions, cfg, dns, dir, upSocks, report, sink)
+}
+
+// probePsiphonRegionsSerial 是 0.2.29 之前的逐个国家测速，仅作并发路径的兜底。
+//
+// known 是**本次会话**真正能用的地区（第一次成功启动后拿到）。Psiphon 每次上报
+// 的集合会变：日志里刷新列表时是 27 个，测速时只上报 25 个，差的那两个（BR 等）
+// 每次都要白等十几秒才失败。拿到列表后直接跳过。
+func (b *warpBackend) probePsiphonRegionsSerial(
+	ctx context.Context, regions []string,
+	cfg, dns, dir, upSocks string,
+	report func(string), sink func(PsiphonRegionProbe),
+) []PsiphonRegionProbe {
+	out := make([]PsiphonRegionProbe, 0, len(regions))
 	var known []string
-	// 总预算 110 秒（用户要求「2 分钟内」）。
-	//
-	// Psiphon 的 psi 是**进程内单例**，多个国家不能并行 —— 一个国家至少要花
-	// 「启动隧道 5–8s + 测速 1.5s」。所以 25 个国家在 2 分钟内跑不完是物理事实，
-	// 到点就停：已经测出来的照常显示，剩下的标「超时未测」，而不是让界面转 5 分钟。
 	deadline := time.Now().Add(110 * time.Second)
 	skippedByTime := 0
 	for i, region := range regions {
@@ -818,8 +873,6 @@ func (b *warpBackend) ProbePsiphonRegions(
 		}
 		report(fmt.Sprintf("地区测速 %d/%d：%s…", i+1, len(regions), region))
 		p := PsiphonRegionProbe{Region: region}
-		// 15s 上限：成功的地区实测 6–10s 就绪，20s 以上基本都是真要失败 ——
-		// 拖满 45s 只会让「25 个国家」变成 10 分钟的白等。
 		ms, bps, perr := warp.ProbePsiphonRegion(ctx, cfg, dns, dir, upSocks, region, 8*time.Second, report)
 		p.MS, p.Bps = ms, bps
 		if perr != nil {
@@ -833,20 +886,14 @@ func (b *warpBackend) ProbePsiphonRegions(
 		report(fmt.Sprintf("地区测速 %s：%s", region,
 			map[bool]string{true: fmt.Sprintf("≈%d KB/s", p.Bps/1024), false: "失败 " + p.Error}[p.OK]))
 		out = append(out, p)
-		// 第一次成功之后，把本次会话的可用地区记下来（见上面 known 的注释）。
 		if known == nil && perr == nil {
 			known = warp.PsiphonRegions()
 			report(fmt.Sprintf("本次会话可用地区 %d 个，其余地区直接跳过", len(known)))
 		}
-		// 给 psi 一点时间停稳：只 Stop 不等待就立刻 Start，下一个国家经常
-		// 「15s 内没有建立隧道」或者「连上了但测不出速度」（真机日志 16:26
-		// 里 25 个国家一半失败，而 16:09 那版每个国家独立上游时都是 200–350 KB/s）。
 		select {
 		case <-ctx.Done():
 		case <-time.After(500 * time.Millisecond):
 		}
-		// 测完一个国家立刻推给界面：等 25 个国家全跑完再刷新，用户看到的就是
-		// 「一直转圈，最后一次性冒出一片失败」。
 		if sink != nil {
 			sink(p)
 		}
@@ -854,14 +901,17 @@ func (b *warpBackend) ProbePsiphonRegions(
 	if skippedByTime > 0 {
 		report(fmt.Sprintf("地区测速：2 分钟预算用尽，%d 个地区未测完（已测的照常显示）", skippedByTime))
 	}
+	coolDownPsiphon(ctx)
+	return out
+}
 
-	// 让 tunnel-core 彻底停稳再放行正式连接：它的 psi 是进程内单例，刚 Stop
-	// 完立刻 Start 会拿不到服务器列表（日志里就是 bytes:0）。
+// coolDownPsiphon 让 tunnel-core 彻底停稳再放行正式连接：psi 是进程内单例，
+// 刚 Stop 完立刻 Start 会拿不到服务器列表（日志里就是 bytes:0）。
+func coolDownPsiphon(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 	case <-time.After(2 * time.Second):
 	}
-	return out
 }
 
 // shortErrStr 把错误压到一行（日志/界面用）。

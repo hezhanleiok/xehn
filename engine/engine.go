@@ -300,9 +300,10 @@ func (e *Engine) RefreshPsiphonRegions() string {
 	return string(b)
 }
 
-// ProbePsiphonRegions 逐个国家实测赛风的速度与延迟（经 WARP 前置）。
+// ProbePsiphonRegions 实测**全部**地区的赛风速度与延迟（经 WARP 前置）。
 //
-// BLOCKING：每个国家约 8–15 秒，27 个约 5–7 分钟。必须在后台线程调用。
+// BLOCKING：并发 4 路，每路「隧道就绪 2–6s + 多流测速 3s」，27 个地区通常
+// 1 分钟内跑完（0.2.29 之前是串行，2 分钟只够测前 10 个）。必须在后台线程调用。
 // Returns JSON: {"ok":true,"results":[{region,ms,bps,ok,error}]}
 func (e *Engine) ProbePsiphonRegions(regionsCSV string) string {
 	wb := e.warpBackendOf()

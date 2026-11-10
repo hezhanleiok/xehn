@@ -71,10 +71,13 @@ func CreateNetTUNBuffered(localAddresses, dnsServers []netip.Addr, mtu, maxBuffe
 		HandleLocal:        true,
 	}
 	dev := &netTun{
-		ep:             channel.New(1024, uint32(mtu), ""),
-		stack:          stack.New(opts),
-		events:         make(chan tun.Event, 10),
-		incomingPacket: make(chan *buffer.View),
+		ep: channel.New(1024, uint32(mtu), ""),
+		stack: stack.New(opts),
+		events: make(chan tun.Event, 10),
+		// incomingPacket 带缓冲：下行突发时 wireguard-go 的收包协程一次只取一个包，
+		// 无缓冲 channel 会让 gVisor 的 notify 协程逐包等它，来不及消费就整段丢包。
+		// 64 个包（≈ 80 KB）足够吸收一次突发，又不占内存。
+		incomingPacket: make(chan *buffer.View, 64),
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
@@ -84,21 +87,20 @@ func CreateNetTUNBuffered(localAddresses, dnsServers []netip.Addr, mtu, maxBuffe
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
 	if maxBuffer > 0 {
-		recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4 << 10, Default: 1 << 20, Max: maxBuffer}
+		// 接收缓冲自适应必须显式打开：gVisor 的 ModerateRecvBuf 里有一句
+		// `if e.RcvAutoParams.Disabled { return }`，也就是**关着的时候窗口永远
+		// 停在 Default，Max 设多大都没用**。这正是「窗口 1 MiB / RTT 400ms ≈
+		// 20 Mbps，再怎么调 Max 也上不去」的根因（用户反馈「OpenVPN 出口只有几兆」）。
+		moderateOpt := tcpip.TCPModerateReceiveBufferOption(true)
+		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &moderateOpt); optErr != nil {
+			return nil, nil, fmt.Errorf("could not enable TCP receive buffer moderation: %v", optErr)
+		}
+		// 起点 1 MiB（慢启动阶段不抖），上限由调用方按「这条链要跑多快」决定。
+		recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 << 10, Default: 1 << 20, Max: maxBuffer}
 		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &recvOpt); optErr != nil {
 			return nil, nil, fmt.Errorf("could not set TCP receive buffer: %v", optErr)
 		}
-		sendOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 4 << 10, Default: 1 << 20, Max: maxBuffer}
-		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt); optErr != nil {
-			return nil, nil, fmt.Errorf("could not set TCP send buffer: %v", optErr)
-		}
-	}
-	if maxBuffer > 0 {
-		recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4 << 10, Default: 1 << 20, Max: maxBuffer}
-		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &recvOpt); optErr != nil {
-			return nil, nil, fmt.Errorf("could not set TCP receive buffer: %v", optErr)
-		}
-		sendOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 4 << 10, Default: 1 << 20, Max: maxBuffer}
+		sendOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 64 << 10, Default: 1 << 20, Max: maxBuffer}
 		if optErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt); optErr != nil {
 			return nil, nil, fmt.Errorf("could not set TCP send buffer: %v", optErr)
 		}

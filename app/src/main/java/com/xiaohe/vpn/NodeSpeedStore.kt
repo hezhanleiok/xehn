@@ -37,8 +37,15 @@ object NodeProbeStore {
     /** 实测握手失败的节点，在这段时间内直接跳过（不进候选）。 */
     const val DEAD_SKIP_MS = 30 * 60 * 1000L
 
-    /** 一条探测记录：[ms] 握手耗时（失败时是超时时间，只用于展示），[ok] 是否握手成功。 */
-    data class Probe(val ms: Int, val ok: Boolean, val at: Long)
+    /**
+     * 一条探测记录：[ms] 握手耗时（失败时是超时时间，只用于展示），[ok] 是否握手成功，
+     * [bps] 是**这一次探测**测到的下载速度（0 = 握手成功但没测出速度）。
+     *
+     * bps 必须跟着握手结果一起存：界面要显示「速度 · 延迟」，而 NodeSpeedStore 里
+     * 那份是「上一次连上它时」的出口速度（可能已经 6 小时了）。两者混用会出现
+     * 「这次测速失败，却拿旧速度配新延迟」这种自相矛盾的行。
+     */
+    data class Probe(val ms: Int, val ok: Boolean, val bps: Long = 0, val at: Long = 0)
 
     fun snapshot(ctx: Context): Map<String, Probe> {
         val now = System.currentTimeMillis()
@@ -63,7 +70,7 @@ object NodeProbeStore {
         }
         for ((id, p) in results) {
             if (id.isEmpty()) continue
-            ed.putString(id, "${p.ms}|${if (p.ok) 1 else 0}|${p.at}")
+            ed.putString(id, "${p.ms}|${if (p.ok) 1 else 0}|${p.bps}|${p.at}")
         }
         ed.apply()
     }
@@ -82,12 +89,24 @@ object NodeProbeStore {
     private fun parse(raw: Any?): Probe? {
         val s = raw as? String ?: return null
         val parts = s.split('|')
-        if (parts.size != 3) return null
-        val ms = parts[0].toIntOrNull() ?: return null
-        val ok = parts[1] == "1"
-        val at = parts[2].toLongOrNull() ?: return null
-        if (at <= 0) return null
-        return Probe(ms, ok, at)
+        // 旧格式是 "ms|ok|at"（3 段），没有速度；读到就按 bps=0 处理，
+        // 这样升级后老记录不会整批作废，只是那一行显示「测速失败」。
+        val ms = parts.getOrNull(0)?.toIntOrNull() ?: return null
+        val ok = parts.getOrNull(1) == "1"
+        return when (parts.size) {
+            3 -> {
+                val at = parts[2].toLongOrNull() ?: return null
+                if (at <= 0) return null
+                Probe(ms, ok, 0, at)
+            }
+            else -> {
+                if (parts.size != 4) return null
+                val bps = parts[2].toLongOrNull() ?: 0
+                val at = parts[3].toLongOrNull() ?: return null
+                if (at <= 0) return null
+                Probe(ms, ok, if (bps > 0) bps else 0, at)
+            }
+        }
     }
 }
 

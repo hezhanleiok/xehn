@@ -834,23 +834,25 @@ func ProbePsiphonRegion(
 		return time.Since(started).Milliseconds(), 0, err
 	}
 	ms := time.Since(started).Milliseconds()
-	// 采样 256 KB、超时 6s：配合 128 KB 预热，一个国家约 1.5 秒测完 ——
-	// 「25 个国家 2 分钟内」的预算里，测速本身不能占太多。
-	bps := ProbeSpeedViaSocks(ctx, ex.SocksAddr(), 256<<10, 6*time.Second)
+	// 多流并发 + 稳态窗口（与 speedtest 同口径），一次约 3–4 秒。
+	bps := ProbeSpeedViaSocks(ctx, ex.SocksAddr(), 10*time.Second)
 	ex.stop()
 	return ms, bps, nil
 }
 
-// ProbeSpeedViaSocks 经一个 SOCKS5 下载最多 limit 字节，返回字节/秒（0 = 测不出）。
+// ProbeSpeedViaSocks 经一个 SOCKS5 用多流并发量一次稳态吞吐（0 = 测不出）。
 //
-// 用于「出口地区」里的测速：RegionsOnly 模式下 Psiphon 只有 SOCKS、没有 tun，
-// 但经 SOCKS 下载就是它真实落地时能给到的速度。
-func ProbeSpeedViaSocks(ctx context.Context, socksAddr string, limit int64, timeout time.Duration) int64 {
-	if socksAddr == "" || limit <= 0 {
+// 用于「出口地区」里的测速（串行兜底路径）：RegionsOnly 模式下 Psiphon 只有
+// SOCKS、没有 tun，但经 SOCKS 下载就是它真实落地时能给到的速度。
+//
+// 单流 + 字节预热的老做法测出来只有真实值的几分之一（真机：单流 70 KB/s，
+// speedtest 同一节点 17 Mbps），现在统一走 speedProbeVia（多流 + 时间预热）。
+func ProbeSpeedViaSocks(ctx context.Context, socksAddr string, timeout time.Duration) int64 {
+	if socksAddr == "" {
 		return 0
 	}
 	if timeout <= 0 {
-		timeout = 6 * time.Second
+		timeout = 10 * time.Second
 	}
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
@@ -862,55 +864,11 @@ func ProbeSpeedViaSocks(ctx context.Context, socksAddr string, limit int64, time
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
-				return cd.DialContext(dctx, network, addr)
-			},
-		},
+	open := func(dctx context.Context) (net.Conn, error) {
+		return cd.DialContext(dctx, "tcp", net.JoinHostPort(probeSpeedHost, "443"))
 	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, probeSpeedURL, nil)
-	if err != nil {
-		return 0
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	buf := make([]byte, 64<<10)
-
-	// 预热：先丢掉 128 KB 再开始计时。
-	//
-	// 不预热的话，采样段基本全在 TCP 慢启动里，测出来只有稳态的几分之一。
-	// 但预热也不能太长：25 个国家串行测（Psiphon 的 psi 是进程内单例，不能让
-	// 多个国家并行），总时长必须压在 2 分钟内，所以这里按「128 KB 跳过慢启动 +
-	// 256 KB 采样」取一个够用又快的量。
-	var warm int64
-	for warm < 128<<10 {
-		n, rerr := resp.Body.Read(buf)
-		warm += int64(n)
-		if rerr != nil {
-			break
-		}
-	}
-
-	start := time.Now()
-	var got int64
-	for got < limit {
-		n, rerr := resp.Body.Read(buf)
-		got += int64(n)
-		if rerr != nil {
-			break
-		}
-	}
-	d := time.Since(start).Seconds()
-	if got <= 0 || d < 0.3 {
-		return 0
-	}
-	return int64(float64(got) / d)
+	bps, _ := speedProbeVia(reqCtx, open, probeSpeedHost, psiphonRegionStreams, speedProbeWarmup, speedProbeWindow)
+	return bps
 }
 
 // probeViaSocks 通过一个本地 SOCKS5 真发一次请求，拿回出口 IP 与归属。

@@ -25,27 +25,44 @@ type ipStack struct {
 	client *http.Client
 }
 
-// netstackTCPBufferMax 是外层 gVisor TCP 的收/发缓冲上限。
+// 外层 gVisor TCP 的收/发缓冲上限。
 //
-// 单程 RTT ~250ms 时，吞吐 ≈ 窗口/RTT：8MB ⇒ 理论上限 ~256 Mbps，远高于
-// VPN Gate 节点本身能给到的带宽，所以再大只是白占内存（每条连接都可能吃满）。
-// 上游默认在 1MB 量级，实测把「WARP → 节点」这条链锁在 17 Mbps。
-// 0.2.24 起开 2MB（按上面那条给自己留的建议）。
+// 吞吐 ≈ 窗口/RTT。2026-11-09 之前一直是 2 MiB，而 gVisor 的「接收缓冲自适应」
+// 默认是**关**的（见 netstackx/tun.go 的说明）：不打开它，Max 设多大都没用，
+// 窗口永远停在 Default（1 MiB）。1 MiB / 300~400ms RTT ≈ 20~27 Mbps —— 正好是
+// 用户反复反馈的「几兆到十几兆」。
 //
-// 那次「打开 8MB 之后数据面不通」的真正原因是出口验证的 DialContext 丢掉了
-// 请求地址（见 pitfalls 第 19 节），跟缓冲大小无关；而且 0 的代价很实在：
-// 上游默认 1MB 量级，实测把「WARP → 节点」这条链锁在 17 Mbps —— 正是用户
-// 反馈的「赛风能连但很慢」。
-const netstackTCPBufferMax = 2 << 20
+// 现在两件事一起改：
+//  1. 打开 TCPModerateReceiveBufferOption，让窗口按实测 BDP 往上长到 Max；
+//  2. 正式会话给 8 MiB（8MiB / 0.3s ≈ 213 Mbps），测速用的临时栈给 4 MiB。
+//
+// 那次「开到 8MB 之后数据面不通」的真正原因是出口验证的 DialContext 丢掉了请求
+// 地址（见 pitfalls 第 19 节），跟缓冲大小无关。
+const (
+	// netstackProbeBufferMax 给「测速用的临时 netstack」：一次探测最多 4 个节点
+	// × 4 条流在跑，每条都给 8 MiB 会把这台手机的堆打满。
+	netstackProbeBufferMax = 4 << 20
+	// netstackSessionBufferMax 给正式会话的外层（OpenVPN / Psiphon 的上游）：
+	// 整条带宽都压在这**一条**外层连接上，窗口必须按 BDP 给足。
+	netstackSessionBufferMax = 8 << 20
+)
+
+// netstackTCPBufferMax 保留旧名字（测速路径默认值），避免调用方散落常量。
+const netstackTCPBufferMax = netstackProbeBufferMax
 
 func newIPStack(local []netip.Addr, mtu int) (tun.Device, *ipStack, error) {
+	return newIPStackBuffered(local, mtu, netstackProbeBufferMax)
+}
+
+// newIPStackBuffered 用指定的 TCP 收/发缓冲上限建一个 gVisor netstack。
+func newIPStackBuffered(local []netip.Addr, mtu, maxBuffer int) (tun.Device, *ipStack, error) {
 	// MTU 为 0 时 gVisor 连一个 IP 包都发不出去，表现正是「隧道握手成功、
 	// 数据面全不通」——而调用方完全看不出原因。这里兜底成标准值。
 	if mtu < 576 {
 		mtu = 1280
 	}
 	tunDev, tnet, err := netstack.CreateNetTUNBuffered(
-		local, []netip.Addr{netip.MustParseAddr(tunnelDNS)}, mtu, netstackTCPBufferMax)
+		local, []netip.Addr{netip.MustParseAddr(tunnelDNS)}, mtu, maxBuffer)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -127,10 +144,12 @@ func newWGTunnel(awg bool) (*wgTunnel, error) {
 	if tunFD > 0 {
 		tunDev, counters, err = newFdTunDevice(tunFD, mtu)
 	} else {
-		tunDev, stack, err = newIPStack([]netip.Addr{
+		// 这里是「外层数据面」：OpenVPN 出口与 Psiphon 出口的外层连接都跑在这条
+		// netstack 上，整条带宽压在一条 TCP 上，所以用会话级的窗口上限。
+		tunDev, stack, err = newIPStackBuffered([]netip.Addr{
 			netip.MustParseAddr(warpAddress),
 			netip.MustParseAddr(warpAddressV6),
-		}, mtu)
+		}, mtu, netstackSessionBufferMax)
 	}
 	if err != nil {
 		return nil, err

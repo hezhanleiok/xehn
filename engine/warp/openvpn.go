@@ -24,7 +24,6 @@ package warp
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -657,26 +656,27 @@ func probeOpenVPNHandshake(
 // probeSpeedSlots 限制「同时做测速」的节点数。
 //
 // 每一个测速都要起一个完整的 gVisor netstack（TCP/IP 栈 + goroutine 池）再叠
-// 一条 OpenVPN 数据通道。握手探测本身很轻（一个控制通道），但测速很重：
-// 真机现象是「测到第 8 个就再也不动了」—— 8 个并发 netstack 把手机 CPU/内存
-// 压满，后面的节点永远等不到 worker。握手仍然并发 8，只把**测速**限到 3。
-var probeSpeedSlots = make(chan struct{}, 3)
+// 一条 OpenVPN 数据通道，而每条节点现在要**并发 4 条流**下载（与 speedtest 同口径）。
+// 握手探测本身很轻（一个控制通道），但测速很重：真机现象是「测到第 8 个就再也不动」
+// —— 并发 netstack 把手机 CPU/内存压满，后面的节点永远等不到 worker。
+// 握手仍并发 8，只把**测速**限到 4（每节点 4 流 × 4 节点 = 16 条 TCP）。
+var probeSpeedSlots = make(chan struct{}, 4)
 
 // measureThroughOpenVPN 用 gVisor netstack 当 tun，把 OpenVPN 的包泵接上去，
-// 然后做一次真实下载。0 = 测不出来。
+// 然后做一次真实下载（多流并发，和 speedtest 同口径）。0 = 测不出来。
 func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget time.Duration) (int64, string) {
 	if budget <= 0 {
-		budget = 6 * time.Second
+		budget = 10 * time.Second
 	}
 	// 等一个测速槽位。
 	//
-	// 这里**不能**只等 budget：8 个握手 worker 里只有 3 个能同时测速，其余 5 个
-	// 若 6 秒就放弃，界面会有一大半节点「速度未测」（用户明确不接受）。正常排队
-	// 最多 3×6=18 秒，所以给 30 秒的等待上限：足够排队，又不会把 worker 永久占住。
+	// 这里**不能**只等 budget：8 个握手 worker 里只有 4 个能同时测速，其余 4 个
+	// 若 10 秒就放弃，界面会有一大半节点「速度未测」（用户明确不接受）。正常排队
+	// 最多 4×10=40 秒，所以给 45 秒的等待上限：足够排队，又不会把 worker 永久占住。
 	select {
 	case probeSpeedSlots <- struct{}{}:
 		defer func() { <-probeSpeedSlots }()
-	case <-time.After(30 * time.Second):
+	case <-time.After(45 * time.Second):
 		return 0, "测速队列等待超时"
 	}
 
@@ -702,21 +702,34 @@ func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget tim
 			ex.close()
 		})
 	}
-	timer := time.AfterFunc(budget+3*time.Second, forceClose)
+	// 硬超时必须覆盖「第一次 + 重试」两段（budget + 8s），否则重试还没跑完
+	// 泵就被关掉了 —— 那会把「其实能测出来」的节点误判成测速失败。
+	timer := time.AfterFunc(budget+12*time.Second, forceClose)
 	ex.startPump(context.Background())
 	defer func() {
 		timer.Stop()
 		forceClose()
 	}()
-	return probeDownloadBps(stack, budget)
+
+	bps, note := probeDownloadBps(stack, budget)
+	if bps > 0 {
+		return bps, ""
+	}
+	// 第一次没测出来就再给一次机会：跨境链路偶尔整段丢包，重试一次往往就出数。
+	// 用户明确要求「不能出现握手成功、只有延迟、没有速度」，所以宁可多花几秒。
+	if bps2, note2 := probeDownloadBps(stack, 8*time.Second); bps2 > 0 {
+		return bps2, ""
+	} else if note2 != "" {
+		note = note2
+	}
+	return 0, note
 }
 
-// probeSpeedHost / probeSpeedURL 是探测用的测速端点：1 MiB 足够看出量级，
-// 又不至于让一个节点占住探测通道太久（正式出口测速另有 speedURL）。
-const (
-	probeSpeedHost = "speed.cloudflare.com"
-	probeSpeedURL  = "https://" + probeSpeedHost + "/__down?bytes=1048576"
-)
+// probeSpeedHost 是探测用的测速端点主机名（正式出口测速另有 speedURL）。
+//
+// 单条流下载多少由 speedprobe.go 的 speedProbeBytes 决定，这里不再写死 1 MiB：
+// 1 MiB 在 17 Mbps 的线路上 0.5 秒就读完，样本必然落在慢启动段里。
+const probeSpeedHost = "speed.cloudflare.com"
 
 // probeSpeedIP 缓存测速端点的 IPv4 解析结果。
 var probeSpeedIP atomic.Value
@@ -743,77 +756,35 @@ func lookupProbeSpeedIP() string {
 	return ""
 }
 
-// probeDownloadBps 经 netstack 下载一小段并算出字节/秒。
+// probeDownloadBps 经 netstack 用**多流并发**下载一段并算出稳态字节/秒。
 //
 // 第二个返回值是「为什么没测出来」，由调用方写进日志 —— 只写「速度未测」的话，
 // 下次还是分不清是 DNS 不通、TLS 失败，还是节点真的没带宽。
+//
+// 多流不是可选项：单流测出来只有节点真实能力的几十分之一（见 speedprobe.go 顶部
+// 的说明），用它排序会把「实测 17 Mbps 的家宽节点」判成 70 KB/s 的慢节点。
 func probeDownloadBps(stack *ipStack, budget time.Duration) (int64, string) {
+	if stack == nil || stack.tnet == nil {
+		return 0, "测速网络栈未就绪"
+	}
+	if budget <= 0 {
+		budget = 10 * time.Second
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
-	tr := &http.Transport{DisableKeepAlives: true}
-	if ip := lookupProbeSpeedIP(); ip != "" {
-		// 直接拨 IP + 固定 SNI：绕过隧道内 DNS，这一步救回了大量「握手成功但
-		// 测速 0 字节」的节点。
-		tr.DialTLSContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
-			c, err := stack.tnet.DialContext(dctx, "tcp", net.JoinHostPort(ip, "443"))
-			if err != nil {
-				return nil, fmt.Errorf("tcp: %w", err)
-			}
-			tc := tls.Client(c, &tls.Config{
-				ServerName: probeSpeedHost,
-				NextProtos: []string{"http/1.1"},
-			})
-			if err := tc.HandshakeContext(dctx); err != nil {
-				_ = c.Close()
-				return nil, fmt.Errorf("tls: %w", err)
-			}
-			return tc, nil
+	// 主机 DNS 解析一次，之后所有流直接拨 IP + 固定 SNI：绕过隧道内 DNS。
+	// 经 VPN Gate 节点解析 speed.cloudflare.com 经常整段不通（不转发 UDP 53），
+	// 那会让测速「一个字节都收不到」。
+	ip := lookupProbeSpeedIP()
+	open := func(dctx context.Context) (net.Conn, error) {
+		addr := net.JoinHostPort(probeSpeedHost, "443")
+		if ip != "" {
+			addr = net.JoinHostPort(ip, "443")
 		}
-	} else {
-		tr.DialContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
-			return stack.tnet.DialContext(dctx, network, addr)
-		}
+		return stack.tnet.DialContext(dctx, "tcp", addr)
 	}
-
-	client := &http.Client{Timeout: budget, Transport: tr}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeSpeedURL, nil)
-	if err != nil {
-		return 0, "构造请求失败"
-	}
-	// client.Do 包含 TCP + TLS + 首字节：经「WARP → 节点 → CF」链路，光握手就要
-	// 好几秒，所以计时**从首字节之后开始**。
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, shortErr(err)
-	}
-	defer resp.Body.Close()
-
-	start := time.Now()
-	window := 2 * time.Second
-	if dl, ok := ctx.Deadline(); ok {
-		if rest := time.Until(dl); rest < window {
-			window = rest
-		}
-	}
-	var got int64
-	buf := make([]byte, 32<<10)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		got += int64(n)
-		if rerr != nil || time.Since(start) >= window {
-			break
-		}
-	}
-	d := time.Since(start).Seconds()
-	// 样本太短（<0.3s）就不可信：可能是首包刚好卡在窗口边缘。
-	if got <= 0 {
-		return 0, "已连上但 2 秒内没有收到数据"
-	}
-	if d < 0.3 {
-		return 0, "样本太短"
-	}
-	return int64(float64(got) / d), ""
+	return speedProbeVia(ctx, open, probeSpeedHost, speedProbeStreams, speedProbeWarmup, speedProbeWindow)
 }
 
 // dialOpenVPNUpstream 起 WARP 上游 → 经它拨节点 → 完成 OpenVPN 握手。
@@ -887,7 +858,17 @@ func dialThroughStack(ctx context.Context, stack *ipStack, proto, addr string, t
 
 	switch proto {
 	case ovpn.ProtoTCP:
-		return stack.tnet.DialContext(dialCtx, "tcp", addr)
+		conn, err := stack.tnet.DialContext(dialCtx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		// 关掉 Nagle：OpenVPN over TCP 是「一个 IP 包一次 Write」（还带 2 字节
+		// 长度前缀），1217 字节小于 MSS 1240，属于 Nagle 眼里的「小段」。高 RTT
+		// 链路上它会攒着等 ACK，吞吐能掉到几十 KB/s。
+		if nd, ok := conn.(interface{ SetNoDelay(bool) error }); ok {
+			_ = nd.SetNoDelay(true)
+		}
+		return conn, nil
 	case ovpn.ProtoUDP:
 		host, portStr, err := net.SplitHostPort(addr)
 		if err != nil {

@@ -263,13 +263,13 @@ fun SettingsScreen(
                     ) {
                         if (regionProbing) {
                             // 进度直接取引擎日志里的「地区测速 3/27：BE…」——
-                            // 27 个地区要跑 5 分钟以上，没有进度看起来就是卡死。
+                            // 27 个地区要跑好几轮，没有进度看起来就是卡死。
                             val prog = state.logs.lastOrNull {
                                 it.contains("地区测速 ") && it.contains("/")
-                            }?.substringAfter("地区测速 ")?.substringBefore("…")?.trim().orEmpty()
+                            }?.substringAfter("地区测速 ")?.substringBefore("：")?.trim().orEmpty()
                             Text(
                                 "测速中…" + if (prog.isNotEmpty()) " $prog" else "" +
-                                    "（逐个国家经 WARP 前置跑一次 Psiphon，每个 10–20 秒）",
+                                    "（全部地区并发测：每个地区一条 Psiphon 隧道，每条 4 路并发下载，约 1 分钟）",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(vertical = 6.dp),
@@ -1046,7 +1046,8 @@ private fun OpenVpnNodePicker(
                 if (probing) {
                     Text(
                         "正在测真实握手 + 下载速度（不建 VPN）：" + progress.ifEmpty { "建 WARP 上游…" } +
-                            "；每个节点握手后再下载一小段，测完按握手耗时重排，期间可以关掉这个窗口",
+                            "；每个节点握手后用 4 路并发下载（与 speedtest 同口径），" +
+                            "测完按实测速度重排，期间可以关掉这个窗口",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 4.dp),
@@ -1065,9 +1066,10 @@ private fun OpenVpnNodePicker(
                 }
                 groups.forEach { (cc, list) ->
                     val open = expanded == cc
-                    // 国家行的小结也要说人话：测过就报「几个能握手」，没测过才退回
-                    // 「几个有响应」（那个只是 api 域名的 TCP 时间，不代表节点活着）。
-                    val shakeOk = list.count { it.hasProbe && it.handshakeOk }
+                    // 国家行的小结也要说人话：测过就报「几个有速度」（握手成功且真的
+                    // 下得动数据才算数），没测过才退回「几个有响应」（那只是 api 域名
+                    // 的 TCP 时间，不代表节点活着）。
+                    val usable = list.count { it.hasProbe && it.handshakeOk && it.probeBps > 0 }
                     val probed = list.count { it.hasProbe }
                     val responded = list.count { it.latencyMs > 0 }
                     Row(
@@ -1085,7 +1087,7 @@ private fun OpenVpnNodePicker(
                         Text(
                             "${list.size} 个" +
                                 when {
-                                    probed > 0 -> " · $shakeOk 能握手"
+                                    probed > 0 -> " · $usable 有速度"
                                     responded > 0 -> " · $responded 有响应"
                                     else -> ""
                                 } +
@@ -1129,6 +1131,41 @@ private fun OpenVpnNodePicker(
 
 @Composable
 private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onClick: () -> Unit) {
+    // 排版（2026-11-09 用户要求）：左边节点名字，右边「下载速度 · 延迟数字」。
+    //
+    //   JP家宽03            ≈2.0 MB/s · 3214ms     ← 成功：不再出现「握手」两个字
+    //   KR家宽01                        握手失败     ← 握手失败
+    //   US家宽01                        测速失败     ← 握手成功但一个字节都下不来
+    //   TH机房02                              未测     ← 还没测
+    //
+    // 「测速失败」这一档是必须的：以前握手成功、速度没测出来时显示「握手 3341ms」，
+    // 用户的读感就是「成功了但没速度」，而它其实和一个死节点没有区别。
+    val speedBps = if (n.probeBps > 0) n.probeBps else n.measuredBps
+    val tail: String
+    val tailColor: androidx.compose.ui.graphics.Color
+    when {
+        n.hasProbe && !n.handshakeOk -> {
+            tail = "握手失败"
+            tailColor = MaterialTheme.colorScheme.error
+        }
+        n.hasProbe && n.probeBps > 0 -> {
+            tail = "${NodeSpeedStore.text(n.probeBps)} · ${n.handshakeMs}ms"
+            tailColor = MaterialTheme.colorScheme.onSurface
+        }
+        n.hasProbe -> {
+            tail = "测速失败"
+            tailColor = MaterialTheme.colorScheme.error
+        }
+        // 没测过：有历史实测速度就带上，但明确标「未测」（那是上次连接时量的）。
+        speedBps > 0 -> {
+            tail = "${NodeSpeedStore.text(speedBps)} · 未测"
+            tailColor = MaterialTheme.colorScheme.onSurfaceVariant
+        }
+        else -> {
+            tail = "未测"
+            tailColor = MaterialTheme.colorScheme.onSurfaceVariant
+        }
+    }
     Row(
         Modifier
             .fillMaxWidth()
@@ -1136,12 +1173,12 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
             .padding(start = 8.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // 一行只留编号 + 延迟：IP:port、ISP、共享 都是用户明确说「太长、不要」的东西。
+        // 一行只留名字 + 结果：IP:port、ISP、共享 都是用户明确说「太长、不要」的东西。
         // 需要 IP 时去看引擎日志 —— 每次尝试都会打印带 ip:port 的完整节点名。
         Text(
             slot,
             style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.width(100.dp),
+            modifier = Modifier.weight(1f),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             color = when (n.cls) {
@@ -1150,43 +1187,13 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             },
         )
-        // 速度单独占一列，夹在「名称」和「握手延迟」之间（用户要求的位置）。
-        // 没测到就写「—」，不写「未测」—— 那一列只在测速有结果时有意义。
+        Spacer(Modifier.width(8.dp))
         Text(
-            if (n.measuredBps > 0) NodeSpeedStore.text(n.measuredBps) else "—",
+            tail,
             style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier.width(78.dp),
             maxLines = 1,
             textAlign = TextAlign.End,
-            color = if (n.measuredBps > 0) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.weight(1f))
-        // 只显示真握手结果（用户要的就是「真延迟」），没测过就写「未测」。
-        // 握手失败的标红 —— 那种节点端口是开的、看着有延迟，实际连不上。
-        val probeLabel: String
-        val probeColor: androidx.compose.ui.graphics.Color
-        when {
-            n.hasProbe && n.handshakeOk -> {
-                probeLabel = "握手 ${n.handshakeMs}ms"
-                probeColor = MaterialTheme.colorScheme.onSurface
-            }
-            n.hasProbe -> {
-                probeLabel = "握手失败"
-                probeColor = MaterialTheme.colorScheme.error
-            }
-            // 没测过就写「未测」：不再回退到那个 TCP 时间或节点自报的 ping。
-            // 它们跟能不能握手无关（实测 193ms 的美国节点三个全死），写出来只会
-            // 让人以为「看着挺快却没结果」，分不清到底是没测还是测了不行。
-            else -> {
-                probeLabel = "未测"
-                probeColor = MaterialTheme.colorScheme.onSurfaceVariant
-            }
-        }
-        Text(
-            probeLabel,
-            style = MaterialTheme.typography.labelSmall,
-            color = probeColor,
+            color = tailColor,
         )
         if (selected) {
             Text(

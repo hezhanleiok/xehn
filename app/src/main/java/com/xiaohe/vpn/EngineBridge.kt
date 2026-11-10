@@ -310,6 +310,7 @@ object EngineBridge {
                         measuredBps = speeds[n.optString("id")] ?: 0L,
                         handshakeMs = probes[n.optString("id")]?.ms ?: 0,
                         handshakeOk = probes[n.optString("id")]?.ok ?: false,
+                        probeBps = probes[n.optString("id")]?.bps ?: 0L,
                         hasProbe = probes.containsKey(n.optString("id")),
                     )
                 )
@@ -391,10 +392,16 @@ object EngineBridge {
         val now = System.currentTimeMillis()
         NodeProbeStore.rememberAll(
             context,
-            out.map { it.id to NodeProbeStore.Probe(it.ms, it.ok, now) },
+            out.map { it.id to NodeProbeStore.Probe(it.ms, it.ok, it.bps, now) },
         )
         val ok = out.count { it.ok }
-        note("[ui] 握手测速完成：${out.size} 个节点里 $ok 个能握手（结果已用于排序）")
+        // 「能握手」和「测到速度」分开报：用户要的是「速度 · 延迟」，
+        // 只有握手没有速度的节点在界面上属于失败态，日志里也要能一眼看出来。
+        val withSpeed = out.count { it.ok && it.bps > 0 }
+        note(
+            "[ui] 握手 + 测速完成：${out.size} 个节点里 $ok 个能握手、$withSpeed 个测到速度" +
+                "（结果已用于排序）"
+        )
         return out
     }
 
@@ -544,6 +551,15 @@ data class VpnGateNode(
     val handshakeMs: Int = 0,
     /** 上一次真实握手是否成功（配合 [hasProbe] 使用）。 */
     val handshakeOk: Boolean = false,
+    /**
+     * **这一次探测**测到的下载速度（bps；0 = 握手成功但没测出速度）。
+     *
+     * 与 [measuredBps] 的区别：那是「上一次连上它时」的出口速度（6 小时有效），
+     * 而 [probeBps] 只代表这次「测延迟」的结果。界面把两者混用会出现
+     * 「这次测速失败，却拿着旧速度配新延迟」的行，所以显示优先级是：
+     * probeBps → measuredBps。
+     */
+    val probeBps: Long = 0L,
     /** 是否有过真实握手记录（成功或失败都算）。 */
     val hasProbe: Boolean = false,
 ) {
