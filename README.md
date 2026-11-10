@@ -1,6 +1,6 @@
-# xiaohe VPN · 安卓版（xhwarp-android）
+# XEHN VPN · 安卓版（xehn-android）
 
-把桌面版 `xhwarp` 的 **WARP / Psiphon / VPN Gate 节点** 能力做成一个完整的 Android 客户端：
+把桌面版 `xEHN` 的 **WARP / Psiphon / VPN Gate 节点** 能力做成一个完整的 Android 客户端：
 系统级 VPN（VpnService）、真握手测速、节点选择、DNS 防泄漏、本地代理与局域网共享。
 
 - 仓库：<https://github.com/hezhanleiok/xehn/tree/xehn-android>
