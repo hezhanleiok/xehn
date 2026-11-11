@@ -773,9 +773,9 @@ func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget tim
 			ex.close()
 		})
 	}
-	// 硬超时必须覆盖「第一次 + 重试」两段（budget + 8s），否则重试还没跑完
+	// 硬超时必须覆盖「4 流一次 + 单流兜底一次」（budget + 14s），否则兜底还没跑完
 	// 泵就被关掉了 —— 那会把「其实能测出来」的节点误判成测速失败。
-	timer := time.AfterFunc(budget+12*time.Second, forceClose)
+	timer := time.AfterFunc(budget+16*time.Second, forceClose)
 	ex.startPump(context.Background())
 	defer func() {
 		timer.Stop()
@@ -786,9 +786,15 @@ func measureThroughOpenVPN(client *ovpn.Client, push *ovpn.PushReply, budget tim
 	if bps > 0 {
 		return bps, ""
 	}
-	// 第一次没测出来就再给一次机会：跨境链路偶尔整段丢包，重试一次往往就出数。
-	// 用户明确要求「不能出现握手成功、只有延迟、没有速度」，所以宁可多花几秒。
-	if bps2, note2 := probeDownloadBps(stack, 8*time.Second); bps2 > 0 {
+	// 兜底：**单流 + 10 秒建连超时**再量一次。
+	//
+	// 为什么不能直接判死（2026-11-11 用户指出电脑版同类问题）：
+	// 4 条流各自都要在 5 秒内完成「穿透节点建 TCP + TLS」，慢节点经常只来得及
+	// 立起 1 条，另外 3 条全是 `连接: context deadline exceeded`；总量 0 就被标成
+	// 「测速失败」。可这类节点是**能用但慢**，不是不能用 —— 真机日志里
+	// `jp-219.100.37.62` 握手只花 1381ms 却报「没有收到数据（连接超时）」就是这个。
+	// 单流对慢节点的建连压力小得多，10 秒也够它完成一次握手。
+	if bps2, note2 := probeDownloadBpsSlow(stack, 15*time.Second); bps2 > 0 {
 		return bps2, ""
 	} else if note2 != "" {
 		note = note2
@@ -856,6 +862,33 @@ func probeDownloadBps(stack *ipStack, budget time.Duration) (int64, string) {
 		return stack.tnet.DialContext(dctx, "tcp", addr)
 	}
 	return speedProbeVia(ctx, open, probeSpeedHost, speedProbeStreams, speedProbeWarmup, speedProbeWindow)
+}
+
+// probeDownloadBpsSlow 是「慢节点兜底」：**单流 + 10 秒建连超时**。
+//
+// 只用来判断「这个节点到底能不能过数据」，不用于排序 —— 单流的数值会显著低于
+// 节点真实能力（见 speedprobe.go 顶部说明）。所以它是 4 流失败之后的第二意见：
+// 有数就说明节点能用（哪怕只有几十 KB/s），没数才是真的不能用。
+func probeDownloadBpsSlow(stack *ipStack, budget time.Duration) (int64, string) {
+	if stack == nil || stack.tnet == nil {
+		return 0, "测速网络栈未就绪"
+	}
+	if budget <= 0 {
+		budget = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	ip := lookupProbeSpeedIP()
+	open := func(dctx context.Context) (net.Conn, error) {
+		addr := net.JoinHostPort(probeSpeedHost, "443")
+		if ip != "" {
+			addr = net.JoinHostPort(ip, "443")
+		}
+		return stack.tnet.DialContext(dctx, "tcp", addr)
+	}
+	// 8s 建连 + 1s 预热 + 2s 采样 = 11s，留出 4s 余量给慢节点的首字节。
+	return speedProbeViaTO(ctx, open, probeSpeedHost, 1,
+		time.Second, speedProbeWindow, 8*time.Second)
 }
 
 // diagUnderlaySpeed 量一次「WARP 上游自身」的下载吞吐（每个进程只量一次）。

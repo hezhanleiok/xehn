@@ -53,6 +53,23 @@ func speedProbeVia(
 	streams int,
 	warmup, window time.Duration,
 ) (int64, string) {
+	return speedProbeViaTO(ctx, open, tlsHost, streams, warmup, window, speedProbeConnectTO)
+}
+
+// speedProbeViaTO 是 speedProbeVia 的可调超时版本。
+//
+// connectTO 覆盖「拨号 + TLS 握手」，是**最容易误杀慢节点**的地方：4 条流各自
+// 都要在 5 秒内完成建连，慢节点（尤其 TCP-over-userspace 的出口）经常
+// 只有 1–2 条流来得及，剩下三条直接 `context deadline exceeded`。
+// 需要区分「节点不能用」和「节点慢」时要显式调大它、并把流数降到 1。
+func speedProbeViaTO(
+	ctx context.Context,
+	open speedProbeDialer,
+	tlsHost string,
+	streams int,
+	warmup, window time.Duration,
+	connectTO time.Duration,
+) (int64, string) {
 	if open == nil {
 		return 0, "没有拨号函数"
 	}
@@ -64,6 +81,9 @@ func speedProbeVia(
 	}
 	if window <= 0 {
 		window = speedProbeWindow
+	}
+	if connectTO <= 0 {
+		connectTO = speedProbeConnectTO
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -119,7 +139,7 @@ func speedProbeVia(
 			defer wg.Done()
 			defer done.Add(1)
 
-			dctx, dcancel := context.WithTimeout(runCtx, speedProbeConnectTO)
+			dctx, dcancel := context.WithTimeout(runCtx, connectTO)
 			conn, err := open(dctx)
 			if err != nil {
 				dcancel()
@@ -178,7 +198,7 @@ func speedProbeVia(
 	}
 
 	// 等第一条流开始出数据。全部流都在建连阶段失败时立刻返回，不要白等。
-	readyBy := time.Now().Add(speedProbeConnectTO + 2*time.Second)
+	readyBy := time.Now().Add(connectTO + 2*time.Second)
 	allDone := int32(0)
 	for total.Load() == 0 {
 		if ctx.Err() != nil {
@@ -207,7 +227,7 @@ func speedProbeVia(
 		if allDone == 1 {
 			return 0, "所有测速流都没拿到数据"
 		}
-		return 0, "1 秒内没有收到首字节"
+		return 0, "首字节超时（等待 " + connectTO.String() + "+2s）"
 	}
 
 	// 预热：丢掉慢启动段（时间维度比字节维度稳，慢的流也能被覆盖）。
