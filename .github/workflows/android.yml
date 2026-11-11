@@ -1,0 +1,109 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - xehn-android
+    tags:
+      - "v*"
+    paths:
+      - "app/**"
+      - "engine/**"
+      - "tools/build-engine.ps1"
+      - "tools/build-apk.ps1"
+      - "gradle/**"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go 1.26.8
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.8"
+          cache-dependency-path: engine/go.sum
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Pin a published command-line tools package; avoid the broken latest alias.
+          cmdline-tools-version: "11076708"
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;26.3.11579264
+          accept-android-sdk-licenses: true
+
+      - name: Validate Android NDK installation
+        shell: pwsh
+        run: |
+          $sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+          if (-not $sdk) { throw "Android SDK path was not provided by setup-android" }
+          $ndk = Join-Path $sdk "ndk\26.3.11579264"
+          $platforms = Join-Path $ndk "meta\platforms.json"
+          if (-not (Test-Path $platforms)) {
+            Write-Host "NDK metadata missing; reinstalling the pinned NDK package..."
+            $sdkmanager = Join-Path $sdk "cmdline-tools\latest\bin\sdkmanager.bat"
+            if (-not (Test-Path $sdkmanager)) {
+              $sdkmanager = Get-ChildItem (Join-Path $sdk "cmdline-tools") -Filter "sdkmanager.bat" -Recurse |
+                Select-Object -First 1 -ExpandProperty FullName
+            }
+            if (-not $sdkmanager) { throw "sdkmanager.bat not found under $sdk\cmdline-tools" }
+            & $sdkmanager --install "ndk;26.3.11579264"
+            if ($LASTEXITCODE -ne 0) { throw "sdkmanager failed to install NDK 26.3.11579264" }
+          }
+          if (-not (Test-Path $platforms)) { throw "NDK is incomplete: missing $platforms" }
+          "ANDROID_HOME=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANDROID_SDK_ROOT=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANDROID_NDK_HOME=$ndk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GOTOOLCHAIN=go1.26.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using Android NDK: $ndk"
+
+      - name: Build Go engine AAR
+        shell: pwsh
+        run: ./tools/build-engine.ps1
+
+      - name: Build debug APK
+        shell: pwsh
+        run: ./gradlew.bat --no-daemon --console=plain :app:assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xehn-android-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Xehn Android ${{ github.ref_name }}
+          generate_release_notes: true
+          files: app/build/outputs/apk/debug/*.apk
