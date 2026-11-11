@@ -1197,6 +1197,19 @@ func sampleInPrefix(p netip.Prefix, n int) []netip.Addr {
 
 func itoa(v int) string { return fmt.Sprintf("%d", v) }
 
+// farColo 判断 Cloudflare 边缘是否在「对中国用户来说跨太平洋」的位置。
+//
+// 只用于提示，不影响选路：colo 由运营商到 CF anycast 的路由决定，客户端改不了。
+// 名单取美洲主要枢纽（美西/美东/加拿大/巴西）。
+func farColo(colo string) bool {
+	switch strings.ToUpper(strings.TrimSpace(colo)) {
+	case "LAX", "SJC", "SEA", "PDX", "SMF", "SFO", "LAS", "PHX", "DEN",
+		"DFW", "ORD", "ATL", "MIA", "IAD", "EWR", "JFK", "BOS", "YYZ", "YVR", "GRU":
+		return true
+	}
+	return false
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -1332,6 +1345,15 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 		// 真正能区分线路的是 colo，不是 IP 归属地。
 		if s.Colo != "" {
 			o.report(fmt.Sprintf("出口 %s (%s, colo=%s)", s.ExitIP, s.Country, s.Colo))
+			// 出口 IP 都是 CF 的共享 NAT（这台机器上一直是 104.28.245.200），
+			// 决定速度的是**落到了哪个边缘**。中国网络连 162.159.198.x 有时会被
+			// 路由去美西（LAX/SJC），跨太平洋跑几十兆就是正常水平，不是账号或
+			// 代码退化 —— 直接说出来，省得用户对着「以前能跑几百兆」反复重试。
+			if farColo(s.Colo) {
+				o.report(fmt.Sprintf(
+					"提示：本次落地 %s（跨太平洋），下行通常只有几十兆；"+
+						"想跑满可以换 AWG/WG，或断开重连换一个边缘", s.Colo))
+			}
 		} else {
 			o.report(fmt.Sprintf("出口 %s (%s)", s.ExitIP, s.Country))
 		}

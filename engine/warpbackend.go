@@ -1102,9 +1102,16 @@ func (b *warpBackend) Connect(ctx context.Context, req Request, report func(stri
 		// 只有「基础 WARP 隧道」自己的失败才可能与账号有关：节点出口（OpenVPN /
 		// Psiphon）连不上是节点或网络的事，算到账号头上就会「每次启动都在重新注册」
 		// 一台新设备（真机日志：4 次固定节点失败之后账号被删掉）。
-		accountRelated := !errors.Is(err, errTunEstablish) &&
+		// 反例（2026-11-11 20:02 真机日志，都真实发生过）：
+		//   · wwarp：外层已上线（`外层已就绪`），只是**内层** 20 个端点没握上
+		//     —— 账号是好的，删掉只会让下次又要重新注册；
+		//   · 用户点「断开」触发的 context.Canceled —— 更不该算账号失败。
+		accountRelated := err != nil &&
+			!errors.Is(err, errTunEstablish) &&
+			!errors.Is(err, context.Canceled) &&
 			!strings.Contains(err.Error(), "OpenVPN 节点") &&
-			!strings.Contains(err.Error(), "Psiphon")
+			!strings.Contains(err.Error(), "Psiphon") &&
+			!strings.Contains(err.Error(), "可用端点")
 		b.mu.Lock()
 		if accountRelated {
 			b.accountFailStreak++
