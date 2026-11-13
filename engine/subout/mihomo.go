@@ -16,6 +16,7 @@ package subout
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
@@ -24,7 +25,30 @@ import (
 var (
 	mu      sync.Mutex
 	running bool
+	logOnce sync.Once
+	logf    atomic.Value // func(string)
 )
+
+// SetLogf 注册日志回调（引擎把它接到 UI 日志）。
+//
+// 必须接：mihomo 的错误全靠它的 logger 输出（tun 起不来、节点连不上都不返回 error，
+// ApplyConfig 是 void）。没有这一层，用户看到的就是「日志全绿、网络不通」。
+func SetLogf(f func(string)) { logf.Store(f) }
+
+func startLogPump() {
+	logOnce.Do(func() {
+		sub := log.Subscribe()
+		go func() {
+			for ev := range sub {
+				f, _ := logf.Load().(func(string))
+				if f == nil {
+					continue
+				}
+				f("[mihomo] " + ev.Payload)
+			}
+		}()
+	})
+}
 
 // Start 用一段完整的 mihomo 配置启动内核；重复调用等于热重载。
 //
@@ -33,8 +57,10 @@ var (
 func Start(yamlText string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	// mihomo 默认 INFO 会把每个连接都打出来，Android 日志会被刷爆。
-	log.SetLevel(log.WARNING)
+	// 订阅出口还在排障期：INFO 才能看到 tun 启动、节点拨号、DNS 这些关键行。
+	// 接进 UI 日志后由用户按需查看，不会刷屏。
+	startLogPump()
+	log.SetLevel(log.INFO)
 	cfg, err := executor.ParseWithBytes([]byte(yamlText))
 	if err != nil {
 		return fmt.Errorf("配置解析失败: %w", err)

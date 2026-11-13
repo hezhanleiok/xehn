@@ -138,6 +138,15 @@ class WarpVpnService : VpnService() {
          */
         private const val OPENVPN_TUN_LOCAL = "192.0.2.111"
 
+        /**
+         * 订阅出口时系统 tun 的地址：必须等于 mihomo 的 tun 本地地址
+         * （`dns.FakeIPRange` 默认 198.18.0.1/16，mihomo 取 /30 → 198.18.0.1/30）。
+         *
+         * 地址不一致时 gvisor 栈不认这张网卡，包被静默丢弃：现象是
+         * 「已连接、出口 IP 获取中、上下行 0 B/s」。
+         */
+        private const val SUB_TUN_V4 = "198.18.0.1"
+
         /** 看门狗多久看一次快照。 */
         private const val WATCHDOG_TICK_MS = 5_000L
         /** 自动重连的统计窗口与上限：5 分钟内最多 3 次。 */
@@ -1185,11 +1194,19 @@ class WarpVpnService : VpnService() {
         // 每次都一样的是 v6 地址 `fd00:1:...`，所以它最容易撞；v4 的 172.16.0.2
         // **不能换**（引擎的 netstack 设备地址固定是它，换了回程包在内核里没有归属，
         // 等于连上就断），能换的只有「要不要 v6」+「等一会儿再试」。
+        // 订阅出口：tun 地址必须和内核期望的一致。
+        //
+        // mihomo 的 tun 本地地址取自 dns.FakeIPRange（默认 198.18.0.1/16，取 /30），
+        // 也就是 **198.18.0.1/30**；而普通模式的 172.16.0.2 是 WARP netstack 的设备
+        // 地址。两者不一致时 gvisor 栈不认这个网卡，包会被静默丢弃 ——
+        // 现象正是用户报的「已连接、出口 IP 获取中、上下行 0 B/s」。
+        val tunV4 = if (s.subExit) SUB_TUN_V4 else TUN_ADDR_V4
+        val tunBits = if (s.subExit) 30 else 32
         val variants = buildList {
-            add(TunVariant(TUN_ADDR_V4, true, "默认地址 + v6"))
+            add(TunVariant(tunV4, true, if (s.subExit) "订阅出口地址 + v6" else "默认地址 + v6"))
             if (!s.ipv6) {
-                add(TunVariant(TUN_ADDR_V4, false, "不带 v6"))
-                add(TunVariant(TUN_ADDR_V4, false, "不带 v6，等旧接口回收后重试"))
+                add(TunVariant(tunV4, false, "不带 v6"))
+                add(TunVariant(tunV4, false, "不带 v6，等旧接口回收后重试"))
             }
         }
         var last: Throwable? = null
@@ -1204,7 +1221,7 @@ class WarpVpnService : VpnService() {
                     .setSession(getString(R.string.app_name))
                     .setMtu(mtu)
                     .setBlocking(true)
-                vpnStep("addAddress(${v.addr}/32)") { b.addAddress(v.addr, 32) }
+                vpnStep("addAddress(${v.addr}/$tunBits)") { b.addAddress(v.addr, tunBits) }
 
                 // 路由策略：VpnService 只有一种表达方式 —— **加了路由的网段才进 tun**，
                 // 没加的直接走物理网卡。三种规则模式就是三份路由集合。

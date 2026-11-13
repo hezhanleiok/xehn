@@ -506,6 +506,8 @@ func (e *Engine) StartSubExit(proto string, tunFD int, country, customURL, iface
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 130*time.Second)
 	defer cancel()
+	// 内核自己的日志接到 UI：tun 起不来、节点连不上都不返回 error，只能靠日志。
+	subout.SetLogf(func(s string) { e.sess.logf("%s", s) })
 	err := wb.StartSubExit(ctx, proto, tunFD, country, customURL, iface,
 		func(s string) { e.sess.logf("[subout] %s", s) })
 	if err != nil {
