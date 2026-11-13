@@ -1712,6 +1712,19 @@ proxies:
 | `tun.auto-route` / `auto-detect-interface` | `false` | 内核去改系统路由，和 VpnService 的路由表打架 |
 | `interface-name` | 物理网卡（wlan0/rmnet_data0） | 内核的 DNS/直连被自己的 VPN 抓回去 → 死循环 |
 
+### 36.3b 真机踩到：`interface-name` 取到了 `tun0`
+
+第一次连接日志是 `物理网卡 = wlan0`（正常），第二次变成 **`tun0`** —— 因为
+`ConnectivityManager.activeNetwork` 在 VPN 建起来之后就是**我们自己的 tun**。
+把它当 `interface-name` 交给 mihomo，内核所有出口 socket 会写回自己的 tun：
+表现正是用户报的「状态栏有 VPN 图标、首页显示未连接、所有网站打不开」。
+
+修法：遍历 `allNetworks`，**排除 `TRANSPORT_VPN`**，优先 Wi-Fi、其次蜂窝。
+
+同一轮还修了「点了按钮没反应」：订阅出口不走 `Engine.connect`，会话状态一直停在
+idle，首页因此永远显示「未连接」。新增 `MarkSubExitConnected/Stopped`，
+在启动成功/关闭时显式转 `connecting → connected` 与 `stopping → idle`。
+
 ### 36.4 体积
 
 mihomo 全家桶（含 sing-tun、sing、quic、bbolt）让 `libgojni.so` 从 20 MB 涨到 71 MB。

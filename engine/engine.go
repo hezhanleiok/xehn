@@ -521,6 +521,28 @@ func (e *Engine) StopSubExit() {
 	}
 }
 
+// MarkSubExitConnected 把会话状态置成「已连接」。
+//
+// 订阅出口不经过 Connect（数据面由 mihomo 接管），如果不显式转状态，首页会一直
+// 停在「未连接」—— 用户看到的就是「点了按钮没反应，只有日志在动」。
+func (e *Engine) MarkSubExitConnected(country string) {
+	switch e.sess.snapshot().State {
+	case StateIdle, StateError:
+		_ = e.sess.transition(StateConnecting, nil)
+	}
+	_ = e.sess.transition(StateConnected, nil)
+	e.sess.setExit("sub", "订阅出口", "", country)
+}
+
+// MarkSubExitStopped 把会话状态收回 idle（关闭订阅出口 / 启动失败时调用）。
+func (e *Engine) MarkSubExitStopped() {
+	switch e.sess.snapshot().State {
+	case StateConnected, StateConnecting, StateError:
+		_ = e.sess.transition(StateStopping, nil)
+		_ = e.sess.transition(StateIdle, nil)
+	}
+}
+
 // RefreshCNRoutes 立即拉一次大陆路由表（**阻塞**，调用方要放到后台线程）。
 //
 // 手动刷新用它。注意：在「仅代理」模式下这个请求走本机网络，在 VPN 模式下它会

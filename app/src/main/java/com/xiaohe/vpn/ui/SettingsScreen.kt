@@ -1216,18 +1216,18 @@ private fun OpenVpnNodePicker(
  * 节点多的排前面 —— 用户更可能在这里找到「又快又稳」的节点。
  */
 private val SUB_COUNTRIES = listOf(
-    "US" to "美国",
-    "JP" to "日本",
-    "SG" to "新加坡",
-    "HK" to "香港",
-    "KR" to "韩国",
-    "TW" to "台湾",
-    "NL" to "荷兰",
-    "DE" to "德国",
-    "GB" to "英国",
-    "FR" to "法国",
-    "CA" to "加拿大",
-    "AU" to "澳大利亚",
+    "US" to "🇺🇸 美国",
+    "JP" to "🇯🇵 日本",
+    "SG" to "🇸🇬 新加坡",
+    "HK" to "🇭🇰 香港",
+    "KR" to "🇰🇷 韩国",
+    "TW" to "🇹🇼 台湾",
+    "NL" to "🇳🇱 荷兰",
+    "DE" to "🇩🇪 德国",
+    "GB" to "🇬🇧 英国",
+    "FR" to "🇫🇷 法国",
+    "CA" to "🇨🇦 加拿大",
+    "AU" to "🇦🇺 澳大利亚",
 )
 
 @Composable

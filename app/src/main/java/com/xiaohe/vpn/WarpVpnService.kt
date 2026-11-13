@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.content.pm.ServiceInfo
 import android.net.IpPrefix
 import android.net.VpnService
@@ -237,7 +238,11 @@ class WarpVpnService : VpnService() {
     private fun closeTun() {
         // 订阅出口：内核握着 tun fd，必须先停内核再关 fd
         // （sing-tun 对着已关闭的 fd 读写会刷一串 "use of closed file"）。
-        EngineBridge.peek()?.let { e -> runCatching { e.stopSubExit() } }
+        EngineBridge.peek()?.let { e ->
+            runCatching { e.stopSubExit() }
+            // 会话状态也要收回去，否则断开后首页还显示「已连接」。
+            runCatching { e.markSubExitStopped() }
+        }
         val p = tunPfd ?: return
         tunPfd = null
         tunFd = -1
@@ -474,6 +479,7 @@ class WarpVpnService : VpnService() {
                     EngineBridge.note("[subout] $r")
                     if (!r.startsWith("订阅出口已启动")) {
                         runCatching { e.stopSubExit() }
+                        runCatching { e.markSubExitStopped() }
                         closeTun()
                         e.setVPNState(false)
                         EngineBridge.refresh(e)
@@ -481,6 +487,9 @@ class WarpVpnService : VpnService() {
                         stopSelf()
                         return@launch
                     }
+                    // 数据面由 mihomo 接管，不经过 Engine.connect，所以要显式把会话
+                    // 置成「已连接」—— 否则首页一直停在「未连接」，看起来像按钮没反应。
+                    runCatching { e.markSubExitConnected(s.subCountry) }
                     e.setVPNState(true)
                     EngineBridge.refresh(e)
                 } catch (t: Throwable) {
@@ -1514,12 +1523,32 @@ class WarpVpnService : VpnService() {
         return dns
     }
 
-    /** 当前物理网络的网卡名（wlan0 / rmnet_data0 …）；拿不到返回空串。 */
+    /**
+     * 当前**物理网络**的网卡名（wlan0 / rmnet_data0 …）；拿不到返回空串。
+     *
+     * 不能用 `activeNetwork`：系统 VPN 建起来之后它就是我们自己的 tun（日志里
+     * 第二次连接拿到的是 `tun0`），把它交给 mihomo 当 interface-name，内核的
+     * 所有出口 socket 会直接写回自己的 tun —— 表现就是「VPN 图标亮着、所有网站
+     * 打不开」。所以这里遍历全部网络，**排除 VPN 传输类型**，优先 Wi-Fi、其次蜂窝。
+     */
     private fun activeInterfaceName(): String = runCatching {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             ?: return@runCatching ""
-        val nw = cm.activeNetwork ?: return@runCatching ""
-        cm.getLinkProperties(nw)?.interfaceName.orEmpty()
+        val physical = cm.allNetworks
+            .mapNotNull { n ->
+                val caps = cm.getNetworkCapabilities(n) ?: return@mapNotNull null
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return@mapNotNull null
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@mapNotNull null
+                val score = when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 2
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 1
+                    else -> 0
+                }
+                cm.getLinkProperties(n)?.interfaceName?.takeIf { it.isNotBlank() }?.let { it to score }
+            }
+            .maxByOrNull { it.second }
+            ?.first
+        physical ?: cm.getLinkProperties(cm.activeNetwork ?: return@runCatching "")?.interfaceName.orEmpty()
     }.getOrDefault("")
 
     /** 只把 IP 字面量转成地址，主机名一律返回 null（避免触发一次真实解析）。 */
