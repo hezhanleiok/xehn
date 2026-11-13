@@ -115,7 +115,11 @@ func BuildConfig(o Options) (string, error) {
 			// 路由由 VpnService 管，内核不要碰系统路由表。
 			"auto-route":            false,
 			"auto-detect-interface": false,
-			"dns-hijack":            []string{"any:53"},
+			// **绝对不要 dns-hijack**：内核自己的 DNS 查询走系统路由 → 进 tun
+			// → 又被 hijack 抓回自己 → `dial udp 198.18.0.1 -> 1.1.1.1:53:
+			// i/o timeout`（2026-11-13 真机，39 条 [TCP] 全是 dns resolve failed）。
+			// 关掉之后 UDP:53 按规则走代理，由节点侧解析（出口与解析器同国，
+			// 也不会有 DNS 泄漏）。
 		},
 		"proxies": proxies,
 		// 用 url-test 而不是 select：订阅里第一条极可能是死节点，select 会把它钉死，
@@ -131,20 +135,16 @@ func BuildConfig(o Options) (string, error) {
 			"proxies":   names,
 		}},
 		"rules": []string{"MATCH," + group},
+		// **内核 DNS 必须关**：见上面 dns-hijack 的说明。节点域名已经在上层
+		// 用宿主解析成 IP，内核不需要任何 DNS；应用流量的域名交给节点侧解析。
 		"dns": map[string]any{
-			"enable":        true,
-			"ipv6":          false,
-			// tun2socks 把 UDP:53 全部转到这个监听：内核按域名解析，
-			// 节点域名也在这里解析（经 WARP 上游，不走系统路由）。
-			"listen":        fmt.Sprintf("127.0.0.1:%d", o.DNSPort),
-			"enhanced-mode": "redir-host",
-			"nameserver":    []string{"1.1.1.1", "8.8.8.8"},
+			"enable": false,
+			"ipv6":   false,
 		},
 	}
-	// 绑物理网卡：mihomo 自己发起的 DNS / 直连必须绕开 tun。
-	if iface := strings.TrimSpace(o.Interface); iface != "" {
-		cfg["interface-name"] = iface
-	}
+	// **不绑 interface-name**：内核的所有出站都先到本地 SOCKS 桥（127.0.0.1），
+	// 绑到 wlan0 会让连回环的那一步直接失败（2026-11-13 真机：所有节点
+	// health check 全 65535）。内核不再需要任何直连，也就不需要绑网卡。
 
 	buf, err := yaml.Marshal(cfg)
 	if err != nil {

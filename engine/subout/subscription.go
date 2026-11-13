@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -36,6 +37,78 @@ var supportedTypes = map[string]bool{
 	"wireguard": true,
 	"socks5":    true,
 	"http":      true,
+}
+
+// ResolveNodeServers 把节点 `server` 里的域名换成 IP（宿主解析）。
+//
+// 为什么必须做（2026-11-13 真机日志）：
+//
+//	[mihomo] [TCP] dial 订阅出口 ... error: dns resolve failed:
+//	  read udp 198.18.0.1:46493->1.1.1.1:53: i/o timeout
+//
+// mihomo 解析节点域名时会查 1.1.1.1，而它的查询走系统路由 → 进 tun → 又被自己
+// 接住，全部超时 —— 表现就是 148 个节点 health check 一律 65535、所有连接
+// `dns resolve failed`。换成 IP 之后内核不需要任何 DNS。
+//
+// TLS 的 SNI / WebSocket 的 Host 用原域名补回（如果订阅没显式配置），
+// 否则证书校验和 CDN 路由都会错。解析不出来的节点直接丢掉：留着只会拖慢
+// health check，反正也连不上。
+func ResolveNodeServers(proxies []map[string]any) (kept []map[string]any, resolved, dropped int) {
+	kept = make([]map[string]any, 0, len(proxies))
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	for _, p := range proxies {
+		server, _ := p["server"].(string)
+		if strings.TrimSpace(server) == "" {
+			dropped++
+			continue
+		}
+		if net.ParseIP(server) != nil {
+			kept = append(kept, p)
+			continue
+		}
+		ips, err := net.DefaultResolver.LookupHost(ctx, server)
+		if err != nil || len(ips) == 0 {
+			dropped++
+			continue
+		}
+		p["server"] = ips[0]
+		patchTLSHost(p, server)
+		kept = append(kept, p)
+		resolved++
+	}
+	return kept, resolved, dropped
+}
+
+// patchTLSHost 把原域名补到 SNI / Host 字段（只在订阅没显式配置时）。
+func patchTLSHost(p map[string]any, host string) {
+	typ, _ := p["type"].(string)
+	typ = strings.ToLower(typ)
+	// sni / servername 二选一：不同协议/版本认的字段不同，两个都补最省事。
+	if s, _ := p["servername"].(string); strings.TrimSpace(s) == "" {
+		if s2, _ := p["sni"].(string); strings.TrimSpace(s2) == "" {
+			switch typ {
+			case "trojan", "hysteria2", "tuic":
+				p["sni"] = host
+			case "vless", "vmess":
+				if on, _ := p["tls"].(bool); on {
+					p["servername"] = host
+				}
+			}
+		}
+	}
+	// WebSocket 的 Host 头：很多节点的域名绑定靠它。
+	if ws, ok := p["ws-opts"].(map[string]any); ok {
+		hdr, _ := ws["headers"].(map[string]any)
+		if hdr == nil {
+			hdr = map[string]any{}
+		}
+		if v, _ := hdr["Host"].(string); strings.TrimSpace(v) == "" {
+			hdr["Host"] = host
+			ws["headers"] = hdr
+			p["ws-opts"] = ws
+		}
+	}
 }
 
 // CountryURL 返回某个国家码的分片订阅地址。

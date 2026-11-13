@@ -1163,6 +1163,14 @@ func (b *warpBackend) StartSubExit(
 	}
 	report("订阅出口：" + note)
 
+	// 节点域名 → IP（宿主解析）：内核解析不了任何域名（见 ResolveNodeServers 的说明）。
+	var resolved, dropped int
+	nodes, resolved, dropped = subout.ResolveNodeServers(nodes)
+	if len(nodes) == 0 {
+		return fail(errors.New("节点域名全部解析失败（宿主 DNS 不通？）"))
+	}
+	report(fmt.Sprintf("订阅出口：节点域名解析完成（%d 个转 IP，%d 个解析失败已丢弃）", resolved, dropped))
+
 	mixedPort := freeLoopbackPort()
 	dnsPort := freeLoopbackPort()
 	if mixedPort == 0 || dnsPort == 0 {
@@ -1185,6 +1193,31 @@ func (b *warpBackend) StartSubExit(
 	}
 	// 等 mixed-port 真正开始监听，否则头几个连接会被拒。
 	time.Sleep(400 * time.Millisecond)
+
+	// **端到端验证**：只有真的能出网，才允许界面显示「已连接」。
+	//
+	// 用户的反馈很明确：「显示已连接就表示可以上网」。之前是先置已连接、再让内核
+	// 自己慢慢测节点，于是出现「已连接 + 出口 IP 获取中 + 上下行 0」。
+	// 这里从 Go 侧直接拨 1.1.1.1:80：这个 socket 没被 protect，会被 VpnService
+	// 抓进 tun → 内核按 MATCH 走订阅节点 → 真出网。走通才说明整条链可用。
+	report("订阅出口：验证能否出网（最多等 20 秒）…")
+	ok := false
+	for i := 0; i < 10; i++ {
+		c, derr := net.DialTimeout("tcp", "1.1.1.1:80", 3*time.Second)
+		if derr == nil {
+			_ = c.Close()
+			ok = true
+			break
+		}
+		if upCtx.Err() != nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !ok {
+		return fail(errors.New("节点已加载但无法出网（该国家的节点暂时都不可用），已取消连接"))
+	}
+	report("订阅出口：出网验证通过")
 
 	b.mu.Lock()
 	b.subExit = under
