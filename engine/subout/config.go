@@ -148,11 +148,11 @@ func BuildConfig(o Options) (string, error) {
 			"ipv6":          false,
 			"listen":        "0.0.0.0:0",
 			"enhanced-mode": "redir-host",
-			"nameserver":    []string{"tcp://1.1.1.1", "tcp://8.8.8.8"},
-			// 隐私域名用 DoH（同样走 TCP），一般用不到，留作兜底。
-			"fallback":           []string{"https://1.1.1.1/dns-query"},
-			"fallback-filter":    map[string]any{"geoip": true, "geoip-code": "CN"},
-			"default-nameserver": []string{"tcp://1.1.1.1"},
+			"nameserver": []string{"tcp://1.1.1.1", "tcp://8.8.8.8"},
+			// **不要 fallback / fallback-filter**：`fallback-filter.geoip: true`
+			// 会要求加载 GeoIP 数据库，而 mihomo 在 tun 起来之前就去下载
+			// `geoip.metadb`，那条请求走 UDP DNS → 必然超时 →
+			// 整个配置解析失败、连接直接失败（真机 2026-11-13 21:51）。
 		},
 	}
 	// **不绑 interface-name**：内核的所有出站都先到本地 SOCKS 桥（127.0.0.1），
