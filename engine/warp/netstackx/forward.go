@@ -12,7 +12,9 @@ import (
 	"strconv"
 
 	"github.com/amnezia-vpn/amneziawg-go/tun"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -36,13 +38,19 @@ func CreateNetTUNForwarding(
 	if !ok {
 		return dev, tnet, nil
 	}
-	// **tun2socks 的命门**：注入的包目的地址是任意外网 IP，而 gVisor 默认只接受
-	// 「发给自己」的包，其余直接丢 —— 表现就是「连上了、内核日志一条 [TCP] 都没有、
-	// 上下行 0 B/s」（2026-11-13 真机现象）。
+	// **tun2socks 的命门（三件套，缺一个就是「连上了、0 流量」）**：
 	//
-	// 这两行与 sing-tun 的 gvisor 栈完全一致（`stack_gvisor.go` 的
-	// SetSpoofing / SetPromiscuousMode）：前者允许 endpoint 用非本机地址做源/目的，
-	// 后者让 NIC 不做地址过滤。
+	//  1. 默认路由表：wireguard 的 netstack 只给「本机地址」加了路由，注入的包
+	//     目的地址是任意外网 IP，查不到路由 → IP 层直接丢，一个字节都到不了
+	//     forwarder。sing-tun 的 `NewGVisorStackWithOptions` 第一件事就是
+	//     SetRouteTable(0.0.0.0/0 + ::/0)，我们漏了这一步（2026-11-13 真机：
+	//     mihomo 起来了、mixed-port 在听、日志里 [TCP] 一条都没有）。
+	//  2. Spoofing：允许 endpoint 用非本机地址做源/目的。
+	//  3. PromiscuousMode：NIC 不做地址过滤。
+	nt.stack.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: 1},
+		{Destination: header.IPv6EmptySubnet, NIC: 1},
+	})
 	nt.stack.SetSpoofing(1, true)
 	nt.stack.SetPromiscuousMode(1, true)
 	if h.DialTCP != nil {

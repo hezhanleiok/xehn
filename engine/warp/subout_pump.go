@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/tun"
 	"golang.org/x/net/proxy"
@@ -26,13 +28,19 @@ type SubOutExit struct {
 	file packetStream
 	dev  tun.Device
 	once sync.Once
+	// 双向包计数（诊断用，见 start 里的定时上报）。
+	rxPkts atomic.Int64
+	txPkts atomic.Int64
 }
 
 // StartSubOutPump 把 tun fd 接到 mihomo 的 mixed-port（socksAddr）上。
 //
 // dnsAddr 是 mihomo 的 DNS 监听（127.0.0.1:port）：tun2socks 把 UDP:53 全部
 // 转给它，其余 UDP 直接拒绝（QUIC 会自动回退 TCP）。
-func StartSubOutPump(fd int, socksAddr, dnsAddr string) (*SubOutExit, error) {
+func StartSubOutPump(fd int, socksAddr, dnsAddr string, report func(string)) (*SubOutExit, error) {
+	if report == nil {
+		report = func(string) {}
+	}
 	if fd <= 0 {
 		return nil, errors.New("没有 tun fd")
 	}
@@ -76,6 +84,15 @@ func StartSubOutPump(fd int, socksAddr, dnsAddr string) (*SubOutExit, error) {
 
 	e := &SubOutExit{file: newPacketFile(fd), dev: dev}
 	e.start()
+	// 前 60 秒每 5 秒报一次计数：这是区分「tun 上根本没包」和「栈把包丢了」的
+	// 唯一办法 —— 已经靠猜修过太多次，不能再没有可观测性。
+	go func() {
+		for i := 0; i < 12; i++ {
+			time.Sleep(5 * time.Second)
+			report(fmt.Sprintf("tun2socks：tun→栈 %d 包，栈→tun %d 包",
+				e.rxPkts.Load(), e.txPkts.Load()))
+		}
+	}()
 	return e, nil
 }
 
@@ -86,6 +103,7 @@ func (e *SubOutExit) start() {
 		for {
 			n, err := e.file.Read(buf)
 			if n > 0 {
+				e.rxPkts.Add(1)
 				_, _ = e.dev.Write([][]byte{buf[:n]}, 0)
 			}
 			if err != nil {
@@ -101,6 +119,7 @@ func (e *SubOutExit) start() {
 		for {
 			n, err := e.dev.Read(bufs, sizes, 0)
 			if n > 0 {
+				e.txPkts.Add(int64(n))
 				for i := 0; i < n; i++ {
 					_, _ = e.file.Write(bufs[i][:sizes[i]])
 				}

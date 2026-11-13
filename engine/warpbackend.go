@@ -1173,6 +1173,7 @@ func (b *warpBackend) StartSubExit(
 		tunFD,
 		fmt.Sprintf("127.0.0.1:%d", mixedPort),
 		fmt.Sprintf("127.0.0.1:%d", dnsPort),
+		report,
 	)
 	if err != nil {
 		subout.Stop()
