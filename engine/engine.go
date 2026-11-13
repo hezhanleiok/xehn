@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xhwarp/android-engine/subout"
 	"github.com/xhwarp/android-engine/warp"
 )
 
@@ -465,6 +466,58 @@ func (e *Engine) RefreshVPNGateNodes() string {
 func (e *Engine) SetSocksListen(addr string) {
 	if wb := e.warpBackendOf(); wb != nil {
 		wb.SetSocksListen(addr)
+	}
+}
+
+// SetSubExit 开关「订阅出口」。
+//
+// 打开时传入一段完整的 mihomo 配置（proxies + proxy-groups + tun.file-descriptor），
+// 内核按它接管 tun、把流量交给订阅节点；关闭时停掉内核。
+//
+// 与 OpenVPN 出口同级：前面选 WG/AWG/MASQUE 都成立，WARP 通过本地 SOCKS5 桥
+// 作为 dialer-proxy 参与（见 subout 包的说明）。
+func (e *Engine) SetSubExit(enabled bool, yamlText string) error {
+	if !enabled {
+		subout.Stop()
+		return nil
+	}
+	if err := subout.Start(yamlText); err != nil {
+		e.sess.logf("[subout] 启动订阅出口失败: %v", err)
+		return err
+	}
+	e.sess.logf("[subout] 订阅出口已启动")
+	return nil
+}
+
+// SubExitRunning 报告订阅出口（内嵌 mihomo）当前是否在运行。
+func (e *Engine) SubExitRunning() bool {
+	return subout.Running()
+}
+
+// StartSubExit 打开订阅出口（BLOCKING，UI 放后台线程）。
+//
+// 参数：当前协议（wg/awg/masque…）、系统 tun fd、国家码（JP/US…）、自定义订阅
+// （空 = 用内置分片）、物理网卡名（wlan0/rmnet_data0，用于绕开 VPN 路由）。
+// 返回值直接给界面看（成功/失败原因）。
+func (e *Engine) StartSubExit(proto string, tunFD int, country, customURL, iface string) string {
+	wb := e.warpBackendOf()
+	if wb == nil {
+		return "引擎未就绪"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 130*time.Second)
+	defer cancel()
+	err := wb.StartSubExit(ctx, proto, tunFD, country, customURL, iface,
+		func(s string) { e.sess.logf("[subout] %s", s) })
+	if err != nil {
+		return "订阅出口失败：" + err.Error()
+	}
+	return "订阅出口已启动"
+}
+
+// StopSubExit 关闭订阅出口。
+func (e *Engine) StopSubExit() {
+	if wb := e.warpBackendOf(); wb != nil {
+		wb.StopSubExit()
 	}
 }
 

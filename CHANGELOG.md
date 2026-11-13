@@ -5,6 +5,16 @@
 
 ---
 
+## 0.2.41
+
+- **新增第三种出口「订阅出口」**（内嵌 mihomo 内核）：`系统 tun → mihomo → 订阅节点 →
+  本地 SOCKS 桥 → WARP`，与 OpenVPN 出口同构；前面选 WG/AWG/MASQUE 都成立
+  （wwarp / masque-x2 嵌套场景不支持）。
+- 内置按国家分片的免费订阅（`Au1rxx/free-vpn-subscriptions` 的 `by-country/clash-<CC>.yaml`，
+  每小时更新），另加自定义订阅输入框；设置页只选国家，不展示节点列表。
+- 为控制体积改打 **arm64 + `-ldflags=-w -s`**：APK 87.6 MB（mihomo 让 so 涨到 71 MB）。
+- 待办：同国多节点测速选最快、失效自动切换（当前取订阅第一个）。
+
 ## 0.2.40
 
 - **不再把「内层选点失败」和「用户主动取消」算进账号失败**：wwarp 外层已就绪、只有内层

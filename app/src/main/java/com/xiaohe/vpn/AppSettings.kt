@@ -74,6 +74,18 @@ data class AppSettings(
     val openvpnNodeId: String = "",
     /** 固定节点的显示名（只用于日志与界面）。 */
     val openvpnNodeLabel: String = "",
+    /**
+     * 订阅出口：走订阅里的节点（VLESS/Trojan/HY2…），由内嵌 mihomo 处理。
+     *
+     * 与 OpenVPN 出口同级：前面选 WG/AWG/MASQUE 都成立 —— 数据路径是
+     * `WARP → 本地 SOCKS 桥 → 订阅节点`，与电脑版 openvpn + dialer-proxy 同构。
+     * 与 [psiphon] / [openvpn] 互斥（都是最终出口，同时开会抢 tun）。
+     */
+    val subExit: Boolean = false,
+    /** 订阅出口的国家码（ISO-2，JP/US/SG…）。内置订阅按国家分片拉取。 */
+    val subCountry: String = "JP",
+    /** 自定义订阅地址（空 = 用内置的国家分片）。 */
+    val subCustomURL: String = "",
     val ipv6: Boolean = false,
     val mtu: Int = 1280,
     // 默认只下发 Cloudflare：223.5.5.5 之类的国内解析器会被 leak 测试判成
@@ -145,6 +157,9 @@ object SettingsStore {
             openvpnCountry = p.getString("openvpnCountry", d.openvpnCountry) ?: d.openvpnCountry,
             openvpnNodeId = p.getString("openvpnNodeId", d.openvpnNodeId) ?: d.openvpnNodeId,
             openvpnNodeLabel = p.getString("openvpnNodeLabel", d.openvpnNodeLabel) ?: d.openvpnNodeLabel,
+            subExit = p.getBoolean("subExit", d.subExit),
+            subCountry = p.getString("subCountry", d.subCountry) ?: d.subCountry,
+            subCustomURL = p.getString("subCustomURL", d.subCustomURL) ?: d.subCustomURL,
             mode = p.getString("mode", d.mode) ?: d.mode,
             proxyPort = p.getInt("proxyPort", d.proxyPort),
             proxyLan = p.getBoolean("proxyLan", d.proxyLan),
@@ -178,6 +193,9 @@ object SettingsStore {
             putString("openvpnCountry", s.openvpnCountry)
             putString("openvpnNodeId", s.openvpnNodeId)
             putString("openvpnNodeLabel", s.openvpnNodeLabel)
+            putBoolean("subExit", s.subExit)
+            putString("subCountry", s.subCountry)
+            putString("subCustomURL", s.subCustomURL)
             putString("mode", s.mode)
             putInt("proxyPort", s.proxyPort)
             putBoolean("proxyLan", s.proxyLan)

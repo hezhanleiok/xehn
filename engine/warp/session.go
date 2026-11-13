@@ -3,8 +3,11 @@ package warp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"strconv"
 	"time"
@@ -454,6 +457,61 @@ func (s *Session) startSocksAt(
 		}
 	}()
 	return true
+}
+
+// StartInternalSocks 在这条会话上起一个**内部** SOCKS5（只绑回环）。
+//
+// 订阅出口用它当 mihomo 的 dialer-proxy：订阅节点的出站连接先到这个 SOCKS，
+// 再由本引擎的 netstack 送进 WARP —— 这就是「WARP 前置 → 订阅节点」。
+// 与 Psiphon 上游那条监听同性质（内部，不暴露给界面）。
+func (s *Session) StartInternalSocks(ctx context.Context) (string, error) {
+	if s == nil || s.tn == nil || s.tn.stack() == nil {
+		return "", errors.New("这条会话没有 netstack，不能作为订阅出口的上游")
+	}
+	if !s.startSocksAt(ctx, "127.0.0.1:0", func(string) {}, nil, true) {
+		return "", errors.New("本地 SOCKS5 监听失败（端口不可用）")
+	}
+	if s.ln == nil {
+		return "", errors.New("本地 SOCKS5 未就绪")
+	}
+	return s.ln.Addr().String(), nil
+}
+
+// HTTPGet 经这条会话的 netstack 拉一个 URL。
+//
+// 订阅（GitHub raw）在国内经常直连不通，必须借 WARP 这条隧道去拉；
+// 不能复用 ipStack.client —— 那个 Transport 会把地址改写成出口验证端点。
+func (s *Session) HTTPGet(ctx context.Context, url string, max int64) ([]byte, error) {
+	if s == nil || s.tn == nil {
+		return nil, errors.New("会话未就绪")
+	}
+	st := s.tn.stack()
+	if st == nil || st.tnet == nil {
+		return nil, errors.New("这条会话没有 netstack")
+	}
+	if max <= 0 {
+		max = 8 << 20
+	}
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext:       st.tnet.DialContext,
+	}
+	defer tr.CloseIdleConnections()
+	cli := &http.Client{Transport: tr, Timeout: 40 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "xehn-sub/1")
+	resp, err := cli.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, max))
 }
 
 // socksPath 选出这条会话的本地 SOCKS 拨号路径（见 socks.go 的 socksPath）。

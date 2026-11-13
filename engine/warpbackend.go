@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/xhwarp/android-engine/subout"
 	"github.com/xhwarp/android-engine/warp"
 )
 
@@ -77,6 +78,10 @@ type warpBackend struct {
 	lastGood map[string]string
 	// VPN Gate 节点缓存（OpenVPN 出口的候选池）。懒加载，落盘在 workDir。
 	vpnGate *warp.VPNGateCache
+
+	// subExit 是订阅出口的 WARP 上游（netstack 模式 + 内部 SOCKS5）。
+	// mihomo 内核本身在 subout 包里，这里只持有它的上游，关闭时一起收掉。
+	subExit *warp.Session
 }
 
 // vpnGatePath 是 VPN Gate 节点缓存文件。
@@ -1072,6 +1077,107 @@ func (b *warpBackend) connectPsiphon(
 		Endpoint: sess.Endpoint,
 		Egress:   "psiphon",
 	}, nil
+}
+
+// StartSubExit 启动「订阅出口」：
+//
+//	WARP(netstack) → 内部 SOCKS5 → mihomo 内核 → 订阅节点 → 外网
+//
+// 与 OpenVPN 出口同构（那边是 WARP → openvpn 节点），只是最后一跳换成了订阅里的
+// VLESS/Trojan/HY2 等协议，交给内嵌的 mihomo 处理。
+//
+// BLOCKING：建上游 + 拉订阅十几秒，UI 必须放后台线程。
+func (b *warpBackend) StartSubExit(
+	ctx context.Context, proto string, tunFD int,
+	country, customURL, iface string, report func(string),
+) error {
+	if tunFD <= 0 {
+		return errors.New("订阅出口需要系统 tun fd（先建 VPN）")
+	}
+	if report == nil {
+		report = func(string) {}
+	}
+	b.StopSubExit()
+
+	b.mu.Lock()
+	hs := b.handshake
+	b.mu.Unlock()
+	if hs <= 0 {
+		hs = 4 * time.Second
+	}
+
+	upCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	report("订阅出口：先建 WARP 上游（netstack 模式）…")
+	under, err := warp.OpenUnderlay(upCtx, warp.OpenVPNOptions{
+		UnderlayProto:    proto,
+		HandshakeTimeout: hs,
+		VerifyTimeout:    10 * time.Second,
+		Budget:           60 * time.Second,
+		Report:           report,
+	})
+	if err != nil {
+		return err
+	}
+	fail := func(e error) error {
+		under.Close()
+		return e
+	}
+
+	socksAddr, err := under.StartInternalSocks(upCtx)
+	if err != nil {
+		return fail(fmt.Errorf("内部 SOCKS5 起不来: %w", err))
+	}
+	report("订阅出口：WARP 已就绪，本地桥 " + socksAddr)
+
+	subURL := strings.TrimSpace(customURL)
+	if subURL == "" {
+		subURL = subout.CountryURL(country)
+	}
+	report("订阅出口：拉取订阅（经 WARP）…")
+	buf, err := under.HTTPGet(upCtx, subURL, 8<<20)
+	if err != nil {
+		return fail(fmt.Errorf("拉取订阅失败: %w", err))
+	}
+	nodes, note, err := subout.ParseClash(buf)
+	if err != nil {
+		return fail(err)
+	}
+	report("订阅出口：" + note)
+
+	yamlText, err := subout.BuildConfig(subout.Options{
+		TUNFD:      tunFD,
+		Interface:  iface,
+		MTU:        1280,
+		BridgeAddr: socksAddr,
+		Proxies:    nodes,
+		Group:      "订阅出口",
+	})
+	if err != nil {
+		return fail(err)
+	}
+	if err := subout.Start(yamlText); err != nil {
+		return fail(fmt.Errorf("内核启动失败: %w", err))
+	}
+
+	b.mu.Lock()
+	b.subExit = under
+	b.mu.Unlock()
+	report(fmt.Sprintf("订阅出口已启动（%d 个节点，经 WARP 前置）", len(nodes)))
+	return nil
+}
+
+// StopSubExit 关掉订阅出口（内核 + 上游）。
+func (b *warpBackend) StopSubExit() {
+	subout.Stop()
+	b.mu.Lock()
+	u := b.subExit
+	b.subExit = nil
+	b.mu.Unlock()
+	if u != nil {
+		u.Close()
+	}
 }
 
 // Connect 建隧道。失败时**必须**把系统 VPN 一起收掉 —— 见下面 defer 里的说明。

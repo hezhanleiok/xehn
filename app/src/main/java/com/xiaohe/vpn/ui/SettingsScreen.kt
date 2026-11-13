@@ -472,6 +472,44 @@ fun SettingsScreen(
             )
         }
 
+        // ---------------- 订阅出口 ----------------
+        //
+        // 第三种出口，与 OpenVPN / 赛风同级：数据路径是
+        //   系统 tun → 内嵌 mihomo → 订阅节点 → dialer-proxy(本地 SOCKS) → WARP
+        // 所以前面选 WG / AWG / MASQUE 都成立（wwarp / masque-x2 嵌套场景不支持）。
+        Section("订阅出口")
+        SettingSwitch(
+            title = "使用订阅出口",
+            subtitle = "经 WARP 前置走订阅里的节点（VLESS/Trojan/HY2…），" +
+                "出口 IP 就是所选国家。与 OpenVPN / 赛风出口互斥",
+            checked = settings.subExit,
+            onChange = { on ->
+                onChange(
+                    settings.copy(
+                        subExit = on,
+                        // 三个都是「最终出口」，同时开会互相抢 tun，打开这个就关掉别的。
+                        openvpn = if (on) false else settings.openvpn,
+                        psiphon = if (on) false else settings.psiphon,
+                    )
+                )
+            },
+        )
+        if (settings.subExit) {
+            SettingChips(
+                title = "出口国家",
+                subtitle = "只选国家，节点由引擎按分片自动挑（不展示节点列表）",
+                options = SUB_COUNTRIES,
+                selected = settings.subCountry,
+                onSelect = { onChange(settings.copy(subCountry = it)) },
+            )
+            SettingText(
+                title = "自定义订阅",
+                subtitle = "留空 = 内置分片；填 Clash 订阅地址则优先用它",
+                value = settings.subCustomURL,
+                onChange = { onChange(settings.copy(subCustomURL = it)) },
+            )
+        }
+
         SettingChips(
             title = "分应用",
             subtitle = if (settings.mode == "vpn") {
@@ -1170,6 +1208,27 @@ private fun OpenVpnNodePicker(
         },
     )
 }
+
+/**
+ * 订阅出口支持的国家。
+ *
+ * 顺序按内置分片的节点数排（US 694 / JP 394 / SG 219 / NL 128 / HK 78 / KR 66 …），
+ * 节点多的排前面 —— 用户更可能在这里找到「又快又稳」的节点。
+ */
+private val SUB_COUNTRIES = listOf(
+    "US" to "美国",
+    "JP" to "日本",
+    "SG" to "新加坡",
+    "HK" to "香港",
+    "KR" to "韩国",
+    "TW" to "台湾",
+    "NL" to "荷兰",
+    "DE" to "德国",
+    "GB" to "英国",
+    "FR" to "法国",
+    "CA" to "加拿大",
+    "AU" to "澳大利亚",
+)
 
 @Composable
 private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onClick: () -> Unit) {

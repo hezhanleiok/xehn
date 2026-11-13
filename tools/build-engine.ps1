@@ -5,7 +5,7 @@
 # 先跑 tools\check-env.ps1 确认 JDK / Android SDK / NDK / gomobile 都在。
 
 param(
-    [string]$Target = 'android/arm64,android/arm',
+    [string]$Target = 'android/arm64',
     # gomobile 会把 Go 包名当子包追加：-javapkg=com.xiaohe + package engine
     # 才等于 Java 的 com.xiaohe.engine。传 com.xiaohe.engine 会得到
     # com.xiaohe.engine.engine，Kotlin 侧全部 Unresolved reference。
@@ -113,7 +113,7 @@ try {
     # （2026-11-01 实测：不 strip 时 APK 145 MB）。只加 -w 不加 -s：保留符号表，
     # 原生崩溃的 tombstone 仍然能解析出函数名，正是排查闪退要用的东西。
     $bindArgs = @('bind', "-javapkg=$JavaPkg", "-target=$Target",
-                  "-androidapi=$AndroidAPI", '-ldflags=-w',
+                  "-androidapi=$AndroidAPI", '-ldflags=-w -s',
                   '-o', $out, '.\')
     $bindLog = & gomobile @bindArgs 2>&1
     $bindLog | ForEach-Object { Write-Host "  $_" }

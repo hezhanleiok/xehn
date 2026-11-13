@@ -1667,3 +1667,66 @@ MASQUEX2：先拨外层 MASQUE(HTTP/3)…
 
 判据：**看日志里的 `colo=`**。`colo=LAX/SJC/SEA` → 慢是物理距离；`colo=HKG/NRT/SIN`
 还慢，才是真问题（那时再看 `[diag] WARP 上游 1/4 流`）。
+
+---
+
+## 36. 0.2.41：订阅出口（内嵌 mihomo）骨架
+
+目标：新增第三种出口「订阅出口」，与 OpenVPN / 赛风同级，**叠加在 WARP 之上**：
+
+```
+应用 → 系统 tun(fd) → mihomo(tun 入站) → 订阅节点(VLESS/Trojan/HY2…)
+                                          └─ dialer-proxy: warp-bridge（本地 SOCKS5）
+                                               └─ 本引擎的 WARP netstack → 节点
+```
+
+### 36.1 为什么是「WARP → 订阅」，不是「订阅 → WARP」
+
+`dialer-proxy` 的语义是「**这个 outbound 自己的连接**先经过指定代理」。挂在订阅节点上，
+就是「订阅节点经 WARP 拨号」= WARP 前置、订阅节点做最后一跳，出口 IP 是节点所在国。
+反过来（订阅做前置、WARP 做出口）不成立：WARP 是 L3 隧道，没有可供前置拨号的服务器地址，
+而且出口仍是 `104.28.x`（国家不变）。
+
+与电脑版 `type: openvpn` + `dialer-proxy: WARP` 完全同构，只是把 OpenVPN 换成订阅协议。
+
+### 36.2 关键实现：不注册自定义 outbound
+
+mihomo 的 `adapter.ParseProxy` 是固定 switch，没有对外注册扩展点。所以**不写新 outbound**，
+而是用一个 `127.0.0.1` 的 socks5 桥：
+
+```yaml
+proxies:
+  - {name: warp-bridge, type: socks5, server: 127.0.0.1, port: <引擎内部 SOCKS>}
+  - {name: jp-1, type: vless, ..., dialer-proxy: warp-bridge}
+```
+
+这个桥就是引擎已有的「socksPath → WARP netstack」（Psiphon 出口用的同一套），
+`Session.StartInternalSocks` 起监听，`Session.HTTPGet` 负责经 WARP 拉订阅（GitHub raw
+国内直连常被墙）。
+
+### 36.3 三个必须写对的参数
+
+| 参数 | 值 | 不写会怎样 |
+|---|---|---|
+| `tun.file-descriptor` | VpnService 建好的 fd | 内核自己建网卡 → Android 上没有权限，直接失败 |
+| `tun.auto-route` / `auto-detect-interface` | `false` | 内核去改系统路由，和 VpnService 的路由表打架 |
+| `interface-name` | 物理网卡（wlan0/rmnet_data0） | 内核的 DNS/直连被自己的 VPN 抓回去 → 死循环 |
+
+### 36.4 体积
+
+mihomo 全家桶（含 sing-tun、sing、quic、bbolt）让 `libgojni.so` 从 20 MB 涨到 71 MB。
+处理：**只打 arm64 + `-ldflags=-w -s`**，APK 从 170 MB 降到 **87.6 MB**（原来 69 MB）。
+代价是不再支持 armeabi-v7a（2026 年的设备基本是 arm64）。
+
+### 36.5 本轮做到哪、没做到哪
+
+| 项 | 状态 |
+|---|---|
+| 内嵌 mihomo、按国家分片拉订阅（内置 by-country + 自定义地址） | ✅ |
+| tun fd 接管、WARP 前置（socks5 桥）、防环路 | ✅ |
+| 设置页：开关 + 国家下拉 + 自定义订阅输入 | ✅ |
+| **测速选最快**（同国多个节点里挑最快的） | ⬜ 下一轮（当前取订阅里的第一个） |
+| **失效自动切换**（同国顺延 / 整国回退 WARP） | ⬜ 下一轮 |
+
+> 判据：选「日本」连上后，`https://chatgpt.com/cdn-cgi/trace` 的 `loc=JP`。
+> 注意公开订阅节点大量被 AI 风控拉黑，`loc` 对了也可能提示 unusual activity。
