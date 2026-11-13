@@ -16,13 +16,18 @@ android {
         // 缓存图标，版本号不变时覆盖安装会继续显示旧图标。
         // 规矩（见 docs/pitfalls.md 第 5 节）：每轮改动都要 +1，并在版本说明里写清这一版
         // 相对上一版变/没变什么。启动器按「包名 + versionCode」缓存图标，不递增会显示旧图标。
-        versionCode = 44
-        versionName = "0.2.42"
+        versionCode = 45
+        versionName = "0.2.43"
 
         // 只出 arm64 + arm。x86_64 仅在模拟器上有意义，需要额外跑一次
         // gomobile bind -target=android/amd64 并放入 libs/。
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // 只保留 64 位（arm64-v8a）。
+        //
+        // 引擎现在内嵌 mihomo 内核，每个 ABI 的 libgojni.so 都在 70 MB 以上；
+        // 同时打两份就是 150 MB+。而且从 0.2.41 起 build-engine.ps1 只产出
+        // android/arm64 —— 保留 armeabi-v7a 只会得到一个「装上就崩」的 32 位包。
+        abiFilters += listOf("arm64-v8a")
         }
     }
 
