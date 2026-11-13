@@ -1164,12 +1164,14 @@ func (b *warpBackend) StartSubExit(
 	report("订阅出口：" + note)
 
 	// 节点域名 → IP（宿主解析）：内核解析不了任何域名（见 ResolveNodeServers 的说明）。
-	var resolved, dropped int
-	nodes, resolved, dropped = subout.ResolveNodeServers(nodes)
+	var resolved, dropped, udpOnly int
+	nodes, resolved, dropped, udpOnly = subout.ResolveNodeServers(nodes)
 	if len(nodes) == 0 {
-		return fail(errors.New("节点域名全部解析失败（宿主 DNS 不通？）"))
+		return fail(errors.New("没有可用节点（域名解析失败或全部是 UDP 协议）"))
 	}
-	report(fmt.Sprintf("订阅出口：节点域名解析完成（%d 个转 IP，%d 个解析失败已丢弃）", resolved, dropped))
+	report(fmt.Sprintf(
+		"订阅出口：可用节点 %d 个（%d 个域名转 IP，%d 个解析失败，%d 个 UDP 协议暂不支持已跳过）",
+		len(nodes), resolved, dropped, udpOnly))
 
 	mixedPort := freeLoopbackPort()
 	dnsPort := freeLoopbackPort()
@@ -1200,24 +1202,31 @@ func (b *warpBackend) StartSubExit(
 	// 自己慢慢测节点，于是出现「已连接 + 出口 IP 获取中 + 上下行 0」。
 	// 这里从 Go 侧直接拨 1.1.1.1:80：这个 socket 没被 protect，会被 VpnService
 	// 抓进 tun → 内核按 MATCH 走订阅节点 → 真出网。走通才说明整条链可用。
-	report("订阅出口：验证能否出网（最多等 20 秒）…")
+	report("订阅出口：验证能否出网（DNS + TCP，最多等 20 秒）…")
+	// 用**域名**而不是 IP：这样一次验证覆盖两段链 ——
+	//   DNS：应用查询 → tun → hijack → 内核 DNS → tcp://1.1.1.1 → 节点 → 境外解析
+	//   TCP：应用连接 → tun → MATCH → 节点 → 目标站
+	// 只测 IP 会漏掉 DNS（那正是「能 ping 通、网页打不开」的原因）。
 	ok := false
-	for i := 0; i < 10; i++ {
-		c, derr := net.DialTimeout("tcp", "1.1.1.1:80", 3*time.Second)
+	var dialErr error
+	for i := 0; i < 8; i++ {
+		c, derr := net.DialTimeout("tcp", "www.gstatic.com:80", 4*time.Second)
 		if derr == nil {
 			_ = c.Close()
 			ok = true
 			break
 		}
+		dialErr = derr
 		if upCtx.Err() != nil {
 			break
 		}
 		time.Sleep(2 * time.Second)
 	}
 	if !ok {
-		return fail(errors.New("节点已加载但无法出网（该国家的节点暂时都不可用），已取消连接"))
+		return fail(fmt.Errorf(
+			"节点已加载但无法出网（DNS 或 TCP 不通：%v），已取消连接", dialErr))
 	}
-	report("订阅出口：出网验证通过")
+	report("订阅出口：出网验证通过（DNS + TCP）")
 
 	b.mu.Lock()
 	b.subExit = under

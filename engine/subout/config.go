@@ -115,11 +115,10 @@ func BuildConfig(o Options) (string, error) {
 			// 路由由 VpnService 管，内核不要碰系统路由表。
 			"auto-route":            false,
 			"auto-detect-interface": false,
-			// **绝对不要 dns-hijack**：内核自己的 DNS 查询走系统路由 → 进 tun
-			// → 又被 hijack 抓回自己 → `dial udp 198.18.0.1 -> 1.1.1.1:53:
-			// i/o timeout`（2026-11-13 真机，39 条 [TCP] 全是 dns resolve failed）。
-			// 关掉之后 UDP:53 按规则走代理，由节点侧解析（出口与解析器同国，
-			// 也不会有 DNS 泄漏）。
+			// 应用的 DNS（UDP:53）必须被内核接住：我们的 SOCKS 桥只支持 TCP
+			// （`udp: false`），UDP:53 直接走节点会**全部失败**，表现就是
+			// 「TCP 能通（17 条 OK）、但所有域名解析不出来 → 网页打不开」。
+			"dns-hijack": []string{"any:53"},
 		},
 		"proxies": proxies,
 		// 用 url-test 而不是 select：订阅里第一条极可能是死节点，select 会把它钉死，
@@ -135,11 +134,25 @@ func BuildConfig(o Options) (string, error) {
 			"proxies":   names,
 		}},
 		"rules": []string{"MATCH," + group},
-		// **内核 DNS 必须关**：见上面 dns-hijack 的说明。节点域名已经在上层
-		// 用宿主解析成 IP，内核不需要任何 DNS；应用流量的域名交给节点侧解析。
+		// 内核 DNS：**上游必须是 TCP**。
+		//
+		// 为什么（2026-11-13 真机日志）：
+		//   · TCP 经节点是通的（`[TCP] ... ` 里有 17 条正常记录）；
+		//   · hysteria2（QUIC/UDP）全部 `quic: transport closed` —— 我们的 SOCKS 桥
+		//     只支持 TCP，节点侧 UDP 转发不了；
+		//   · 所以 `nameserver: 1.1.1.1`（UDP 查询）必然超时，而 `tcp://1.1.1.1`
+		//     走的是已经验证可通的那条路。
+		// 这些查询会进 tun → MATCH → 节点 → 境外解析，出口与解析器同国，也不泄漏。
 		"dns": map[string]any{
-			"enable": false,
-			"ipv6":   false,
+			"enable":        true,
+			"ipv6":          false,
+			"listen":        "0.0.0.0:0",
+			"enhanced-mode": "redir-host",
+			"nameserver":    []string{"tcp://1.1.1.1", "tcp://8.8.8.8"},
+			// 隐私域名用 DoH（同样走 TCP），一般用不到，留作兜底。
+			"fallback":           []string{"https://1.1.1.1/dns-query"},
+			"fallback-filter":    map[string]any{"geoip": true, "geoip-code": "CN"},
+			"default-nameserver": []string{"tcp://1.1.1.1"},
 		},
 	}
 	// **不绑 interface-name**：内核的所有出站都先到本地 SOCKS 桥（127.0.0.1），

@@ -53,11 +53,19 @@ var supportedTypes = map[string]bool{
 // TLS 的 SNI / WebSocket 的 Host 用原域名补回（如果订阅没显式配置），
 // 否则证书校验和 CDN 路由都会错。解析不出来的节点直接丢掉：留着只会拖慢
 // health check，反正也连不上。
-func ResolveNodeServers(proxies []map[string]any) (kept []map[string]any, resolved, dropped int) {
+func ResolveNodeServers(proxies []map[string]any) (kept []map[string]any, resolved, dropped, udpOnly int) {
 	kept = make([]map[string]any, 0, len(proxies))
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	for _, p := range proxies {
+		// 纯 UDP 协议先跳过：本地 SOCKS 桥只支持 TCP，hysteria2 / tuic / wireguard
+		// 的出站报文发不出去（真机日志里全是 `quic: transport closed`）。
+		// 留着它们只会让 url-test 白测一轮，还可能被选中导致「连上了没网」。
+		switch strings.ToLower(fmt.Sprint(p["type"])) {
+		case "hysteria2", "tuic", "wireguard":
+			udpOnly++
+			continue
+		}
 		server, _ := p["server"].(string)
 		if strings.TrimSpace(server) == "" {
 			dropped++
@@ -77,7 +85,7 @@ func ResolveNodeServers(proxies []map[string]any) (kept []map[string]any, resolv
 		kept = append(kept, p)
 		resolved++
 	}
-	return kept, resolved, dropped
+	return kept, resolved, dropped, udpOnly
 }
 
 // patchTLSHost 把原域名补到 SNI / Host 字段（只在订阅没显式配置时）。
