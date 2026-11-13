@@ -120,7 +120,10 @@ try {
     # 「Start TUN listening error」、数据面完全不存在。
     # 带 cmfa 后走 server_notandroid.go 的空实现（buildAndroidRules 直接 return nil），
     # 这也是 Clash Meta for Android 的官方做法。
-    '-tags=cmfa',
+    # with_gvisor：mihomo 的 gvisor 栈是**可选编译**的（`//go:build with_gvisor`），
+    # 不带这个 tag 时 tun 会报 `gVisor is not included in this build`
+    # （2026-11-13 真机：packages.xml 修好后又卡在这一步）。
+    '-tags=cmfa,with_gvisor',
                   '-o', $out, '.\')
     $bindLog = & gomobile @bindArgs 2>&1
     $bindLog | ForEach-Object { Write-Host "  $_" }
