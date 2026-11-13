@@ -64,7 +64,10 @@ func BuildConfig(o Options) (string, error) {
 		"type":   "socks5",
 		"server": "127.0.0.1",
 		"port":   portOf(o.BridgeAddr),
-		"udp":    true,
+		// **不能写 udp: true**：那会让 mihomo 先尝试 UDP ASSOCIATE，而本引擎的
+		// SOCKS5 服务端只做 TCP CONNECT —— 握手被拒后整个 outbound 都不可用，
+		// 表现是所有节点 health check 全 65535（真机 2026-11-13）。
+		"udp": false,
 	})
 
 	names := make([]string, 0, len(o.Proxies))

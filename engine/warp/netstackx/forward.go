@@ -36,6 +36,15 @@ func CreateNetTUNForwarding(
 	if !ok {
 		return dev, tnet, nil
 	}
+	// **tun2socks 的命门**：注入的包目的地址是任意外网 IP，而 gVisor 默认只接受
+	// 「发给自己」的包，其余直接丢 —— 表现就是「连上了、内核日志一条 [TCP] 都没有、
+	// 上下行 0 B/s」（2026-11-13 真机现象）。
+	//
+	// 这两行与 sing-tun 的 gvisor 栈完全一致（`stack_gvisor.go` 的
+	// SetSpoofing / SetPromiscuousMode）：前者允许 endpoint 用非本机地址做源/目的，
+	// 后者让 NIC 不做地址过滤。
+	nt.stack.SetSpoofing(1, true)
+	nt.stack.SetPromiscuousMode(1, true)
 	if h.DialTCP != nil {
 		tcpFwd := tcp.NewForwarder(nt.stack, 0, 2048, func(r *tcp.ForwarderRequest) {
 			id := r.ID()
