@@ -124,6 +124,8 @@ type Session struct {
 	// 单独一个字段是必要的：Psiphon 会话里两个监听同时存在，界面要显示的是
 	// 「局域网里的电脑能不能连」的那一个（可能是 0.0.0.0），而不是内部那条。
 	userLn   net.Listener
+	// hostResolveFirst：内部 SOCKS 桥连的是节点域名，先宿主解析（见 socksPath）。
+	hostResolveFirst bool
 	Endpoint string
 	ExitIP   string
 	Country  string
@@ -469,7 +471,10 @@ func (s *Session) StartInternalSocks(ctx context.Context) (string, error) {
 	if s == nil || s.tn == nil || s.tn.stack() == nil {
 		return "", errors.New("这条会话没有 netstack，不能作为订阅出口的上游")
 	}
+	// 先宿主解析节点域名（见 socksPath.hostResolveFirst 的说明）。
+	s.hostResolveFirst = true
 	if !s.startSocksAt(ctx, "127.0.0.1:0", func(string) {}, nil, true) {
+		s.hostResolveFirst = false
 		return "", errors.New("本地 SOCKS5 监听失败（端口不可用）")
 	}
 	if s.ln == nil {
@@ -561,7 +566,12 @@ func (s *Session) socksPath() socksPath {
 		// 也就是真的走这条节点；用 tn 的 netstack 就绕开了节点，出口地区全错。
 		if s.ovpn == nil {
 			if st := s.tn.stack(); st != nil {
-				return socksPath{dial: st.tnet.DialContext, inTunnel: true, tnet: st.tnet}
+				return socksPath{
+			dial:             st.tnet.DialContext,
+			inTunnel:         true,
+			tnet:             st.tnet,
+			hostResolveFirst: s.hostResolveFirst,
+		}
 			}
 		}
 	}

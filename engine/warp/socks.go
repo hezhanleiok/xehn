@@ -3,6 +3,7 @@ package warp
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -60,6 +61,11 @@ type socksPath struct {
 	dial     func(ctx context.Context, network, addr string) (net.Conn, error)
 	inTunnel bool
 	tnet     *netstack.Net
+	// hostResolveFirst 只给「订阅出口的内部桥」用：那条桥连的是**节点域名**，
+	// 隧道 DNS 一旦超时（真机日志 `lookup github.com. on 1.1.1.1: no such host`），
+	// 所有节点就都连不上、health check 全 65535。节点域名不算敏感信息，
+	// 先宿主解析不构成泄露；解析失败再回退隧道 DNS。
+	hostResolveFirst bool
 }
 
 func serveSOCKS(ctx context.Context, c net.Conn, path socksPath, rules *RuleSet) {
@@ -88,10 +94,18 @@ func serveSOCKS(ctx context.Context, c net.Conn, path socksPath, rules *RuleSet)
 	}
 
 	if path.inTunnel && path.tnet != nil {
-		target, err = resolveInTunnel(dialCtx, path.tnet, target)
-		if err != nil {
-			socksReply(c, socksRefused)
-			return
+		resolved := false
+		if path.hostResolveFirst {
+			if t2, herr := resolveOnHost(dialCtx, target); herr == nil {
+				target, resolved = t2, true
+			}
+		}
+		if !resolved {
+			target, err = resolveInTunnel(dialCtx, path.tnet, target)
+			if err != nil {
+				socksReply(c, socksRefused)
+				return
+			}
 		}
 	}
 	remote, err := path.dial(dialCtx, "tcp", target)
@@ -169,6 +183,22 @@ func dialDirect(ctx context.Context, c net.Conn, target string) bool {
 // reason the meta fetch takes it - and, nested, because netstack tries the
 // addresses in order with a share of the deadline each, so an IPv6 answer that
 // does not pass eats the budget the working v4 one needed.
+// resolveOnHost 用宿主解析器解析目标（只给订阅出口的内部桥用）。
+func resolveOnHost(ctx context.Context, target string) (string, error) {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return target, nil
+	}
+	ips, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return "", errors.New("宿主解析失败")
+	}
+	return net.JoinHostPort(ips[0], port), nil
+}
+
 func resolveInTunnel(ctx context.Context, tnet *netstack.Net, target string) (string, error) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
