@@ -469,6 +469,9 @@ class WarpVpnService : VpnService() {
             )
             connectJob = scope.launch {
                 try {
+                    // 立刻转「连接中」：建上游 + 拉订阅要十几秒，这段必须有状态反馈。
+                    runCatching { e.markSubExitConnecting() }
+                    EngineBridge.refresh(e)
                     val iface = activeInterfaceName()
                     if (iface.isNotEmpty()) {
                         EngineBridge.note("[subout] 物理网卡 = $iface（内核出口绑它，避免被自己的 VPN 抓走）")

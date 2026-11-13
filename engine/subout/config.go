@@ -105,10 +105,17 @@ func BuildConfig(o Options) (string, error) {
 			"dns-hijack":            []string{},
 		},
 		"proxies": proxies,
+		// 用 url-test 而不是 select：订阅里第一条极可能是死节点，select 会把它钉死，
+		// 表现就是「连上了、所有网站打不开」。url-test 会周期性测
+		// `generate_204`，自动切到当下能通的节点；tolerance 避免来回抖。
 		"proxy-groups": []map[string]any{{
-			"name":    group,
-			"type":    "select",
-			"proxies": names,
+			"name":      group,
+			"type":      "url-test",
+			"url":       "http://www.gstatic.com/generate_204",
+			"interval":  60,
+			"tolerance": 50,
+			"lazy":      false,
+			"proxies":   names,
 		}},
 		"rules": []string{"MATCH," + group},
 		"dns": map[string]any{

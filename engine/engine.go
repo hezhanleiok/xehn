@@ -521,6 +521,17 @@ func (e *Engine) StopSubExit() {
 	}
 }
 
+// MarkSubExitConnecting 把会话状态置成「连接中」。
+//
+// 订阅出口要建 WARP 上游 + 拉订阅（十几秒），这段时间首页必须显示「连接中」——
+// 否则点完按钮一直停在「未连接」，用户以为按钮没反应。
+func (e *Engine) MarkSubExitConnecting() {
+	switch e.sess.snapshot().State {
+	case StateIdle, StateError:
+		_ = e.sess.transition(StateConnecting, nil)
+	}
+}
+
 // MarkSubExitConnected 把会话状态置成「已连接」。
 //
 // 订阅出口不经过 Connect（数据面由 mihomo 接管），如果不显式转状态，首页会一直

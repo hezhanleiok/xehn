@@ -495,13 +495,40 @@ fun SettingsScreen(
             },
         )
         if (settings.subExit) {
-            SettingChips(
+            // 和赛风出口同一套交互：一行显示当前国家（国旗 + 名称），点开是弹窗列表。
+            // 之前用 SettingChips 是一排平铺的 chip，用户明确说「这是错误的」。
+            var subCountryPicker by remember { mutableStateOf(false) }
+            ActionRow(
                 title = "出口国家",
-                subtitle = "只选国家，节点由引擎按分片自动挑（不展示节点列表）",
-                options = SUB_COUNTRIES,
-                selected = settings.subCountry,
-                onSelect = { onChange(settings.copy(subCountry = it)) },
-            )
+                subtitle = "${flagEmoji(settings.subCountry)} ${countryDisplayName(settings.subCountry)}" +
+                    " · 节点由引擎自动挑（不展示节点列表）",
+            ) { subCountryPicker = true }
+            if (subCountryPicker) {
+                AlertDialog(
+                    onDismissRequest = { subCountryPicker = false },
+                    title = { Text("订阅出口国家") },
+                    text = {
+                        Column(
+                            Modifier
+                                .heightIn(max = 420.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            SUB_COUNTRIES.forEach { (cc, label) ->
+                                RegionRow(
+                                    label,
+                                    if (cc == settings.subCountry) "$cc ✓" else cc,
+                                ) {
+                                    onChange(settings.copy(subCountry = cc))
+                                    subCountryPicker = false
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { subCountryPicker = false }) { Text("关闭") }
+                    },
+                )
+            }
             SettingText(
                 title = "自定义订阅",
                 subtitle = "留空 = 内置分片；填 Clash 订阅地址则优先用它",
