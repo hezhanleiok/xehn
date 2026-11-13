@@ -9,9 +9,14 @@ import (
 
 // Options 是一次「订阅出口」启动所需的全部参数。
 type Options struct {
-	// TUNFD 是 VpnService 建好的 tun fd。mihomo 用 tun.file-descriptor 接管，
-	// 不再自己建网卡（Android 上也只有这一个 tun 可用）。
-	TUNFD int
+	// MixedPort 是 mihomo 的 SOCKS/HTTP 入站端口。
+	//
+	// **不再给 mihomo 传 tun fd**：它的 tun 在非 root Android 上必然失败
+	// （要读 /data/system/packages.xml 建 UID 规则，返回 error 且不降级）。
+	// 现在 tun 由本引擎的 gVisor 栈读，TCP/UDP 转发到这个端口（tun2socks）。
+	MixedPort int
+	// DNSPort 是 mihomo 的 DNS 监听端口（tun2socks 把 UDP:53 转给它）。
+	DNSPort int
 	// Interface 是物理网卡名（wlan0 / rmnet_data0 …）。
 	//
 	// 必须绑它：mihomo 的出口 socket、DNS 查询都要绕开 VPN 路由，否则会
@@ -38,8 +43,8 @@ const bridgeName = "warp-bridge"
 // 只做三件事：tun 接 fd、节点全部经 warp-bridge 出去、所有流量走一个 select 组。
 // 分流规则、DNS 策略都保持最简 —— 先把「能出去、出口是国家」跑通。
 func BuildConfig(o Options) (string, error) {
-	if o.TUNFD <= 0 {
-		return "", fmt.Errorf("没有 tun fd，订阅出口无法接管数据面")
+	if o.MixedPort <= 0 {
+		return "", fmt.Errorf("缺少 mixed-port，订阅出口无法接管数据面")
 	}
 	if strings.TrimSpace(o.BridgeAddr) == "" {
 		return "", fmt.Errorf("缺少本地 SOCKS5 桥地址")
@@ -48,10 +53,6 @@ func BuildConfig(o Options) (string, error) {
 		return "", fmt.Errorf("订阅里没有可用节点")
 	}
 
-	mtu := o.MTU
-	if mtu < 576 || mtu > 9000 {
-		mtu = 1280
-	}
 	group := o.Group
 	if group == "" {
 		group = "订阅出口"
@@ -83,27 +84,15 @@ func BuildConfig(o Options) (string, error) {
 	}
 
 	cfg := map[string]any{
-		"mixed-port":       0,
+		"mixed-port":       o.MixedPort,
 		"allow-lan":        false,
 		"mode":             "rule",
-		"log-level":        "warning",
+		"log-level":        "info",
 		"ipv6":             false,
 		"find-process-mode": "off",
 		"geodata-mode":     false,
 		"unified-delay":    true,
 		"tcp-concurrent":   true,
-		"tun": map[string]any{
-			"enable":                true,
-			"device":                "xehn-sub",
-			"stack":                 "gvisor",
-			"mtu":                   mtu,
-			"file-descriptor":       o.TUNFD,
-			// 路由由 VpnService 管；内核不要去改系统路由/网卡，否则会与
-			// Android 的 VPN 路由表打架（曾经在别的项目上表现为整个网络中断）。
-			"auto-route":            false,
-			"auto-detect-interface": false,
-			"dns-hijack":            []string{},
-		},
 		"proxies": proxies,
 		// 用 url-test 而不是 select：订阅里第一条极可能是死节点，select 会把它钉死，
 		// 表现就是「连上了、所有网站打不开」。url-test 会周期性测
@@ -121,7 +110,9 @@ func BuildConfig(o Options) (string, error) {
 		"dns": map[string]any{
 			"enable":        true,
 			"ipv6":          false,
-			"listen":        "0.0.0.0:0",
+			// tun2socks 把 UDP:53 全部转到这个监听：内核按域名解析，
+			// 节点域名也在这里解析（经 WARP 上游，不走系统路由）。
+			"listen":        fmt.Sprintf("127.0.0.1:%d", o.DNSPort),
 			"enhanced-mode": "redir-host",
 			"nameserver":    []string{"1.1.1.1", "8.8.8.8"},
 		},

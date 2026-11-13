@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,8 @@ type warpBackend struct {
 	// subExit 是订阅出口的 WARP 上游（netstack 模式 + 内部 SOCKS5）。
 	// mihomo 内核本身在 subout 包里，这里只持有它的上游，关闭时一起收掉。
 	subExit *warp.Session
+	// subPump 是订阅出口的 tun2socks（tun fd ↔ gVisor 栈 ↔ mihomo）。
+	subPump *warp.SubOutExit
 }
 
 // vpnGatePath 是 VPN Gate 节点缓存文件。
@@ -1146,10 +1149,14 @@ func (b *warpBackend) StartSubExit(
 	}
 	report("订阅出口：" + note)
 
+	mixedPort := freeLoopbackPort()
+	dnsPort := freeLoopbackPort()
+	if mixedPort == 0 || dnsPort == 0 {
+		return fail(errors.New("分配本地端口失败"))
+	}
 	yamlText, err := subout.BuildConfig(subout.Options{
-		TUNFD:      tunFD,
-		Interface:  iface,
-		MTU:        1280,
+		MixedPort:  mixedPort,
+		DNSPort:    dnsPort,
 		BridgeAddr: socksAddr,
 		Proxies:    nodes,
 		Group:      "订阅出口",
@@ -1160,21 +1167,51 @@ func (b *warpBackend) StartSubExit(
 	if err := subout.Start(yamlText); err != nil {
 		return fail(fmt.Errorf("内核启动失败: %w", err))
 	}
+	// 等 mixed-port 真正开始监听，否则头几个连接会被拒。
+	time.Sleep(400 * time.Millisecond)
+	pump, err := warp.StartSubOutPump(
+		tunFD,
+		fmt.Sprintf("127.0.0.1:%d", mixedPort),
+		fmt.Sprintf("127.0.0.1:%d", dnsPort),
+	)
+	if err != nil {
+		subout.Stop()
+		return fail(fmt.Errorf("tun2socks 启动失败: %w", err))
+	}
 
 	b.mu.Lock()
 	b.subExit = under
+	b.subPump = pump
 	b.mu.Unlock()
-	report(fmt.Sprintf("订阅出口已启动（%d 个节点，经 WARP 前置）", len(nodes)))
+	report(fmt.Sprintf("订阅出口已启动（%d 个节点，经 WARP 前置，mixed-port %d）", len(nodes), mixedPort))
 	return nil
 }
 
-// StopSubExit 关掉订阅出口（内核 + 上游）。
+// freeLoopbackPort 向内核要一个空闲的本地端口（拿到后立刻释放，交给 mihomo 用）。
+func freeLoopbackPort() int {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0
+	}
+	defer l.Close()
+	if a, ok := l.Addr().(*net.TCPAddr); ok {
+		return a.Port
+	}
+	return 0
+}
+
+// StopSubExit 关掉订阅出口（tun2socks + 内核 + 上游）。
 func (b *warpBackend) StopSubExit() {
 	subout.Stop()
 	b.mu.Lock()
 	u := b.subExit
+	p := b.subPump
 	b.subExit = nil
+	b.subPump = nil
 	b.mu.Unlock()
+	if p != nil {
+		p.Close()
+	}
 	if u != nil {
 		u.Close()
 	}
