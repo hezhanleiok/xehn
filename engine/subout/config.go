@@ -22,6 +22,9 @@ type Options struct {
 	MixedPort int
 	// DNSPort 是 mihomo 的 DNS 监听端口。
 	DNSPort int
+	// APIPort 是 external-controller（只绑回环）。测速要逐个节点试，
+	// 只能靠这个 API 切 select 组；没有它就只能按订阅原序连。
+	APIPort int
 	// Interface 是物理网卡名（wlan0 / rmnet_data0 …）。
 	//
 	// 必须绑它：mihomo 的出口 socket、DNS 查询都要绕开 VPN 路由，否则会
@@ -114,6 +117,10 @@ func BuildConfig(o Options) (string, error) {
 			"proxies": names,
 		}},
 		"rules": []string{"MATCH," + group},
+	}
+	// 控制器：测速要切 select 组（PUT /proxies/{组}），只有 select 支持。
+	if o.APIPort > 0 {
+		cfg["external-controller"] = fmt.Sprintf("127.0.0.1:%d", o.APIPort)
 	}
 	// tun 只在给了 fd 时才配（真机）；桌面上做链路自测时只用 mixed-port，
 	// 这样「WARP → SOCKS 桥 → mihomo → 节点」这段能脱离 Android 单独验证。

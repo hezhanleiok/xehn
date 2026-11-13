@@ -152,6 +152,8 @@ const statsInterval = 2 * time.Second
 // logs live there.
 func NewEngine(workDir string) *Engine {
 	e := &Engine{workDir: workDir, sess: newSession()}
+	// 订阅出口的测速缓存落在工作目录（App 私有），卸载即清，不碰外部存储。
+	subout.RankDir = workDir
 	// 真正的数据面：WARP 账号 + WG/AWG 隧道 + gVisor netstack。
 	// 装不上（workDir 不可写等）也只影响连不上，不影响 UI。
 	e.setBackend(newWarpBackend(workDir))

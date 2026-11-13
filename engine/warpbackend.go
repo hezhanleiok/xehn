@@ -83,8 +83,8 @@ type warpBackend struct {
 	// subExit 是订阅出口的 WARP 上游（netstack 模式 + 内部 SOCKS5）。
 	// mihomo 内核本身在 subout 包里，这里只持有它的上游，关闭时一起收掉。
 	subExit *warp.Session
-	// subPump 是订阅出口的 tun2socks（tun fd ↔ gVisor 栈 ↔ mihomo）。
-	subPump *warp.SubOutExit
+	// subPorts 是订阅出口的本地端口（controller / mixed），测速与重测用。
+	subPorts *subPorts
 }
 
 // vpnGatePath 是 VPN Gate 节点缓存文件。
@@ -1173,9 +1173,16 @@ func (b *warpBackend) StartSubExit(
 		"订阅出口：可用节点 %d 个（%d 个域名转 IP，%d 个解析失败，%d 个 UDP 协议暂不支持已跳过）",
 		len(nodes), resolved, dropped, udpOnly))
 
+	// 上次的测速结果：最快在前，select 组默认就选它 —— 第二次连接不用再等测速。
+	if ranked := subout.LoadRank(country); len(ranked) > 0 {
+		nodes = subout.SortByRank(nodes, ranked)
+		report(fmt.Sprintf("订阅出口：用上次的测速缓存排序（%d 条记录）", len(ranked)))
+	}
+
 	mixedPort := freeLoopbackPort()
 	dnsPort := freeLoopbackPort()
-	if mixedPort == 0 || dnsPort == 0 {
+	apiPort := freeLoopbackPort()
+	if mixedPort == 0 || dnsPort == 0 || apiPort == 0 {
 		return fail(errors.New("分配本地端口失败"))
 	}
 	yamlText, err := subout.BuildConfig(subout.Options{
@@ -1183,6 +1190,7 @@ func (b *warpBackend) StartSubExit(
 		MTU:        1280,
 		MixedPort:  mixedPort,
 		DNSPort:    dnsPort,
+		APIPort:    apiPort,
 		BridgeAddr: socksAddr,
 		Proxies:    nodes,
 		Group:      "订阅出口",
@@ -1228,9 +1236,17 @@ func (b *warpBackend) StartSubExit(
 	}
 	report("订阅出口：出网验证通过（DNS + TCP）")
 
+	// 出网验证已通过 → 记下端口，供测速与定时重测使用。
 	b.mu.Lock()
 	b.subExit = under
+	b.subPorts = &subPorts{api: apiPort, mixed: mixedPort, group: "订阅出口"}
 	b.mu.Unlock()
+
+	// 后台按速度选最快：不阻塞「已连接」，但下一次连接会用上这次的结果。
+	go b.rankSubExit(country, nodes)
+	// 定时重测：订阅每小时刷新、节点掉得很快，只在连接那一刻测一次的话
+	// 半小时后可能已经跑在死节点上。
+	go b.keepSubExitFresh(country, nodes, 10*time.Minute)
 	report(fmt.Sprintf("订阅出口已启动（%d 个节点，经 WARP 前置，mixed-port %d）", len(nodes), mixedPort))
 	return nil
 }
@@ -1248,18 +1264,21 @@ func freeLoopbackPort() int {
 	return 0
 }
 
-// StopSubExit 关掉订阅出口（tun2socks + 内核 + 上游）。
+// StopSubExit 关掉订阅出口（内核 + 上游 + 定时重测）。
 func (b *warpBackend) StopSubExit() {
 	subout.Stop()
 	b.mu.Lock()
 	u := b.subExit
-	p := b.subPump
 	b.subExit = nil
-	b.subPump = nil
+	b.subPorts = nil
 	b.mu.Unlock()
-	if p != nil {
-		p.Close()
+	// 定时重测的循环：关掉它，避免换出口后还在往旧端口上切节点。
+	subRankMu.Lock()
+	if subRankStop != nil {
+		close(subRankStop)
+		subRankStop = nil
 	}
+	subRankMu.Unlock()
 	if u != nil {
 		u.Close()
 	}
