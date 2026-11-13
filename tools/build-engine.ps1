@@ -114,6 +114,13 @@ try {
     # 原生崩溃的 tombstone 仍然能解析出函数名，正是排查闪退要用的东西。
     $bindArgs = @('bind', "-javapkg=$JavaPkg", "-target=$Target",
                   "-androidapi=$AndroidAPI", '-ldflags=-w -s',
+    # **必须带 cmfa tag**：mihomo 的 `listener/sing_tun/server_android.go` 的构建
+    # 条件是 `android && !cmfa`，它会在建 tun 时读 /data/system/packages.xml 生成
+    # UID 分应用规则 —— 非 root 必然 permission denied，且返回 error 导致
+    # 「Start TUN listening error」、数据面完全不存在。
+    # 带 cmfa 后走 server_notandroid.go 的空实现（buildAndroidRules 直接 return nil），
+    # 这也是 Clash Meta for Android 的官方做法。
+    '-tags=cmfa',
                   '-o', $out, '.\')
     $bindLog = & gomobile @bindArgs 2>&1
     $bindLog | ForEach-Object { Write-Host "  $_" }

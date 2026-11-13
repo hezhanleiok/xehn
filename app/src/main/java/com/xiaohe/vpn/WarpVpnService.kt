@@ -145,7 +145,7 @@ class WarpVpnService : VpnService() {
          * 认的 172.16.0.2 —— 与普通 WARP 模式一致。mihomo 不再碰 tun
          * （它自带的 tun 在非 root Android 上必然失败）。
          */
-        private const val SUB_TUN_V4 = "172.16.0.2"
+        private const val SUB_TUN_V4 = "198.18.0.1"
 
         /** 看门狗多久看一次快照。 */
         private const val WATCHDOG_TICK_MS = 5_000L
@@ -1200,8 +1200,10 @@ class WarpVpnService : VpnService() {
         // 也就是 **198.18.0.1/30**；而普通模式的 172.16.0.2 是 WARP netstack 的设备
         // 地址。两者不一致时 gvisor 栈不认这个网卡，包会被静默丢弃 ——
         // 现象正是用户报的「已连接、出口 IP 获取中、上下行 0 B/s」。
+        // 订阅出口：tun 地址必须等于 mihomo 的 tun 本地地址（dns.FakeIPRange 取 /30
+        // → 198.18.0.1/30），否则 gVisor 栈不认这张网卡。
         val tunV4 = if (s.subExit) SUB_TUN_V4 else TUN_ADDR_V4
-        val tunBits = 32
+        val tunBits = if (s.subExit) 30 else 32
         val variants = buildList {
             add(TunVariant(tunV4, true, if (s.subExit) "订阅出口地址 + v6" else "默认地址 + v6"))
             if (!s.ipv6) {

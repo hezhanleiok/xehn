@@ -1155,6 +1155,8 @@ func (b *warpBackend) StartSubExit(
 		return fail(errors.New("分配本地端口失败"))
 	}
 	yamlText, err := subout.BuildConfig(subout.Options{
+		TUNFD:      tunFD,
+		MTU:        1280,
 		MixedPort:  mixedPort,
 		DNSPort:    dnsPort,
 		BridgeAddr: socksAddr,
@@ -1169,20 +1171,9 @@ func (b *warpBackend) StartSubExit(
 	}
 	// 等 mixed-port 真正开始监听，否则头几个连接会被拒。
 	time.Sleep(400 * time.Millisecond)
-	pump, err := warp.StartSubOutPump(
-		tunFD,
-		fmt.Sprintf("127.0.0.1:%d", mixedPort),
-		fmt.Sprintf("127.0.0.1:%d", dnsPort),
-		report,
-	)
-	if err != nil {
-		subout.Stop()
-		return fail(fmt.Errorf("tun2socks 启动失败: %w", err))
-	}
 
 	b.mu.Lock()
 	b.subExit = under
-	b.subPump = pump
 	b.mu.Unlock()
 	report(fmt.Sprintf("订阅出口已启动（%d 个节点，经 WARP 前置，mixed-port %d）", len(nodes), mixedPort))
 	return nil

@@ -9,13 +9,18 @@ import (
 
 // Options 是一次「订阅出口」启动所需的全部参数。
 type Options struct {
-	// MixedPort 是 mihomo 的 SOCKS/HTTP 入站端口。
+	// TUNFD 是 VpnService 建好的 tun fd，交给 mihomo 的 tun（file-descriptor 模式）。
 	//
-	// **不再给 mihomo 传 tun fd**：它的 tun 在非 root Android 上必然失败
-	// （要读 /data/system/packages.xml 建 UID 规则，返回 error 且不降级）。
-	// 现在 tun 由本引擎的 gVisor 栈读，TCP/UDP 转发到这个端口（tun2socks）。
+	// 关键前提：**引擎必须用 `-tags cmfa` 编译**。mihomo 的
+	// `listener/sing_tun/server_android.go` 构建条件是 `android && !cmfa`，它会在建
+	// tun 时读 /data/system/packages.xml 生成 UID 分应用规则 —— 非 root 必然
+	// `permission denied`，而且返回 error 导致 tun 根本起不来（真机日志：
+	// `Start TUN listening error: build android rules: ... permission denied`）。
+	// 带 cmfa 后走空实现，tun 正常启动（CMFA 官方同款做法）。
+	TUNFD int
+	// MixedPort 是 mihomo 的 SOCKS/HTTP 入站（保留：本地代理/调试可用）。
 	MixedPort int
-	// DNSPort 是 mihomo 的 DNS 监听端口（tun2socks 把 UDP:53 转给它）。
+	// DNSPort 是 mihomo 的 DNS 监听端口。
 	DNSPort int
 	// Interface 是物理网卡名（wlan0 / rmnet_data0 …）。
 	//
@@ -45,6 +50,9 @@ const bridgeName = "warp-bridge"
 func BuildConfig(o Options) (string, error) {
 	if o.MixedPort <= 0 {
 		return "", fmt.Errorf("缺少 mixed-port，订阅出口无法接管数据面")
+	}
+	if o.TUNFD <= 0 {
+		return "", fmt.Errorf("缺少 tun fd，订阅出口无法接管数据面")
 	}
 	if strings.TrimSpace(o.BridgeAddr) == "" {
 		return "", fmt.Errorf("缺少本地 SOCKS5 桥地址")
@@ -96,6 +104,19 @@ func BuildConfig(o Options) (string, error) {
 		"geodata-mode":     false,
 		"unified-delay":    true,
 		"tcp-concurrent":   true,
+		// tun 由**内核自己**接管（fd 模式）：sing-tun 那条路是 CMFA 天天在跑的成熟
+		// 实现，比我们自己写 tun2socks 可靠。前提是编译带 `-tags cmfa`（见 Options.TUNFD）。
+		"tun": map[string]any{
+			"enable":                true,
+			"device":                "xehn-sub",
+			"stack":                 "gvisor",
+			"mtu":                   mtuOrDefault(o.MTU),
+			"file-descriptor":       o.TUNFD,
+			// 路由由 VpnService 管，内核不要碰系统路由表。
+			"auto-route":            false,
+			"auto-detect-interface": false,
+			"dns-hijack":            []string{"any:53"},
+		},
 		"proxies": proxies,
 		// 用 url-test 而不是 select：订阅里第一条极可能是死节点，select 会把它钉死，
 		// 表现就是「连上了、所有网站打不开」。url-test 会周期性测
@@ -130,6 +151,14 @@ func BuildConfig(o Options) (string, error) {
 		return "", fmt.Errorf("生成配置失败: %w", err)
 	}
 	return string(buf), nil
+}
+
+// mtuOrDefault 归一化 tun MTU。
+func mtuOrDefault(mtu int) int {
+	if mtu < 576 || mtu > 9000 {
+		return 1280
+	}
+	return mtu
 }
 
 // portOf 从 "host:port" 里取端口；取不到返回 0（BuildConfig 会因此报错）。
