@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	urlpkg "net/url"
 	"strconv"
 	"time"
 )
@@ -492,10 +493,39 @@ func (s *Session) HTTPGet(ctx context.Context, url string, max int64) ([]byte, e
 	if max <= 0 {
 		max = 8 << 20
 	}
+	// 域名先在**宿主**解析，再让隧道拨 IP。
+	//
+	// 为什么不能只靠隧道 DNS（真机 2026-11-13 21:14）：
+	//   `拉取订阅失败: dial: lookup github.com. on 1.1.1.1: no such host`
+	// 隧道里的 1.1.1.1 一旦超时/被污染，整次刷新就废了；而宿主解析至少能拿到
+	// 一个 IP（被墙的是 TCP，不是 DNS），拿到 IP 后再走 WARP 出去就能通。
+	// 解析失败就回退原样（交给隧道 DNS），不改变原有行为。
+	if u, uerr := urlpkg.Parse(url); uerr == nil {
+		host := u.Hostname()
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		if ips, lerr := net.DefaultResolver.LookupHost(ctx, host); lerr == nil && len(ips) > 0 {
+			fixed := net.JoinHostPort(ips[0], port)
+			tr := &http.Transport{
+				DisableKeepAlives: true,
+				DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+					return st.tnet.DialContext(dctx, network, fixed)
+				},
+			}
+			return doGet(tr, ctx, url, max)
+		}
+	}
 	tr := &http.Transport{
 		DisableKeepAlives: true,
 		DialContext:       st.tnet.DialContext,
 	}
+	return doGet(tr, ctx, url, max)
+}
+
+// doGet 用给定 Transport 拉一次 URL（订阅 / 出口验证共用）。
+func doGet(tr *http.Transport, ctx context.Context, url string, max int64) ([]byte, error) {
 	defer tr.CloseIdleConnections()
 	cli := &http.Client{Transport: tr, Timeout: 40 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

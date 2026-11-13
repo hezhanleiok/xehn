@@ -1139,9 +1139,23 @@ func (b *warpBackend) StartSubExit(
 		subURL = subout.CountryURL(country)
 	}
 	report("订阅出口：拉取订阅（经 WARP）…")
-	buf, err := under.HTTPGet(upCtx, subURL, 8<<20)
-	if err != nil {
-		return fail(fmt.Errorf("拉取订阅失败: %w", err))
+	// 重试 3 次：GitHub 经 WARP 出去偶尔会撞上 DNS/TLS 抖动，一次失败就整次连接
+	// 报废代价太大（真机 2026-11-13 21:14：`lookup github.com. on 1.1.1.1: no such host`）。
+	var buf []byte
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		buf, lastErr = under.HTTPGet(upCtx, subURL, 8<<20)
+		if lastErr == nil {
+			break
+		}
+		report(fmt.Sprintf("拉取订阅失败（第 %d/3 次）：%v，1 秒后重试…", i+1, lastErr))
+		select {
+		case <-upCtx.Done():
+		case <-time.After(time.Second):
+		}
+	}
+	if lastErr != nil {
+		return fail(fmt.Errorf("拉取订阅失败: %w", lastErr))
 	}
 	nodes, note, err := subout.ParseClash(buf)
 	if err != nil {
