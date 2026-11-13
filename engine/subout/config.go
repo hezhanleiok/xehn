@@ -51,9 +51,9 @@ func BuildConfig(o Options) (string, error) {
 	if o.MixedPort <= 0 {
 		return "", fmt.Errorf("缺少 mixed-port，订阅出口无法接管数据面")
 	}
-	if o.TUNFD <= 0 {
-		return "", fmt.Errorf("缺少 tun fd，订阅出口无法接管数据面")
-	}
+	// TUNFD 允许为 0：那种情况下只渲染 mixed-port + 节点（不接管 tun），
+	// 用于**桌面上的链路自测**（WARP → 内部 SOCKS → mihomo → 订阅节点 → 外网）。
+	// 真机必须给 fd，Kotlin 侧的 StartSubExit 会保证这一点。
 	if strings.TrimSpace(o.BridgeAddr) == "" {
 		return "", fmt.Errorf("缺少本地 SOCKS5 桥地址")
 	}
@@ -104,9 +104,21 @@ func BuildConfig(o Options) (string, error) {
 		"geodata-mode":     false,
 		"unified-delay":    true,
 		"tcp-concurrent":   true,
-		// tun 由**内核自己**接管（fd 模式）：sing-tun 那条路是 CMFA 天天在跑的成熟
-		// 实现，比我们自己写 tun2socks 可靠。前提是编译带 `-tags cmfa`（见 Options.TUNFD）。
-		"tun": map[string]any{
+		"proxies": proxies,
+		// 组用 **select**（与电脑版一致）：默认节点 = proxies 第一个，所以把测速
+		// 最快的那几个排前面就等于「默认用最快的」；而且只有 select 支持通过
+		// controller API 手动切换，测速要逐个试节点，别的组型切不了。
+		"proxy-groups": []map[string]any{{
+			"name":    group,
+			"type":    "select",
+			"proxies": names,
+		}},
+		"rules": []string{"MATCH," + group},
+	}
+	// tun 只在给了 fd 时才配（真机）；桌面上做链路自测时只用 mixed-port，
+	// 这样「WARP → SOCKS 桥 → mihomo → 节点」这段能脱离 Android 单独验证。
+	if o.TUNFD > 0 {
+		cfg["tun"] = map[string]any{
 			"enable":                true,
 			"device":                "xehn-sub",
 			"stack":                 "gvisor",
@@ -117,43 +129,31 @@ func BuildConfig(o Options) (string, error) {
 			"auto-detect-interface": false,
 			// 应用的 DNS（UDP:53）必须被内核接住：我们的 SOCKS 桥只支持 TCP
 			// （`udp: false`），UDP:53 直接走节点会**全部失败**，表现就是
-			// 「TCP 能通（17 条 OK）、但所有域名解析不出来 → 网页打不开」。
+			// 「TCP 能通、但所有域名解析不出来 → 网页打不开」。
 			"dns-hijack": []string{"any:53"},
-		},
-		"proxies": proxies,
-		// 用 url-test 而不是 select：订阅里第一条极可能是死节点，select 会把它钉死，
-		// 表现就是「连上了、所有网站打不开」。url-test 会周期性测
-		// `generate_204`，自动切到当下能通的节点；tolerance 避免来回抖。
-		"proxy-groups": []map[string]any{{
-			"name":      group,
-			"type":      "url-test",
-			"url":       "http://www.gstatic.com/generate_204",
-			"interval":  60,
-			"tolerance": 50,
-			"lazy":      false,
-			"proxies":   names,
-		}},
-		"rules": []string{"MATCH," + group},
-		// 内核 DNS：**上游必须是 TCP**。
-		//
-		// 为什么（2026-11-13 真机日志）：
-		//   · TCP 经节点是通的（`[TCP] ... ` 里有 17 条正常记录）；
-		//   · hysteria2（QUIC/UDP）全部 `quic: transport closed` —— 我们的 SOCKS 桥
-		//     只支持 TCP，节点侧 UDP 转发不了；
-		//   · 所以 `nameserver: 1.1.1.1`（UDP 查询）必然超时，而 `tcp://1.1.1.1`
-		//     走的是已经验证可通的那条路。
-		// 这些查询会进 tun → MATCH → 节点 → 境外解析，出口与解析器同国，也不泄漏。
-		"dns": map[string]any{
-			"enable":        true,
-			"ipv6":          false,
-			"listen":        "0.0.0.0:0",
-			"enhanced-mode": "redir-host",
-			"nameserver": []string{"tcp://1.1.1.1", "tcp://8.8.8.8"},
-			// **不要 fallback / fallback-filter**：`fallback-filter.geoip: true`
-			// 会要求加载 GeoIP 数据库，而 mihomo 在 tun 起来之前就去下载
-			// `geoip.metadb`，那条请求走 UDP DNS → 必然超时 →
-			// 整个配置解析失败、连接直接失败（真机 2026-11-13 21:51）。
-		},
+		}
+	}
+	// 内核 DNS：**上游必须是 TCP**。
+	//
+	// 为什么（2026-11-13 真机日志）：
+	//   · TCP 经节点是通的（`[TCP] ... ` 里有 17 条正常记录）；
+	//   · hysteria2（QUIC/UDP）全部 `quic: transport closed` —— 我们的 SOCKS 桥
+	//     只支持 TCP，节点侧 UDP 转发不了；
+	//   · 所以 `nameserver: 1.1.1.1`（UDP 查询）必然超时，而 `tcp://1.1.1.1`
+	//     走的是已经验证可通的那条路。
+	// 这些查询会进 tun → MATCH → 节点 → 境外解析，出口与解析器同国，也不泄漏。
+	//
+	// 没有 tun（桌面自测）时同样需要：客户端拉 HTTP 时要解析域名。
+	cfg["dns"] = map[string]any{
+		"enable":        true,
+		"ipv6":          false,
+		"listen":        "0.0.0.0:0",
+		"enhanced-mode": "redir-host",
+		"nameserver":    []string{"tcp://1.1.1.1", "tcp://8.8.8.8"},
+		// **不要 fallback / fallback-filter**：`fallback-filter.geoip: true`
+		// 会要求加载 GeoIP 数据库，而 mihomo 在 tun 起来之前就去下载
+		// `geoip.metadb`，那条请求走 UDP DNS → 必然超时 →
+		// 整个配置解析失败、连接直接失败（真机 2026-11-13 21:51）。
 	}
 	// **不绑 interface-name**：内核的所有出站都先到本地 SOCKS 桥（127.0.0.1），
 	// 绑到 wlan0 会让连回环的那一步直接失败（2026-11-13 真机：所有节点
