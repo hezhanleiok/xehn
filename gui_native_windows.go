@@ -2119,6 +2119,10 @@ func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
 			err = nil
 		}
 	}()
+	// The buffered canvas borrows the paint HDC. Dispose releases its
+	// text-measurement metafile and leaves the HDC valid for Walk's blit.
+	defer c.Dispose()
+
 	b := u.mw.ClientBoundsPixels()
 	pxW := b.Width
 	if pxW < 10 {
@@ -2158,7 +2162,12 @@ func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
 	u.scaleFonts(u.k * 96.0 / float64(dpi))
 	u.sp = u.sp[:0]
 
-	if err := c.FillRectanglePixels(u.brush(th.window), walk.Rectangle{X: 0, Y: 0, Width: b.Width, Height: b.Height}); err != nil {
+	background, err := walk.NewSolidColorBrush(th.window)
+	if err != nil {
+		return err
+	}
+	defer background.Dispose()
+	if err := c.FillRectanglePixels(background, walk.Rectangle{X: 0, Y: 0, Width: b.Width, Height: b.Height}); err != nil {
 		return err
 	}
 	u.paintWallpaper(c, b.Width, b.Height)
