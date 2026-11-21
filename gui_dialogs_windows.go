@@ -409,18 +409,6 @@ func (u *natUI) openDataDir() {
 // instead: a local path is meaningless on another machine, in a screenshot, or
 // after a portable ZIP has been unpacked somewhere else.
 
-// mustCoreDir is the core directory, falling back to the process working
-// directory when the app home cannot be resolved.
-func mustCoreDir() string {
-	if d, err := coreDir(); err == nil {
-		return d
-	}
-	if wd, err := os.Getwd(); err == nil {
-		return wd
-	}
-	return "."
-}
-
 // diagText is what the diagnostics button copies: everything needed to describe
 // this install without asking the user to hunt through folders.
 // diagHeader is the environment half of the diagnostic snapshot: versions,
@@ -557,57 +545,4 @@ func shortVersion() string {
 		return "v" + v
 	}
 	return tr("开发版")
-}
-
-// ---------------------------------------------------------------------------
-// DNS presets
-// ---------------------------------------------------------------------------
-
-type dnsPreset struct {
-	label string
-	value string
-}
-
-var dnsPresets = []dnsPreset{
-	{"阿里", "223.5.5.5, 223.6.6.6"},
-	{"腾讯", "119.29.29.29, 182.254.116.116"},
-	{"Cloudflare", "1.1.1.1, 1.0.0.1"},
-	{"Google", "8.8.8.8, 8.8.4.4"},
-}
-
-func dnsPresetIDs() []string {
-	out := make([]string, 0, len(dnsPresets))
-	for i := range dnsPresets {
-		out = append(out, strconv.Itoa(i))
-	}
-	return out
-}
-
-func dnsPresetLabels() []string {
-	out := make([]string, 0, len(dnsPresets))
-	for i := range dnsPresets {
-		out = append(out, dnsPresets[i].label)
-	}
-	return out
-}
-
-func currentDNSPreset(v string) string {
-	norm := normaliseDNS(v)
-	if norm == "" {
-		return ""
-	}
-	for i := range dnsPresets {
-		if normaliseDNS(dnsPresets[i].value) == norm {
-			return strconv.Itoa(i)
-		}
-	}
-	return ""
-}
-
-func normaliseDNS(v string) string {
-	fields := fieldList(v)
-	for i := range fields {
-		fields[i] = strings.ToLower(fields[i])
-	}
-	return strings.Join(fields, ",")
 }

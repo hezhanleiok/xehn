@@ -11,8 +11,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xhwarp/warp-client/internal/cache"
@@ -140,6 +142,10 @@ type clientState struct {
 	OpenVPNMode   bool         `json:"openvpn_mode,omitempty"`
 	OpenVPNRegion string       `json:"openvpn_region,omitempty"`
 	OpenVPNNode   *vpnGateNode `json:"openvpn_node,omitempty"`
+	// SubMode marks a subscription (mode B) session. A repair rebuilds the
+	// session from state.json alone, and without this flag it would render a
+	// WARP config for a session whose whole point is not using WARP.
+	SubMode bool `json:"sub_mode,omitempty"`
 	// MeasuredBps is the connect-time throughput of this session's exit. It is
 	// runtime-only: state.json must not carry a stale speed into a later status
 	// read, and the cross-connect speed memory lives in vpngate-speeds.json.
@@ -198,9 +204,9 @@ func saveState(s clientState) error {
 // ensureAccount loads the cached account, or registers a fresh one when none
 // exists or the caller asks to rotate. Loading means applying: the connect
 // pipeline renders configs from the package globals (warpPrivateKey and
-// friends), so an account that is merely validated but never applied leaves
-// the hardcoded default device in place — every "warm" connect would silently
-// ride a stranger's shared key instead of the registered one.
+// friends), so an account that is merely validated but never applied leaves the
+// process with no device identity at all — this build ships none, so every
+// "warm" connect would otherwise render an empty key.
 func ensureAccount(ctx context.Context, opts options) error {
 	path, err := accountPath()
 	if err != nil {
@@ -208,13 +214,43 @@ func ensureAccount(ctx context.Context, opts options) error {
 	}
 	opts.accountPath = path
 	if opts.freshAccount {
-		return runRegisterCmd(ctx, opts)
+		if err := runRegisterCmd(ctx, opts); err != nil {
+			return err
+		}
+		return validateAccountFor(opts)
 	}
 	if a, err := loadAccount(path); err == nil {
 		applyAccount(a)
+		return validateAccountFor(opts)
+	}
+	if err := runRegisterCmd(ctx, opts); err != nil {
+		return err
+	}
+	return validateAccountFor(opts)
+}
+
+// validateAccountFor refuses to continue without a real device identity.
+//
+// There is no built-in fallback identity on purpose: an empty private key
+// renders a tunnel that can never handshake, and a bundled one belongs to
+// whoever built the binary. Either way the failure is silent — a config that
+// looks valid and passes nothing — so it is caught here, before any core starts.
+// IPv6 is per device too: asking for it without an address must not fall back to
+// someone else's.
+func validateAccountFor(opts options) error {
+	// Subscription mode renders only the imported proxies plus an OpenVPN exit
+	// chained to one of them; no WARP device is involved, so an account is not
+	// required there (a user who only ever uses subscriptions never needs one).
+	if opts.connMode == "subscription" {
 		return nil
 	}
-	return runRegisterCmd(ctx, opts)
+	if warpPrivateKey == "" {
+		return fmt.Errorf("尚未注册 WARP 账号：首次连接会自动注册；若一直失败请检查网络后重试，或运行 xehn register")
+	}
+	if opts.ipFamily() != famV4 && warpAddressV6 == "" {
+		return fmt.Errorf("当前账号没有 IPv6 地址：请在设置里改用 IPv4，或运行 xehn register 重新注册")
+	}
+	return nil
 }
 
 // scanResult is the cacheable projection of a scan we keep for reconnect.
@@ -265,11 +301,12 @@ func scanKeyFor(opts options) string {
 // for a chain (the outer half comes from the `outer` nest), the protocol
 // itself otherwise.
 func runCachedScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRun, error) {
+	endpointRankMode = normalizeRank(opts.endpointRank)
 	store, err := cache.Open(cache.Options{TTL: scanTTL})
 	if err != nil {
 		return nil, protoRun{}, err
 	}
-	key := scanCacheKey(scanKeyFor(opts), opts.ipv6)
+	key := scanCacheKey(scanKeyFor(opts), scanFamilyV6())
 	if !opts.scanNow {
 		if raw, ok := store.Get(key); ok {
 			var cs cachedScan
@@ -282,7 +319,12 @@ func runCachedScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRu
 				if cs.Proto == opts.proto {
 					stageMsg(fmt.Sprintf("[%s] 使用缓存端点（%d 个，扫描于 %s）",
 						protoLabel(opts.proto), len(cs.Results), cs.At.Format("01-02 15:04")))
-					return cs.Results, mustParseProto(opts.proto), nil
+					run := mustParseProto(opts.proto)
+					ranked, changed := rankEndpointsBySpeed(ctx, opts, run, cs.Results)
+					if changed {
+						writeSpeedCache(opts, ranked)
+					}
+					return ranked, run, nil
 				}
 			}
 		}
@@ -292,10 +334,11 @@ func runCachedScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRu
 	if err != nil {
 		return nil, run, err
 	}
+	results, _ = rankEndpointsBySpeed(ctx, opts, run, results)
 	stageMsg(fmt.Sprintf("[%s] 端点扫描完成（%d 个结果）", protoLabel(opts.proto), len(results)))
 	// The cache's Proto records the user-facing protocol the scan ran under
 	// ("wwarp" for chains) so a later read can tell the two apart.
-	cs := cachedScan{Proto: scanKeyFor(opts), IPv6: opts.ipv6, At: time.Now(), Results: results}
+	cs := cachedScan{Proto: scanKeyFor(opts), IPv6: scanFamilyV6(), At: time.Now(), Results: results}
 	if raw, err := json.Marshal(cs); err == nil {
 		_ = store.Put(key, raw)
 	}
@@ -378,6 +421,93 @@ func projectCacheEndpoints(ph phaseResult) []cachedEndpoint {
 	return out
 }
 
+// rankEndpointsBySpeed is the S1-1 ranking probe. When endpoint_rank=speed it
+// measures the steady-state throughput of the top few ping-ranked working
+// candidates (inside the scan's own netstack — no mihomo restart per endpoint),
+// writes the result onto each record, and re-orders the set by throughput tier.
+// It returns whether anything was newly measured so the caller knows to persist
+// the cache. Chains are left alone: a candidate measured here would not ride the
+// outer tunnel, so its number would describe the wrong path.
+func rankEndpointsBySpeed(ctx context.Context, opts options, run protoRun, results []cachedEndpoint) ([]cachedEndpoint, bool) {
+	if normalizeRank(opts.endpointRank) != rankSpeed || opts.through != "" {
+		return results, false
+	}
+	var idx []int
+	for i := range results {
+		if results[i].Working && results[i].Endpoint != "" && results[i].Speed <= 0 {
+			idx = append(idx, i)
+			if len(idx) >= endpointRankProbeCount {
+				break
+			}
+		}
+	}
+	if len(idx) == 0 {
+		// Already measured (a cached scan that ran the probe before): just apply
+		// the tier ordering, no network work.
+		sortCachedByRank(results)
+		return results, false
+	}
+	if err := ensureAccount(ctx, opts); err != nil {
+		return results, false
+	}
+	tn, err := newTunnel(run)
+	if err != nil {
+		return results, false
+	}
+	defer closeAfterDrain(tn)
+	timeout := time.Duration(opts.timeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	measured := false
+	for _, i := range idx {
+		if ctx.Err() != nil {
+			break
+		}
+		ce := results[i]
+		if !tn.handshake(ctx, ce.Endpoint, timeout) {
+			continue
+		}
+		if mbps, ok := tn.stack().speedTestMulti(ctx, rankStreams); ok {
+			results[i].Speed = mbps
+			measured = true
+			stageMsg(fmt.Sprintf("[%s] 端点 %s 稳态吞吐 %.1f Mbps", protoLabel(opts.proto), ce.Endpoint, mbps))
+		}
+	}
+	sortCachedByRank(results)
+	return results, measured
+}
+
+// sortCachedByRank orders working endpoints first, then by the active ranking
+// comparator (latency, or throughput tier when speed is opted in). Stable so
+// equal candidates keep their scanned order.
+func sortCachedByRank(results []cachedEndpoint) {
+	sort.SliceStable(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if a.Working != b.Working {
+			return a.Working
+		}
+		if !a.Working {
+			return false
+		}
+		return betterEndpoint(a, b)
+	})
+}
+
+// writeSpeedCache persists freshly measured throughput back into the scan cache
+// so later connects reuse it instead of re-probing. The TTL refresh is intended:
+// a speed number is only worth keeping while it is recent.
+func writeSpeedCache(opts options, results []cachedEndpoint) {
+	store, err := cache.Open(cache.Options{TTL: scanTTL})
+	if err != nil {
+		return
+	}
+	cs := cachedScan{Proto: scanKeyFor(opts), IPv6: scanFamilyV6(), At: time.Now(), Results: results}
+	if raw, err := json.Marshal(cs); err == nil {
+		_ = store.Put(scanCacheKey(scanKeyFor(opts), scanFamilyV6()), raw)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Full mihomo config rendering. warpscout already renders the `proxies:` block
 // for a single endpoint; a running client needs mixed-port, proxy-groups,
@@ -386,6 +516,11 @@ func projectCacheEndpoints(ph phaseResult) []cachedEndpoint {
 
 // renderClientConfig builds a complete config.yaml from the selected endpoint.
 func renderClientConfig(opts options, ce cachedEndpoint, run protoRun) ([]byte, error) {
+	// Mode B is a separate pipeline: imported Clash proxies become the base
+	// outbound and no WARP endpoint is touched. Mode A below stays unchanged.
+	if opts.connMode == "subscription" {
+		return renderSubscriptionConfig(opts)
+	}
 	if opts.mixedPort == 0 {
 		opts.mixedPort = core.DefaultMixedPort
 	}
@@ -484,63 +619,18 @@ func renderClientConfig(opts options, ce cachedEndpoint, run protoRun) ([]byte, 
 		// of whether mihomo can resolve the connecting process on this host.
 		fmt.Fprintf(&b, "socks-port: %d\n", underlaySocksPort(opts.mixedPort))
 	}
-	fmt.Fprintf(&b, "allow-lan: %t\n", opts.allowLan)
-	if opts.allowLan {
-		b.WriteString("bind-address: \"*\"\n")
-	}
+	writeLanBlock(&b, opts)
 	fmt.Fprintf(&b, "mode: %s\n", mihomoMode(opts))
 	b.WriteString("log-level: info\n")
 	fmt.Fprintf(&b, "ipv6: %t\n", opts.ipFamily() != famV4)
 	fmt.Fprintf(&b, "external-controller: 127.0.0.1:%d\n", opts.apiPort)
-	if dns := confDNSList(opts); len(dns) > 0 {
-		b.WriteString("dns:\n  enable: true\n")
-		fmt.Fprintf(&b, "  ipv6: %t\n", opts.ipFamily() != famV4)
-		if dnsLeakProtected(opts) {
-			// Resolver queries follow the rule set, and the resolvers used to
-			// reach the proxy servers are declared separately. Without this,
-			// mihomo answers upstream directly even while traffic is proxied.
-			b.WriteString("  respect-rules: true\n  proxy-server-nameserver:\n")
-			for _, s := range dns {
-				fmt.Fprintf(&b, "    - %s\n", s)
-			}
-		}
-		b.WriteString("  nameserver:\n")
-		for _, s := range dns {
-			fmt.Fprintf(&b, "    - %s\n", s)
-		}
-		// Bypass mode splits resolution as well as traffic: CN domains are
-		// answered by a domestic resolver, directly. Without this every lookup —
-		// baidu.com included — is answered through the tunnel, which costs a
-		// round trip per domain and returns answers computed for an overseas
-		// client, so "direct" traffic still feels slow.
-		if opts.proxyMode == modeBypass && geoDataReady() {
-			cn, intl := domesticDNS(opts), foreignDNS(opts)
-			if cn != "" || intl != "" {
-				b.WriteString("  nameserver-policy:\n")
-				if cn != "" {
-					fmt.Fprintf(&b, "    \"geosite:cn\": %s\n", cn)
-				}
-				if intl != "" {
-					fmt.Fprintf(&b, "    \"geosite:geolocation-!cn\": %s\n", intl)
-				}
-			}
-		}
-		// An external DNS listener is only useful for TUN-mode hijack, and a
-		// fixed 5353 bind fails outright on hosts with reserved port ranges —
-		// mihomo's internal resolver works without it.
-		if opts.tunMode {
-			b.WriteString("  listen: 127.0.0.1:1053\n")
-		}
+	// Additive core tunings (S1-4): parallel TCP dials and unified delay
+	// accounting. Rendered only when the connect's capability gate confirmed the
+	// running core parses them; subscription mode ships the same pair.
+	if opts.tuningsOK {
+		b.WriteString("tcp-concurrent: true\nunified-delay: true\n")
 	}
-	if opts.tunMode {
-		b.WriteString("tun:\n  enable: true\n  stack: gvisor\n  auto-route: true\n  auto-detect-interface: true\n")
-		if dnsLeakProtected(opts) {
-			// Covers applications that ignore the system resolver: their port
-			// 53 traffic enters the tunnel and is answered by mihomo instead
-			// of escaping to the local network's DNS.
-			b.WriteString("  dns-hijack:\n    - any:53\n")
-		}
-	}
+	writeDNSAndTun(&b, opts)
 
 	b.WriteString("proxies:\n")
 	b.WriteString(proxyBody)
@@ -573,7 +663,14 @@ func renderClientConfig(opts options, ce cachedEndpoint, run protoRun) ([]byte, 
 		return []byte(b.String()), nil
 	}
 	fmt.Fprintf(&b, "  - name: WARP\n    type: select\n    proxies:\n      - %s\n      - DIRECT\n", egressName)
-	fmt.Fprintf(&b, "  - name: auto\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    proxies:\n      - %s\n", egressName)
+	autoGroup := "  - name: auto\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n"
+	if opts.tuningsOK {
+		// Lazy health-check with a bounded probe timeout (S1-4): the group only
+		// tests when used, and a dark member cannot hold the scheduler hostage.
+		autoGroup += "    lazy: true\n    timeout: 3000\n"
+	}
+	autoGroup += fmt.Sprintf("    proxies:\n      - %s\n", egressName)
+	b.WriteString(autoGroup)
 	b.WriteString("rules:\n")
 	for _, r := range routeRules(opts, "WARP") {
 		fmt.Fprintf(&b, "  - %s\n", r)
@@ -594,6 +691,72 @@ func mihomoMode(o options) string {
 		return "direct"
 	}
 	return "rule"
+}
+
+// writeDNSAndTun emits the resolver and TUN blocks shared by both session
+// renderers (WARP and subscription). Subscription mode used to omit them
+// entirely, which left TUN capture with no device and DNS protection inert;
+// one function keeps the two modes honest about the same guarantees.
+func writeDNSAndTun(b *strings.Builder, opts options) {
+	if dns := confDNSList(opts); len(dns) > 0 {
+		b.WriteString("dns:\n  enable: true\n")
+		fmt.Fprintf(b, "  ipv6: %t\n", opts.ipFamily() != famV4)
+		if dnsLeakProtected(opts) {
+			// Resolver queries follow the rule set, and the resolvers used to
+			// reach the proxy servers are declared separately. Without this,
+			// mihomo answers upstream directly even while traffic is proxied.
+			b.WriteString("  respect-rules: true\n  proxy-server-nameserver:\n")
+			for _, s := range dns {
+				fmt.Fprintf(b, "    - %s\n", s)
+			}
+		}
+		b.WriteString("  nameserver:\n")
+		for _, s := range dns {
+			fmt.Fprintf(b, "    - %s\n", s)
+		}
+		// Bypass mode splits resolution as well as traffic: CN domains are
+		// answered by a domestic resolver, directly. Without this every lookup —
+		// baidu.com included — is answered through the tunnel, which costs a
+		// round trip per domain and returns answers computed for an overseas
+		// client, so "direct" traffic still feels slow.
+		if opts.proxyMode == modeBypass && geoDataReady() {
+			cn, intl := domesticDNS(opts), foreignDNS(opts)
+			if cn != "" || intl != "" {
+				b.WriteString("  nameserver-policy:\n")
+				if cn != "" {
+					fmt.Fprintf(b, "    \"geosite:cn\": %s\n", cn)
+				}
+				if intl != "" {
+					fmt.Fprintf(b, "    \"geosite:geolocation-!cn\": %s\n", intl)
+				}
+			}
+		}
+		// An external DNS listener is only useful for TUN-mode hijack, and a
+		// fixed 5353 bind fails outright on hosts with reserved port ranges —
+		// mihomo's internal resolver works without it.
+		if opts.tunMode {
+			b.WriteString("  listen: 127.0.0.1:1053\n")
+		}
+	}
+	if opts.tunMode {
+		// mihomo's sing-tun falls back to MTU 9000 when the line is omitted,
+		// while the WARP/MASQUE outbound's gVisor stack carries 1280. A 9000
+		// byte frame cannot cross that link: it is fragmented or dropped,
+		// which is exactly the "connected but downloads crawl" symptom.
+		// Pin the TUN to the MTU the tunnel actually carries (or the user's
+		// explicit setting), matching the scan and capability probe configs.
+		tunMTU := opts.mtu
+		if tunMTU <= 0 {
+			tunMTU = tunnelMTU
+		}
+		fmt.Fprintf(b, "tun:\n  enable: true\n  stack: gvisor\n  mtu: %d\n  auto-route: true\n  auto-detect-interface: true\n", tunMTU)
+		if dnsLeakProtected(opts) {
+			// Covers applications that ignore the system resolver: their port
+			// 53 traffic enters the tunnel and is answered by mihomo instead
+			// of escaping to the local network's DNS.
+			b.WriteString("  dns-hijack:\n    - any:53\n")
+		}
+	}
 }
 
 // dnsLeakProtected is the precondition for the DNS hardening block: there has
@@ -848,15 +1011,36 @@ const probeBudget = 9 * time.Second
 // cannot resolve - is a failure here, never a "connected" whose payload is a
 // browser that cannot load a page. Returning without an error means at least
 // one source answered 2xx through the tunnel.
-func fetchExitProbe(mixedPort int) (clientState, error) {
-	var out clientState
-	proxyURL := "http://127.0.0.1:" + strconv.Itoa(mixedPort)
-	client := &http.Client{
+// exitProbeClients caches one client per mixed port. The status loop probes the
+// exit every 2 seconds; building a fresh Transport on each poll leaked a
+// connection pool plus its reader goroutines every time, which is the
+// handle/working-set climb visible while connected (~45 handles and ~2.5MB per
+// minute). Caching also lets the probe reuse its TCP+TLS connection, so it costs
+// less than it did.
+var (
+	exitProbeMu      sync.Mutex
+	exitProbeClients = map[int]*http.Client{}
+)
+
+func exitProbeClient(mixedPort int) *http.Client {
+	exitProbeMu.Lock()
+	defer exitProbeMu.Unlock()
+	if c, ok := exitProbeClients[mixedPort]; ok {
+		return c
+	}
+	c := &http.Client{
 		Timeout: probeTimeout,
 		Transport: &http.Transport{
-			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
+			Proxy: http.ProxyURL(mustParseURL("http://127.0.0.1:" + strconv.Itoa(mixedPort))),
 		},
 	}
+	exitProbeClients[mixedPort] = c
+	return c
+}
+
+func fetchExitProbe(mixedPort int) (clientState, error) {
+	var out clientState
+	client := exitProbeClient(mixedPort)
 	var (
 		lastErr  error
 		lastCode int
@@ -1020,6 +1204,23 @@ func fetchSessionProbe(mixedPort int, family string) (clientState, error) {
 	return fetchExitProbe(mixedPort)
 }
 
+// writeLanBlock emits allow-lan, bind-address and the optional authentication
+// entry. Shared by the WARP renderer and the subscription renderer so the two
+// cannot drift: allow-lan with a loopback bind looks enabled but is unreachable,
+// and a missing authentication line would silently drop the user's password.
+func writeLanBlock(b *strings.Builder, opts options) {
+	fmt.Fprintf(b, "allow-lan: %t\n", opts.allowLan)
+	if !opts.allowLan {
+		b.WriteString("bind-address: 127.0.0.1\n")
+		return
+	}
+	b.WriteString("bind-address: \"*\"\n")
+	if opts.lanAuth != "" {
+		// mihomo's shape is a list of "user:pass" strings.
+		fmt.Fprintf(b, "authentication:\n  - %q\n", opts.lanAuth)
+	}
+}
+
 // verifyTunnel is the data-plane gate between "the core process is listening"
 // and "Connected": a tunnel counts only after a real HTTPS round-trip through
 // the mixed port, an IPv6 round-trip when the config asked for v6, and an exit
@@ -1066,10 +1267,22 @@ func verifyTunnel(opts options, logf func(string)) (clientState, error) {
 	logf("数据面验证：吞吐（下载载荷）…")
 	bps, terr := probeThroughput(opts.mixedPort, payloadBytes, payloadTimeout)
 	if terr != nil {
-		return probe, fmt.Errorf("隧道能握手但无法传输数据: %w", terr)
+		// The small HTTPS probe above already proved the tunnel carries data.
+		// A pinned relay is an explicit user choice: on slow public VPNGate
+		// relays the bulk transfer can time out while ordinary browsing still
+		// works, and failing here silently rotates the user to another country.
+		// Keep the relay, report zero speed, and let the speed gate (which is
+		// deliberately disabled for pins) decide instead.
+		if opts.openvpnMode && opts.openvpnNodePin != "" {
+			logf("固定节点吞吐探测超时，保留用户选择的出口（小请求已通）")
+			probe.MeasuredBps = 0
+		} else {
+			return probe, fmt.Errorf("隧道能握手但无法传输数据: %w", terr)
+		}
+	} else {
+		probe.MeasuredBps = bps
+		logf("吞吐验证成功")
 	}
-	probe.MeasuredBps = bps
-	logf("吞吐验证成功")
 
 	// DNS, as its own line: the round-trip above proves it implicitly (every
 	// source is a hostname resolved inside the tunnel), so this is a report,
@@ -1119,6 +1332,13 @@ func verifyTunnelV6Only(opts options, logf func(string)) (clientState, error) {
 	if err != nil {
 		if derr := probeDNSTunnel(opts.mixedPort); derr != nil {
 			return clientState{}, fmt.Errorf("IPv6 请求超时/失败（且隧道内 DNS 不可用）: %w (DNS: %v)", err, derr)
+		}
+		// DNS inside the tunnel answered, so the tunnel itself is up and only the
+		// IPv6 leg failed. In subscription mode that is the node's own egress
+		// lacking IPv6 — the client did its part (ipv6:true, the probe routed
+		// through the node), so say whose limitation it is.
+		if opts.connMode == "subscription" {
+			return clientState{}, fmt.Errorf("IPv6 请求超时/失败（隧道内 DNS 正常，但节点出站不通 IPv6）: %w；该节点可能只支持 IPv4 出站，请在「设置 → IP 协议」改用 IPv4 或双栈", err)
 		}
 		return clientState{}, fmt.Errorf("IPv6 请求超时/失败（隧道内 DNS 正常）: %w", err)
 	}
@@ -1271,7 +1491,32 @@ func cachedScanFor(proto string, ipv6 bool) (cachedScan, bool) {
 	return cs, true
 }
 
+// endpointRankMode selects how pickBest orders working endpoints. It mirrors
+// report.go's bestBy global: the connect/scan path sets it from the user's
+// endpoint_rank choice, and it defaults to ping so an untouched install keeps
+// the historical latency ordering.
+var endpointRankMode = rankPing
+
 func betterEndpoint(a, b cachedEndpoint) bool {
+	// Speed tier (S1-1), only when opted in. Two measured endpoints compete by
+	// throughput first, but a small edge is noise: they fall back to loss and
+	// latency unless one is at least speedTierRatio times the other. A measured
+	// endpoint outranks an unmeasured one — its capacity is proven, not assumed.
+	if endpointRankMode == rankSpeed {
+		switch {
+		case a.Speed > 0 && b.Speed > 0:
+			if a.Speed >= b.Speed*speedTierRatio {
+				return true
+			}
+			if b.Speed >= a.Speed*speedTierRatio {
+				return false
+			}
+		case a.Speed > 0:
+			return true
+		case b.Speed > 0:
+			return false
+		}
+	}
 	// Prefer lower in-tunnel latency when present, else endpoint ping.
 	al := a.TunPingMS
 	bl := b.TunPingMS

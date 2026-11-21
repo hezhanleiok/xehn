@@ -10,29 +10,40 @@ import (
 	"github.com/xhwarp/warp-client/internal/core"
 )
 
-// Settings is one vertical column of cards: capture, routing, behaviour, and
-// DNS/exit. The column is taller than the window body, so the page scrolls;
-// the header stays put and the content is clipped to the body rectangle.
+// Settings is one vertical column of three cards: connection/capture, routing,
+// and exit/startup. The knobs that used to fill a fourth "behaviour" card are
+// internalized (forced defaults in normalize), so the page stays short enough
+// to read at a glance. The column still scrolls on a short window; the header
+// stays put and the content is clipped to the body rectangle.
 const (
-	setCardGap    = 14.0
-	setConnH      = 316.0
-	setRoutingH   = 244.0
-	setBehaviourH = 236.0
-	setExitH      = 376.0
+	setCardGap  = 14.0
+	setConnBase = 252.0 // LAN sharing off: no credential rows at all
+	setConnLan  = 376.0 // sharing on: + two credential rows and the hint line
+	setRoutingH = 300.0
+	setExitH    = 392.0
 )
 
+// setConnHeight follows the sharing switch. The credential rows do not exist
+// while sharing is off — a username/password field for a listener that is not
+// open is noise, and showing them made the page look like it had leaked them.
+func (u *natUI) setConnHeight() float64 {
+	if u.m.set.AllowLan {
+		return setConnLan
+	}
+	return setConnBase
+}
+
 func (u *natUI) settingsContentH() float64 {
-	return setConnH + setCardGap + setRoutingH + setCardGap + setBehaviourH + setCardGap + setExitH
+	return u.setConnHeight() + setCardGap + setRoutingH + setCardGap + setExitH
 }
 
 // settingsTops returns the top of each card in design coordinates for the
-// current scroll offset: connection, routing, behaviour, DNS/exit.
-func (u *natUI) settingsTops() (conn, routing, behaviour, exit float64) {
+// current scroll offset: connection, routing, exit/startup.
+func (u *natUI) settingsTops() (conn, routing, exit float64) {
 	conn = shellBodyY - float64(u.m.setScroll)
-	routing = conn + setConnH + setCardGap
-	behaviour = routing + setRoutingH + setCardGap
-	exit = behaviour + setBehaviourH + setCardGap
-	return conn, routing, behaviour, exit
+	routing = conn + u.setConnHeight() + setCardGap
+	exit = routing + setRoutingH + setCardGap
+	return conn, routing, exit
 }
 
 // clampSetScroll keeps the scroll offset inside the content and records the
@@ -53,14 +64,13 @@ func (u *natUI) clampSetScroll() {
 
 func (u *natUI) paintSettings(c *walk.Canvas) {
 	u.clampSetScroll()
-	x, w := shellContentX, u.contentW()
-	clip := u.r(shellContentX, shellBodyY, u.contentW(), shellBodyH)
+	x, w := u.contentX(), u.contentW()
+	clip := u.r(u.contentX(), shellBodyY, u.contentW(), shellBodyH)
 	start := len(u.sp)
 	u.clipCanvas(c, clip, func() {
-		conn, routing, behaviour, exit := u.settingsTops()
+		conn, routing, exit := u.settingsTops()
 		u.paintSetConnection(c, x, conn, w)
 		u.paintSetRouting(c, x, routing, w)
-		u.paintSetBehaviour(c, x, behaviour, w)
 		u.paintSetExit(c, x, exit, w)
 	})
 	u.clipSpots(start, clip)
@@ -145,37 +155,172 @@ func (u *natUI) paintSetScrollbar(c *walk.Canvas) {
 	u.addSpot("set:scrollbar", u.r(trackX-7, top, 18, h), true)
 }
 
-// paintSetConnection holds the local proxy and the way the host is captured:
-// the mixed port, LAN access, the API port, the tunnel's address family, MTU,
-// and the two persistence actions.
-func (u *natUI) paintSetConnection(c *walk.Canvas, x, y, w float64) {
-	cy := u.card(c, x, y, w, setConnH, tr("连接与接管"))
-	s := u.m.set
-	u.rowChips(c, x, cy, w, "set:capture:", tr("接管方式"),
-		[]string{captureProxy, captureTun},
-		[]string{tr("系统代理"), tr("VPN / TUN")}, s.CaptureMode)
-	u.rowEdit(c, x, cy+38, w, "set:mixedport", tr("本地代理端口"),
-		itoa(int64(s.MixedPort)), itoa(int64(core.DefaultMixedPort)))
-	u.rowToggle(c, x, cy+76, w, "set:allowlan", tr("允许局域网访问"),
-		tr("局域网内其它设备可通过本机 IP:端口 使用代理"), s.AllowLan, true)
-	u.rowEdit(c, x, cy+114, w, "set:apiport", tr("API 端口"),
-		itoa(int64(s.APIPort)), itoa(int64(core.DefaultAPIPort)))
-	u.familyRow(c, x, cy+152, w)
-	u.rowEdit(c, x, cy+190, w, "set:mtu", tr("MTU"), itoa(int64(s.MTU)), tr("0 = 自动"))
-
-	const bw = 180.0
-	u.button(c, x+16, cy+232, bw, 34, "set:connect", tr("重新连接以应用"), true, u.m.connected)
-	u.button(c, x+26+bw, cy+232, bw, 34, "set:reset", tr("恢复默认"), false, true)
+// maskPassword renders a stored password as dots in the settings list. The edit
+// dialog still shows the real value, so the user can change it; only the row
+// label is masked.
+func maskPassword(p string) string {
+	if p == "" {
+		return ""
+	}
+	n := len([]rune(p))
+	if n > 24 {
+		n = 24
+	}
+	return strings.Repeat("•", n)
 }
 
-// familyRow is the address-family dropdown. A protocol that cannot carry v6
-// disables it outright (the renderer would clamp the value anyway), with the
+// lanAuthHint says what the credential pair will do right now, including the
+// half-filled case that would otherwise look configured but authenticate
+// nothing.
+func lanAuthHint(s clientSettings) string {
+	if !s.AllowLan {
+		return tr("开启局域网共享后可设置")
+	}
+	switch {
+	case s.LanUser == "" && s.LanPass == "":
+		return tr("留空表示不验证，局域网内任何人都能用")
+	case s.LanUser == "" || s.LanPass == "":
+		return tr("用户名和密码需同时填写才生效")
+	default:
+		return trf("已启用：其它设备需输入用户名 %s 与密码", s.LanUser)
+	}
+}
+
+// paintSetConnection holds the way the host is captured (a dropdown now, not
+// chips), the mixed port, LAN sharing and the tunnel family. Everything else
+// the old card carried (API port, MTU, timeout, DNS leak protection) is
+// internalized in normalize and no longer drawn at all.
+func (u *natUI) paintSetConnection(c *walk.Canvas, x, y, w float64) {
+	cy := u.card(c, x, y, w, u.setConnHeight(), tr("连接与接管"))
+	s := u.m.set
+	u.captureRow(c, x, cy, w)
+	u.rowEdit(c, x, cy+52, w, "set:mixedport", tr("本地代理端口"),
+		itoa(int64(s.MixedPort)), itoa(int64(core.DefaultMixedPort)))
+	// One real capability, one switch: allow-lan widens the listener to "*" so
+	// other devices can use this machine's IP:port. "LAN sharing" is the same
+	// thing, so the label names both rather than faking a second toggle.
+	// Spell out the exact address other devices must use. "127.0.0.1:7890" is
+	// the single most common way this feature looks broken: on a phone that
+	// loopback is the phone itself, and 7890 is another client's default port.
+	lanAddr := "本机IP"
+	if ip := u.m.localLan; ip != "" {
+		lanAddr = ip
+	}
+	u.rowToggle(c, x, cy+104, w, "set:allowlan", tr("允许局域网访问（局域网共享）"),
+		trf("其它设备填 %s:%d（HTTP 与 SOCKS5 同端口）", lanAddr, s.MixedPort), s.AllowLan, true)
+	// Optional HTTP/SOCKS credentials, drawn only while sharing is on. Both
+	// empty is the default and means the listener stays open to the LAN;
+	// filling both makes mihomo demand them. Hiding the rows when sharing is
+	// off keeps a password field from sitting on a page where it does nothing.
+	if s.AllowLan {
+		u.rowEdit(c, x, cy+156, w, "set:lanuser", tr("共享认证用户名"),
+			s.LanUser, tr("留空表示不验证"))
+		u.rowEdit(c, x, cy+208, w, "set:lanpass", tr("共享认证密码"),
+			maskPassword(s.LanPass), tr("留空表示不验证"))
+		// One line that states the effective state, so "filled in one box" is
+		// not silently indistinguishable from "protected".
+		hintCol := th.dim
+		if (s.LanUser == "") != (s.LanPass == "") {
+			hintCol = th.warn
+		}
+		u.txt(c, x+16, cy+246, w-32, 16, lanAuthHint(s), u.f.f8, hintCol)
+		u.familyRow(c, x, cy+276, w)
+		return
+	}
+	u.familyRow(c, x, cy+158, w)
+}
+
+// captureRow is the capture-mode dropdown: system proxy or TUN device.
+func (u *natUI) captureRow(c *walk.Canvas, x, y, w float64) {
+	u.txt(c, x+16, y+8, w-270, 20, tr("连接方式"), u.f.f10, th.text)
+	box := u.r(x+w-16-228, y+4, 228, 30)
+	u.fillRound(c, th.input, box, ctrlRadius)
+	if u.m.hover == "drop:capture" {
+		u.strokeRound(c, th.accentLine, box, ctrlRadius)
+	}
+	u.textL(c, captureLabel(u.m.set.CaptureMode), u.f.f10, th.text, u.r(x+w-16-228+10, y+4, 192, 30))
+	u.icon(c, "chevron", x+w-16-22, y+4+9, 12, th.faint)
+	u.addSpot("drop:capture", box, true)
+}
+
+func captureLabel(m string) string {
+	if m == captureTun {
+		return tr("TUN 虚拟网卡")
+	}
+	return tr("系统代理")
+}
+
+// paintCapturePopup lists the two capture modes with what each one actually
+// covers, because "which programs does this catch" is the question the choice
+// really answers.
+func (u *natUI) paintCapturePopup(c *walk.Canvas, ax, ay, aw, ah float64) {
+	const (
+		rowH = 48.0
+		pad  = 6.0
+	)
+	items := []struct{ mode, label, hint string }{
+		{captureProxy, tr("系统代理"), tr("仅接管使用系统代理的程序")},
+		{captureTun, tr("TUN 虚拟网卡"), tr("全机接管 · 需管理员权限")},
+	}
+	ph := pad*2 + float64(len(items))*rowH
+	py := popupBelow(ay, ah, ph)
+	box := u.r(ax, py, aw, ph)
+	u.shadowRound(c, box, panelRadius, shadowTint(), th.window)
+	u.fillRound(c, th.card, box, panelRadius)
+	u.strokeRound(c, mix(th.card, rx(255, 255, 255), 0.55), box, panelRadius)
+
+	cur := u.m.set.CaptureMode
+	for i, it := range items {
+		ry := py + pad + float64(i)*rowH
+		id := "pickcapture:" + it.mode
+		r := u.r(ax+6, ry, aw-12, rowH)
+		if u.m.hover == id {
+			u.fillRound(c, th.cardHover, r, ctrlRadius)
+		}
+		col := th.text
+		if cur == it.mode {
+			col = th.accent
+		}
+		u.txt(c, ax+16, ry+6, aw-44, 20, it.label, u.f.f10, col)
+		u.txt(c, ax+16, ry+26, aw-44, 16, it.hint, u.f.f8, th.faint)
+		if cur == it.mode {
+			u.statusDot(c, ax+aw-24, ry+rowH/2, 3.5, th.accent)
+		}
+		u.addSpot(id, r, true)
+	}
+}
+
+// familyV6OK is the live capability gate for the family selector. Stacked
+// exits are v4-only; subscription mode has no WARP tunnel so the imported node
+// decides (the selector stays open); otherwise the base protocol's inner MTU
+// decides.
+func (u *natUI) familyV6OK() bool {
+	if u.m.psiphon || u.m.openvpn {
+		return false
+	}
+	if u.m.set.ConnMode == "subscription" {
+		return true
+	}
+	return protoV6Capable(u.m.proto)
+}
+
+// familyRow is the address-family dropdown. A configuration that cannot carry
+// v6 disables it outright (the renderer would clamp the value anyway), with the
 // reason written where the choice would be.
 func (u *natUI) familyRow(c *walk.Canvas, x, y, w float64) {
-	ok := protoV6Capable(u.m.proto)
-	u.txt(c, x+16, y+2, w-270, 18, tr("地址族"), u.f.f10, th.text)
-	if !ok {
-		u.txt(c, x+16, y+20, w-270, 14, tr("当前协议仅支持 IPv4"), u.f.f8, th.faint)
+	ok := u.familyV6OK()
+	u.txt(c, x+16, y+2, w-270, 18, tr("IPv6 协议"), u.f.f10, th.text)
+	sub := ""
+	switch {
+	case u.m.psiphon || u.m.openvpn:
+		sub = tr("叠加出口仅支持 IPv4")
+	case !ok:
+		sub = tr("当前协议仅支持 IPv4")
+	case u.m.set.ConnMode == "subscription":
+		sub = tr("订阅节点需自身支持 IPv6")
+	}
+	if sub != "" {
+		u.txt(c, x+16, y+20, w-270, 14, sub, u.f.f8, th.faint)
 	}
 	u.paintFamilyDropdown(c, x+w-16-228, y+4, 228, 30, ok)
 }
@@ -223,7 +368,11 @@ func (u *natUI) paintFamilyPopup(c *walk.Canvas, ax, ay, aw, ah float64) {
 	u.strokeRound(c, mix(th.card, rx(255, 255, 255), 0.55), box, panelRadius)
 
 	cur := u.m.set.IPFamily
-	v6ok := protoV6Capable(u.m.proto)
+	v6ok := u.familyV6OK()
+	noV6 := tr("协议不支持")
+	if u.m.psiphon || u.m.openvpn {
+		noV6 = tr("出口仅 IPv4")
+	}
 	for i, f := range items {
 		ry := py + pad + float64(i)*rowH
 		id := "pickfamily:" + f
@@ -244,7 +393,7 @@ func (u *natUI) paintFamilyPopup(c *walk.Canvas, ax, ay, aw, ah float64) {
 		}
 		u.txt(c, ax+16, ry+8, tw, 20, familyLabel(f), u.f.f10, col)
 		if !enabled {
-			u.txt(c, ax+aw-110, ry+10, 94, 18, tr("协议不支持"), u.f.f8, th.faint)
+			u.txt(c, ax+aw-110, ry+10, 94, 18, noV6, u.f.f8, th.faint)
 		} else if cur == f {
 			u.statusDot(c, ax+aw-24, ry+rowH/2, 3.5, th.accent)
 		}
@@ -260,16 +409,23 @@ func (u *natUI) paintSetRouting(c *walk.Canvas, x, y, w float64) {
 	s := u.m.set
 	u.presetRow(c, x, cy, w)
 
-	u.rowEdit(c, x, cy+38, w, "set:picknode", tr("默认节点"),
-		orEmpty(u.m.pin, u.m.status.Endpoint), tr("自动（延迟最低）"))
+	// The WARP endpoint pin means nothing in subscription mode — the front node
+	// is picked on the mode page — so the field is inert there instead of
+	// letting a dialog edit a value the session will never read.
+	subMode := s.ConnMode == "subscription"
+	nodeVal, nodePh := orEmpty(u.m.pin, u.m.status.Endpoint), tr("自动（延迟最低）")
+	if subMode {
+		nodeVal, nodePh = "", tr("订阅模式：前置节点在模式页选择")
+	}
+	u.rowEditState(c, x, cy+52, w, "set:picknode", tr("默认节点"), nodeVal, nodePh, !subMode)
 
 	listsOn := s.ProxyMode != modeGlobal && s.ProxyMode != modeDirect
-	u.rowEditState(c, x, cy+76, w, "set:domdirect", tr("直连域名"),
+	u.rowEditState(c, x, cy+104, w, "set:domdirect", tr("直连域名"),
 		s.DomainDirect, tr("域名后缀，如 example.com"), listsOn && s.ProxyMode != modeBlacklist)
-	u.rowEditState(c, x, cy+114, w, "set:domproxy", tr("代理域名"),
+	u.rowEditState(c, x, cy+156, w, "set:domproxy", tr("代理域名"),
 		s.DomainProxy, tr("域名后缀，如 example.com"), listsOn)
 
-	u.txt(c, x+16, cy+154, w-32, 36, presetHint(s.ProxyMode), u.f.f8, th.faint)
+	u.txt(c, x+16, cy+204, w-32, 36, presetHint(s.ProxyMode), u.f.f8, th.faint)
 }
 
 // presetRow is the routing-preset dropdown, laid out like the other rows.
@@ -368,74 +524,58 @@ func (u *natUI) paintPresetPopup(c *walk.Canvas, ax, ay, aw, ah float64) {
 	}
 }
 
-// paintSetBehaviour is the startup/behaviour card.
-func (u *natUI) paintSetBehaviour(c *walk.Canvas, x, y, w float64) {
-	cy := u.card(c, x, y, w, setBehaviourH, tr("启动与行为"))
-	s := u.m.set
-	u.rowToggle(c, x, cy, w, "set:autostart", tr("开机自动启动"),
-		tr("写入当前用户的启动项"), s.AutoStart, true)
-	u.rowToggle(c, x, cy+38, w, "set:autoconnect", tr("启动后自动连接"),
-		tr("程序启动即连接上次的协议"), s.AutoConnect, true)
-	u.rowToggle(c, x, cy+76, w, "set:rescan", tr("连接前重新扫描"),
-		tr("连接时重新扫描端点，耗时更长但更新"), s.Rescan, true)
-	u.rowToggle(c, x, cy+114, w, "set:autorepair", tr("自动修复（健康守护）"),
-		tr("会话断开后由后台守护自动重建"), s.AutoRepair, true)
-	u.rowEdit(c, x, cy+152, w, "set:timeout", tr("连接超时（秒）"),
-		itoa(int64(s.TimeoutSec)), "2")
-}
-
-// paintSetExit is the DNS and Psiphon card. Leak protection sits next to the
-// resolver fields because it changes how those resolvers are reached.
+// paintSetExit is the exit and startup card: the two stacked exits with their
+// region pickers, then the two startup behaviours. DNS fields are internalized
+// in normalize and not drawn anywhere on the page.
 func (u *natUI) paintSetExit(c *walk.Canvas, x, y, w float64) {
-	cy := u.card(c, x, y, w, setExitH, tr("DNS 与出口"))
+	cy := u.card(c, x, y, w, setExitH, tr("出口与启动"))
 	s := u.m.set
-	u.rowEdit(c, x, cy, w, "set:dns", tr("自定义 DNS"),
-		s.DNSCustom, tr("逗号分隔，如 223.5.5.5, 1.1.1.1"))
-	u.rowChips(c, x, cy+38, w, "set:dns:", tr("常用"),
-		dnsPresetIDs(), dnsPresetLabels(), currentDNSPreset(s.DNSCustom))
-	u.rowToggle(c, x, cy+76, w, "set:dnsdi", tr("不下发 DNS"),
-		tr("不向隧道提供解析器，全部用系统 DNS"), s.DNSOff, true)
 
-	leakOK := !s.DNSOff && s.ProxyMode != modeDirect
-	// The subtitle has to state the coverage, not just the mechanism: in system
-	// proxy mode only the programs that use the proxy are covered, and that
-	// distinction is what users keep asking about.
-	leakSub := tr("系统代理：走代理的程序解析经隧道，不走代理的仍会漏")
-	if s.CaptureMode == captureTun {
-		leakSub = tr("TUN：全机 53 端口被接管，任何程序都绕不过")
+	v6OK := u.exitV6OK()
+	psiOK := u.exitOK() && v6OK
+	psiSub := tr("先连基础协议，再叠加 Psiphon 出口")
+	if !v6OK {
+		psiSub = tr("仅 IPv6 下不可用：Psiphon 服务器经 IPv4 出网")
+	} else if !u.exitOK() {
+		psiSub = tr("链式协议（双层隧道）下不可叠加 Psiphon")
 	}
-	if s.DNSOff {
-		leakSub = tr("不下发 DNS 时使用系统解析，无法防泄露")
-	} else if s.ProxyMode == modeDirect {
-		leakSub = tr("直连模式不经过代理，无法防泄露")
-	}
-	u.rowToggle(c, x, cy+114, w, "set:dnsleak", tr("防止 DNS 泄露"),
-		leakSub, s.DNSLeak && leakOK, leakOK)
-
-	psiOK := !protoChained(u.m.proto)
-	u.rowToggle(c, x, cy+152, w, "psiphon", tr("Psiphon 出口"),
-		tr("先连基础协议，再叠加 Psiphon 出口"), u.m.psiphon, psiOK)
-	u.txt(c, x+16, cy+192, 120, 20, tr("出口地区"), u.f.f10, th.text)
+	u.rowToggle(c, x, cy, w, "psiphon", tr("Psiphon 出口"), psiSub, u.m.psiphon, psiOK)
+	u.txt(c, x+16, cy+56, 120, 20, tr("出口地区"), u.f.f10, th.text)
 	ax, ay, aw, ah := u.regionAnchor()
 	u.paintRegionDropdownSmall(c, ax, ay, aw, ah, psiOK && u.m.psiphon)
 
 	// V2: the same two-axis shape, but the exit is a VPN Gate relay rendered as
-	// mihomo's own openvpn outbound. It is IPv4-only, so the sub line says so
-	// instead of letting the family selector quietly disagree.
+	// mihomo's own openvpn outbound. It is IPv4 end to end, so an IPv6-only
+	// tunnel disables it outright.
 	ovpnOK := psiOK && u.protoOK(probeOpenVPNProto)
-	u.rowToggle(c, x, cy+228, w, "openvpn", tr("OpenVPN 出口"),
-		tr("经 VPN Gate 公共节点出站（仅 IPv4）"), u.m.openvpn, ovpnOK)
-	u.txt(c, x+16, cy+268, 120, 20, tr("出口地区"), u.f.f10, th.text)
+	ovpnSub := tr("经 VPN Gate 公共节点出站（仅 IPv4）")
+	if !ovpnOK {
+		switch {
+		case !v6OK:
+			ovpnSub = tr("仅 IPv6 下不可用：VPN Gate 中继只有 IPv4")
+		case !u.exitOK():
+			ovpnSub = tr("链式协议（双层隧道）下不可叠加 OpenVPN")
+		default:
+			ovpnSub = tr("当前核心不支持 OpenVPN 出站")
+		}
+	}
+	u.rowToggle(c, x, cy+104, w, "openvpn", tr("OpenVPN 出口"), ovpnSub, u.m.openvpn, ovpnOK)
+	u.txt(c, x+16, cy+160, 120, 20, tr("出口地区"), u.f.f10, th.text)
 	vx, vy, vw, vh := u.openvpnRegionAnchor()
 	u.paintOpenVPNRegionDropdownSmall(c, vx, vy, vw, vh, ovpnOK && u.m.openvpn)
 
+	u.rowToggle(c, x, cy+208, w, "set:autostart", tr("开机自动启动"),
+		tr("写入当前用户的启动项"), s.AutoStart, true)
+	u.rowToggle(c, x, cy+262, w, "set:autoconnect", tr("启动后自动连接"),
+		tr("程序启动即连接上次的协议"), s.AutoConnect, true)
+
 	switch {
-	case u.m.set.CaptureMode == captureTun && !core.IsElevated():
-		u.txt(c, x+16, cy+300, w-32, 18, tr("TUN 需要管理员权限：请以管理员身份重新运行"), u.f.f9, th.warn)
+	case s.CaptureMode == captureTun && !core.IsElevated():
+		u.txt(c, x+16, cy+316, w-32, 18, tr("TUN 需要管理员权限：请以管理员身份重新运行"), u.f.f9, th.warn)
 	case u.m.setDirty:
-		u.txt(c, x+16, cy+300, w-32, 18, tr("有改动：重新连接后生效"), u.f.f9, th.warn)
+		u.txt(c, x+16, cy+316, w-32, 18, tr("有改动：重新连接后生效"), u.f.f9, th.warn)
 	default:
-		u.txt(c, x+16, cy+300, w-32, 18, tr("端口、地址族与接管方式在下次连接时生效"), u.f.f8, th.faint)
+		u.txt(c, x+16, cy+316, w-32, 18, tr("端口、地址族与接管方式在下次连接时生效"), u.f.f8, th.faint)
 	}
 }
 
@@ -465,102 +605,181 @@ func aboutLinks() []aboutLink {
 // card's value column, and "github.com/…" still reads as a link.
 func shortURL(u string) string { return strings.TrimPrefix(u, "https://") }
 
-// The About page is a fixed 3-row grid plus a two-line footer. The heights are
-// named (and asserted by aboutLayout) because the page does not scroll: a card
-// that grows past the body box is clipped, and clipping a licence line is the
-// one thing this page must not do.
+// The About page is a single-column stack: one card per row, then the link card,
+// then a two-line footer. The page does not scroll, so every row is sized from
+// these constants and aboutLayout is asserted to end above the body box.
+//
+// One card per row is what the page needed: at two columns each card was ~420
+// wide, which forced the action buttons to share the bottom edge and made four
+// blocks of colour compete. Full width lets the fields sit in two columns with
+// the actions on the title line.
 const (
-	aboutRow1H = 186.0 // 本程序 / 开源与许可
-	aboutRow2H = 182.0 // 客户端更新 / 远程控制
-	aboutRow3H = 152.0 // 项目链接
-	aboutGap   = 14.0
-	aboutFootG = 8.0 // gap between the last card and the footer
+	aboutCardH    = 86.0  // title line + two field rows
+	aboutLinkH    = 166.0 // title line + five link rows
+	aboutGap      = 10.0
+	aboutFootG    = 8.0
+	aboutKVStep   = 22.0
+	aboutLinkStep = 24.0
+	aboutBtnH     = 26.0
+	aboutBtnTop   = 6.0
+	aboutBtnPadR  = 14.0
+	aboutBtnGap   = 8.0
+	aboutFieldCol = 84.0 // label column inside a field pair
+	aboutFieldGap = 24.0 // gap between the two field columns
 )
 
-// aboutLayout returns the top of each row and of the footer, in design units,
-// for the body's own top edge.
-func aboutLayout(bodyY float64) (row1, row2, row3, footer float64) {
-	row1 = bodyY
-	row2 = row1 + aboutRow1H + aboutGap
-	row3 = row2 + aboutRow2H + aboutGap
-	footer = row3 + aboutRow3H + aboutFootG
+// aboutLayout returns the top of each card, of the link card and of the footer,
+// in design units, for the body's own top edge.
+func aboutLayout(bodyY float64) (card1, card2, card3, card4, links, footer float64) {
+	card1 = bodyY
+	card2 = card1 + aboutCardH + aboutGap
+	card3 = card2 + aboutCardH + aboutGap
+	card4 = card3 + aboutCardH + aboutGap
+	links = card4 + aboutCardH + aboutGap
+	footer = links + aboutLinkH + aboutFootG
 	return
 }
 
-func (u *natUI) paintAbout(c *walk.Canvas, x, y, w float64) {
-	half := (w - aboutGap) / 2
-	rx := x + half + aboutGap
-	// Two buttons per card row, 16px of padding on both sides and 10 between:
-	// the right button has to clear the card's rim, not sit on it.
-	bw := (half - 16 - 16 - 10) / 2
-	row1, row2, row3, footer := aboutLayout(y)
+// aboutAct is one card action. Both treatments are quiet surfaces — a filled
+// accent button here read as the only saturated thing on an otherwise pale page.
+type aboutAct struct {
+	id      string
+	label   string
+	primary bool
+	enabled bool
+}
 
-	// Row 1 — what this build is, and what it is built from.
-	cy := u.card(c, x, row1, half, aboutRow1H, tr("本程序"))
-	for _, kv := range [][2]string{
+// aboutAction draws one About action as a pale chip with a hairline rim. The
+// card's verb keeps the heavier weight and the brighter text colour; its
+// companion stays one step quieter. Nothing on this page is filled with the
+// accent any more.
+func (u *natUI) aboutAction(c *walk.Canvas, x, y, w, h float64, a aboutAct) {
+	r := u.r(x, y, w, h)
+	bg, fg := th.chip, th.chipText
+	font := u.f.f10
+	if a.primary {
+		fg, font = th.text, u.f.f10b
+	}
+	if u.m.hover == a.id && a.enabled {
+		bg = th.cardHover
+	}
+	if !a.enabled {
+		bg, fg = mix(bg, th.card, 0.55), th.faint
+	}
+	u.fillRound(c, bg, r, ctrlRadius)
+	u.strokeRound(c, th.line, r, ctrlRadius)
+	u.textC(c, a.label, font, fg, r)
+	if a.enabled {
+		u.addSpot(a.id, r, true)
+	}
+}
+
+// aboutActions pins the card's actions to the right of its title line. The slice
+// is ordered [companion, verb] so the heavier verb ends up rightmost.
+func (u *natUI) aboutActions(c *walk.Canvas, cardX, cardY, cardW float64, acts ...aboutAct) {
+	by := cardY + aboutBtnTop
+	bx := cardX + cardW - aboutBtnPadR
+	for i := len(acts) - 1; i >= 0; i-- {
+		a := acts[i]
+		bw := float64(u.measure(c, a.label, u.f.f10b))/u.k + 24
+		if bw < 80 {
+			bw = 80
+		}
+		bx -= bw
+		u.aboutAction(c, bx, by, bw, aboutBtnH, a)
+		bx -= aboutBtnGap
+	}
+}
+
+// aboutStrip is one full-width card: title on the left, its actions on the same
+// line to the right, and the fields in two columns beneath.
+func (u *natUI) aboutStrip(c *walk.Canvas, x, y, w float64, title string, fields [][2]string, acts ...aboutAct) {
+	u.cardPlain(c, x, y, w, aboutCardH)
+	u.txt(c, x+16, y+8, 200, 22, title, u.f.f11b, th.text)
+	u.aboutActions(c, x, y, w, acts...)
+	colW := (w - 32 - aboutFieldGap) / 2
+	for i, f := range fields {
+		col, row := i%2, i/2
+		fx := x + 16 + float64(col)*(colW+aboutFieldGap)
+		fy := y + 34 + float64(row)*aboutKVStep
+		u.txt(c, fx, fy, aboutFieldCol, 20, f[0], u.f.f9, th.dim)
+		u.txt(c, fx+aboutFieldCol, fy, colW-aboutFieldCol, 20, f[1], u.f.f9, th.text)
+	}
+}
+
+func (u *natUI) paintAbout(c *walk.Canvas, x, y, w float64) {
+	card1, card2, card3, card4, links, footer := aboutLayout(y)
+
+	u.aboutStrip(c, x, card1, w, tr("本程序"), [][2]string{
 		{tr("名称"), productName},
 		{tr("版本"), shortVersion()},
 		{tr("构建"), guiBuildKind()},
 		{tr("核心版本"), orEmpty(u.m.coreVersion, tr("未探测"))},
-	} {
-		u.kv(c, x, cy, half, kv[0], kv[1])
-		cy += 24
-	}
-	u.button(c, x+16, row1+146, bw, 34, "about:copydiag", tr("复制诊断信息"), false, true)
-	u.button(c, x+16+bw+10, row1+146, bw, 34, "about:project", tr("打开项目主页"), false, true)
+	},
+		aboutAct{"about:copydiag", tr("复制诊断信息"), false, true},
+		aboutAct{"about:project", tr("打开项目主页"), true, true},
+	)
 
-	cy = u.card(c, rx, row1, half, aboutRow1H, tr("开源与许可"))
-	for _, kv := range [][2]string{
+	u.aboutStrip(c, x, card2, w, tr("开源与许可"), [][2]string{
 		{tr("内核"), "mihomo " + orEmpty(u.m.coreVersion, tr("未探测")) + " · " + coreSizeText(u.m.coreSize)},
 		{tr("内核许可"), "GPL-3.0"},
 		{tr("协议引擎"), "WireGuard / AmneziaWG / MASQUE"},
 		{tr("内核来源"), shortURL(coreRepoURL + "/releases")},
-	} {
-		u.kv(c, rx, cy, half, kv[0], kv[1])
-		cy += 24
-	}
-	u.button(c, rx+16, row1+146, bw, 34, "upd:core", tr("检查/下载内核"), true, !u.m.coreBusy)
-	u.button(c, rx+16+bw+10, row1+146, bw, 34, "upd:refresh", tr("重新探测内核"), false, !u.m.coreBusy)
+	},
+		aboutAct{"upd:refresh", tr("重新探测内核"), false, !u.m.coreBusy},
+		aboutAct{"upd:core", tr("检查/下载内核"), true, !u.m.coreBusy},
+	)
 
-	// Row 2 — updates, and the remote-control identity this install carries.
-	y2 := row2
-	cy = u.card(c, x, y2, half, aboutRow2H, tr("客户端更新"))
-	u.kv(c, x, cy, half, tr("当前版本"), versionWithBuild())
-	u.kv(c, x, cy+24, half, tr("最新版本"), orEmpty(u.m.updLatest, tr("尚未检查")))
-	u.kv(c, x, cy+48, half, tr("状态"), orEmpty(u.m.updNote, tr("点击下方按钮检查更新")))
 	updID, updLabel := "upd:check", tr("检查更新")
 	if u.m.updAvail != "" {
 		updID, updLabel = "upd:install", trf("立即更新到 v%s", u.m.updAvail)
 	}
-	u.button(c, x+16, y2+140, bw, 34, updID, updLabel, true, !u.m.updBusy)
-	u.button(c, x+16+bw+10, y2+140, bw, 34, "about:releases", tr("打开发布页"), false, true)
+	u.aboutStrip(c, x, card3, w, tr("客户端更新"), [][2]string{
+		{tr("当前版本"), versionWithBuild()},
+		{tr("最新版本"), orEmpty(u.m.updLatest, tr("尚未检查"))},
+		{tr("状态"), orEmpty(u.m.updNote, tr("点击右侧按钮检查更新"))},
+	},
+		aboutAct{"about:releases", tr("打开发布页"), false, true},
+		aboutAct{updID, updLabel, true, !u.m.updBusy},
+	)
 
-	cy = u.card(c, rx, y2, half, aboutRow2H, tr("远程控制"))
-	u.kv(c, rx, cy, half, tr("控制码"), orEmpty(u.m.set.ControlCode, tr("未知")))
-	u.txt(c, rx+16, cy+24, 84, 22, tr("状态"), u.f.f9, th.dim)
 	stText, stColor := u.controlStatus()
-	u.txt(c, rx+16+84, cy+24, half-32-84, 22, stText, u.f.f9, stColor)
-	u.kv(c, rx, cy+48, half, tr("最近检查"), controlCheckedText(u.m.control))
-	u.button(c, rx+16, y2+140, bw, 34, "about:copycode", tr("复制控制码"), false, true)
-	u.button(c, rx+16+bw+10, y2+140, bw, 34, "about:checkcontrol", tr("立即检查"), true, !u.m.controlBusy)
+	u.aboutStrip(c, x, card4, w, tr("远程控制"), [][2]string{
+		{tr("控制码"), orEmpty(u.m.set.ControlCode, tr("未知"))},
+		{tr("最近检查"), controlCheckedText(u.m.control)},
+	},
+		aboutAct{"about:copycode", tr("复制控制码"), false, true},
+		aboutAct{"about:checkcontrol", tr("立即检查"), true, !u.m.controlBusy},
+	)
+	// The verdict has its own colour (green / amber / red), so it is painted by
+	// hand into the second field row's left cell instead of going through the
+	// neutral strip text.
+	colW := (w - 32 - aboutFieldGap) / 2
+	stY := card4 + 34 + aboutKVStep
+	u.txt(c, x+16, stY, aboutFieldCol, 20, tr("状态"), u.f.f9, th.dim)
+	u.txt(c, x+16+aboutFieldCol, stY, colW-aboutFieldCol, 20, stText, u.f.f9, stColor)
 
-	// Row 3 — every address the page offers, as one clickable list.
-	y3 := row3
-	cy = u.card(c, x, y3, w, aboutRow3H, tr("项目链接"))
+	// The link card: one address per row, full width, the whole row clickable.
+	u.cardPlain(c, x, links, w, aboutLinkH)
+	u.txt(c, x+16, links+8, 200, 22, tr("项目链接"), u.f.f11b, th.text)
 	for i, ln := range aboutLinks() {
-		ly := cy + float64(i)*22
-		r := u.r(x+8, ly-2, w-16, 22)
+		ly := links + 34 + float64(i)*aboutLinkStep
+		r := u.r(x+10, ly-1, w-20, aboutLinkStep-2)
 		if u.m.hover == ln.id {
-			u.fillRound(c, mix(th.card, th.accentSoft, 0.5), r, 8)
+			// Neutral highlight: the address text is already off-accent, and a
+			// blue wash under it would put the colour back.
+			u.fillRound(c, th.cardHover, r, 7)
+			u.strokeRound(c, th.line2, r, 7)
 		}
-		u.txt(c, x+16, ly, 110, 20, ln.label, u.f.f10, th.text)
-		u.txt(c, x+130, ly, w-146, 20, shortURL(ln.url), u.f.f8, th.accent)
+		u.txt(c, x+20, ly+2, 96, 20, ln.label, u.f.f10, th.text)
+		u.txt(c, x+120, ly+3, w-140, 18, shortURL(ln.url), u.f.f8, th.dim)
 		u.addSpot(ln.id, r, true)
 	}
 
 	// Footer: the same sentence the startup notice opens with, kept on the page
 	// so it is still there after the notice has been dismissed.
 	yf := footer
+	u.hline(c, x, yf-7, w, th.line2)
 	u.txt(c, x+2, yf, w-4, 18, tr("本软件开源免费，仅供学习交流使用，禁止售卖！"), u.f.f10, th.text)
 	u.txt(c, x+2, yf+20, w-4, 18,
 		tr("本程序只在你自己的设备上配置一条加密隧道，不提供、不代理任何服务器资源；程序按「现状」提供，不对可用性、速度或适用性作任何承诺。"),

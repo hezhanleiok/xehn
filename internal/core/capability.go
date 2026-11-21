@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var versionRe = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
@@ -16,10 +18,15 @@ var versionRe = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
 // ("1.19.32"). It works for both official releases ("Mihomo Meta v1.19.32 …")
 // and older/forked builds that print no "v" prefix.
 func BinaryVersion(bin string) (string, error) {
-	cmd := exec.Command(bin, "-v")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-v")
 	hideConsole(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("core: %s -v timed out (blocked by security software?): %w", filepath.Base(bin), ctx.Err())
+		}
 		return "", fmt.Errorf("core: %s -v: %w", filepath.Base(bin), err)
 	}
 	if m := versionRe.FindSubmatch(out); m != nil {
@@ -69,9 +76,14 @@ func TestConfigDetail(bin, workDir string, configYAML []byte) (ok, ran bool, err
 		return false, false, werr
 	}
 
-	cmd := exec.Command(bin, "-t", "-d", workDir, "-f", probe)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-t", "-d", workDir, "-f", probe)
 	hideConsole(cmd)
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return false, false, fmt.Errorf("core: %s -t timed out (blocked by security software?)", filepath.Base(bin))
+	}
 	if err != nil {
 		// A Windows exception code means the process died before it could say
 		// anything. That is an environment problem, not a rejected config, and

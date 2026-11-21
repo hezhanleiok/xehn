@@ -42,10 +42,18 @@ const (
 	// waiting on.
 	connectEarlyStop = 4
 	// psiphonTunnelWait bounds how long a Psiphon sidecar gets to reach a
-	// server through a given underlay. A healthy underlay establishes in tens
-	// of seconds; waiting minutes per candidate turns one dead underlay into a
-	// multi-minute connect.
-	psiphonTunnelWait = 75 * time.Second
+	// server through a given underlay. 75s was measured on filtered networks
+	// but with 5 serial candidates it turned a dead underlay into a
+	// multi-minute connect; a healthy underlay is established in well under
+	// 30s, and the health guard still repairs a genuinely slow one later.
+	psiphonTunnelWait = 30 * time.Second
+	// psiphonSocksWait: the local SOCKS listener binds in under a second. 60s
+	// only made a dead sidecar look alive for a whole minute.
+	psiphonSocksWait = 12 * time.Second
+	// underlayProbeTimeout: one short round trip proves mihomo forwards through
+	// the underlay. 5s, not 3: a subscription front node is not pre-scanned and
+	// its cold TLS+WS handshake to the relay can exceed 3s on the first dial.
+	underlayProbeTimeout = 5 * time.Second
 	// verifyRetryDelay spaces the two tunnel probes: the first request races
 	// the WG handshake (whose trigger packet is dropped), so one retry absorbs
 	// a healthy-but-slow endpoint.
@@ -63,17 +71,24 @@ const (
 	// outbound itself gives up after openvpnHandshakeTimeout seconds, so waiting
 	// longer than that only delays the next candidate.
 	openvpnWarmupWindow = time.Duration(openvpnHandshakeTimeout+2) * time.Second
-	// openvpnWarmupReqTimeout bounds one warm-up request. Short on purpose: the
-	// request is a handshake trigger, not a transfer, and a dead combination
-	// must fail fast enough for the next candidate to get a turn.
-	openvpnWarmupReqTimeout = 4 * time.Second
+	// openvpnWarmupReqTimeout bounds one warm-up request. It has to outlast the
+	// outbound's own handshake (2s direct, 5-8s when the relay is carried by a
+	// tunnel): at 4s every request was cancelled mid-handshake and the retry
+	// restarted it, so a healthy relay never linked and the connect rotated
+	// through the whole candidate list reporting "handshake timeout".
+	openvpnWarmupReqTimeout = 12 * time.Second
 	// openvpnSpeedProbeBytes / openvpnSpeedProbeTimeout are the verification
 	// transfer for an OpenVPN exit. Larger than the generic 128 KiB gate
 	// because the same transfer also feeds the speed ranking: 128 KiB is
 	// dominated by TCP slow start and cannot separate a fast relay from one
 	// that merely avoided stalling.
-	openvpnSpeedProbeBytes   = 512 * 1024
-	openvpnSpeedProbeTimeout = 12 * time.Second
+	// A public VPNGate relay often needs a long TLS/HTTP first byte. 512 KiB in
+	// 12s used to time out while waiting for response headers even though the
+	// small HTTPS probe had already passed, killing a usable relay (and a user
+	// pinned to it) as "隧道能握手但无法传输数据". Halve the payload and give the
+	// first byte room; the speed gate below still filters genuinely slow relays.
+	openvpnSpeedProbeBytes   = 256 * 1024
+	openvpnSpeedProbeTimeout = 20 * time.Second
 	// openvpnMinBps is the usable-speed floor. Relays below it make every page
 	// crawl; the connect loop rotates past up to openvpnSpeedRetries of them,
 	// then keeps the next working relay anyway because slow beats nothing.
@@ -81,6 +96,17 @@ const (
 	// class was passing while delivering ~14 KB/s.
 	openvpnMinBps       = 150 * 1024
 	openvpnSpeedRetries = 2
+	// warpMinBps is the downlink floor for a plain WARP/MASQUE session. The
+	// picker ranks cached endpoints by ping only, so a handshake that passes
+	// at a few tens of KB/s would otherwise be reported as "connected".
+	// Below this the connect loop rotates to the next endpoint at most once.
+	warpMinBps       = 64 * 1024
+	warpSpeedRetries = 1
+	// The verification transfer is only 128 KiB, so TCP slow start can
+	// under-report a healthy endpoint. Re-measure with a warmer, larger
+	// transfer before deciding it is unusable.
+	warpConfirmBytes   = 512 * 1024
+	warpConfirmTimeout = 15 * time.Second
 )
 
 // slowRelayError marks a relay that passed every data-plane check but measured
@@ -91,6 +117,25 @@ type slowRelayError struct{ bps int64 }
 
 func (e *slowRelayError) Error() string {
 	return fmt.Sprintf("出口实测速度过慢（≈%d KB/s，低于 %d KB/s）", e.bps/1024, openvpnMinBps/1024)
+}
+
+// authRejectError marks a relay that answered the OpenVPN handshake with
+// AUTH_FAILED. The rejection is definitive (a retry never succeeds) and it
+// proves the base endpoint forwarded the handshake, so the connect loop drops
+// this relay on every base at once — no base self-check, no repeat attempts.
+type authRejectError struct{ reason string }
+
+func (e *authRejectError) Error() string {
+	return fmt.Sprintf("OpenVPN 出口认证被拒绝（%s），立即换节点", e.reason)
+}
+
+// slowWarpError marks a WARP/MASQUE endpoint that passed every data-plane
+// check but measured below the usable downlink floor. The endpoint works, so
+// it must NOT be marked dead: the connect loop simply tries another one.
+type slowWarpError struct{ bps int64 }
+
+func (e *slowWarpError) Error() string {
+	return fmt.Sprintf("端点下行实测过慢（≈%d KB/s，低于 %d KB/s）", e.bps/1024, warpMinBps/1024)
 }
 
 // proxyHelperAllowed gates the UAC elevation fallback: only the windowsgui
@@ -121,17 +166,45 @@ func runConnectCmd(ctx context.Context, opts options) error {
 }
 
 func runConnectInner(ctx context.Context, opts options) error {
+	// Only a user-initiated connect applies the downlink floor. A health
+	// repair calls startAndVerify directly and must never refuse a working
+	// tunnel just because the network is slow at that moment.
+	opts.speedGate = true
 	if opts.mixedPort == 0 {
 		opts.mixedPort = core.DefaultMixedPort
 	}
 	if opts.apiPort == 0 {
 		opts.apiPort = core.DefaultAPIPort
 	}
+	// The core binds fixed ports; another Clash-family client on this machine
+	// holds 7890 and every candidate then dies after the bind wait, which reads
+	// as "all relays failed". Resolve once, before any mode branches, so the
+	// system proxy, the probes and state.json all agree on the same ports.
+	resolveCorePorts(&opts)
+	// LAN sharing listens on 0.0.0.0, and Windows prompts for any non-loopback
+	// listener unless a firewall rule already covers it. That prompt is the
+	// "mihomo asks for network permission" report, and a user who dismisses it
+	// leaves allow-lan enabled but unreachable. Adding the rule first means the
+	// core never triggers the prompt, and the port actually answers from the LAN.
+	if opts.allowLan {
+		if err := core.EnsureLanFirewall(opts.mixedPort, coreBinaryPath(opts)); err != nil {
+			stageMsg("局域网共享：未能自动放行端口 " + itoa(int64(opts.mixedPort)) + "（" + err.Error() + "）；若其它设备连不上，请手动允许 mihomo.exe 通过防火墙")
+		} else {
+			stageMsg("局域网共享：端口 " + itoa(int64(opts.mixedPort)) + " 已放行（专用/域网络）")
+		}
+	}
 	// TUN needs an elevated process to create the adapter and edit routes. Fail
 	// here, before any account/scan work, so the user sees the real reason
 	// instead of a core that dies at startup with a driver error.
 	if opts.tunMode && !core.IsElevated() {
 		return fmt.Errorf("TUN 模式需要管理员权限：请以管理员身份重新运行本程序")
+	}
+	// Mode B: an imported Clash node is the first hop and WARP plays no part.
+	// This has to branch before the account/scan work below — a subscription
+	// connect that registered a WARP device and swept the endpoint space was
+	// both a 1-2 minute detour and a lie about "订阅模式不使用 WARP".
+	if opts.connMode == "subscription" {
+		return runConnectSubscription(ctx, opts)
 	}
 	// V2 OpenVPN exit: same two-axis shape as Psiphon (base protocol carries the
 	// exit's dials), but the exit is mihomo's native openvpn outbound instead of
@@ -218,7 +291,7 @@ func runConnectInner(ctx context.Context, opts options) error {
 		}
 		if opts.through == "" {
 			stageMsg(fmt.Sprintf("[%s] 选择外层端点…", label))
-			if _, ok := cachedScanFor(opts.outerProto, opts.ipv6); !ok {
+			if _, ok := cachedScanFor(opts.outerProto, scanFamilyV6()); !ok {
 				stageMsg(fmt.Sprintf("[%s] 外层端点无缓存，先扫描外层（约 1-2 分钟）…", label))
 			}
 			endpoint, err := pickOuterEndpoint(ctx, opts)
@@ -244,7 +317,7 @@ func runConnectInner(ctx context.Context, opts options) error {
 	// the silence so the click does not look dead.
 	if opts.scanNow {
 		stageMsg(fmt.Sprintf("[%s] 重新扫描端点，约 1-2 分钟，请稍候…", label))
-	} else if _, ok := cachedScanFor(scanKeyFor(opts), opts.ipv6); !ok {
+	} else if _, ok := cachedScanFor(scanKeyFor(opts), scanFamilyV6()); !ok {
 		stageMsg(fmt.Sprintf("[%s] 首次使用：注册账号并扫描端点，约 1-2 分钟，请稍候…", label))
 	}
 	stageMsg(fmt.Sprintf("[%s] 扫描 WARP 端点…", label))
@@ -338,6 +411,10 @@ func runConnectInner(ctx context.Context, opts options) error {
 		return err
 	}
 	stageMsg(fmt.Sprintf("[%s] 准备 Clash 核心…", label))
+	// A read-only install falls back to %APPDATA% for writable data. Restore
+	// the core/geodata shipped next to the exe before probing for them, or the
+	// first launch would try (and often fail) to download a 60 MB core.
+	syncBundledResources(cDir)
 	bin, err := core.EnsureBinary(cDir, opts.corePath)
 	if err != nil {
 		return fmt.Errorf("Clash 核心不可用（应位于 %s）：%w；请放入 mihomo.exe 或用底栏「核心」按钮下载", core.CoreInDir(cDir), err)
@@ -388,6 +465,7 @@ func runConnectInner(ctx context.Context, opts options) error {
 	}
 
 	var lastErr error
+	slowWarpRejects := 0
 	for i, ce := range cands {
 		if i > 0 {
 			stageMsg(fmt.Sprintf("[%s] 端点 %s 隧道不通，换下一个…", label, cands[i-1].Endpoint))
@@ -426,6 +504,18 @@ func runConnectInner(ctx context.Context, opts options) error {
 		// and the retry loop could still end up reporting success.
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		// A slow-but-working endpoint is not dead. Keep it in the cache and
+		// spend the next attempt on a different one; after the retry budget
+		// is used, accept the next working tunnel whatever its speed.
+		var slowWarp *slowWarpError
+		if errors.As(serr, &slowWarp) {
+			slowWarpRejects++
+			if slowWarpRejects > warpSpeedRetries {
+				opts.acceptSlowWarp = true
+				stageMsg(fmt.Sprintf("[%s] 连续 %d 个端点偏慢，后续保留当前连接", label, slowWarpRejects))
+			}
+			continue
 		}
 		fmt.Fprintln(os.Stderr, errPal.warn(fmt.Sprintf("endpoint %s: %v", ce.Endpoint, serr)))
 		markEndpointDead(opts, ce)
@@ -534,6 +624,10 @@ func runConnectPsiphon(ctx context.Context, opts options) error {
 		}
 	}
 
+	// A read-only install falls back to %APPDATA% for writable data. Restore
+	// the core/geodata shipped next to the exe before probing for them, or the
+	// first launch would try (and often fail) to download a 60 MB core.
+	syncBundledResources(cDir)
 	bin, err := core.EnsureBinary(cDir, opts.corePath)
 	if err != nil {
 		return err
@@ -604,6 +698,13 @@ func runConnectPsiphon(ctx context.Context, opts options) error {
 				ensureSessionGuard(state)
 			}
 			return nil
+		}
+		// A blocked psiphon.exe is an environment problem, not a bad endpoint.
+		// Retrying the remaining WARP endpoints (and rescanning afterwards)
+		// only produced eight identical failures and a wall of misleading
+		// "underlay 数据面不可用" follow-on errors.
+		if errors.Is(serr, errPsiphonPolicyBlocked) {
+			return fmt.Errorf("Psiphon 出口不可用（与基础端点无关，重试无用）：%w", serr)
 		}
 		lastErr = serr
 		fmt.Fprintln(os.Stderr, errPal.warn(fmt.Sprintf("基础端点 %s: %v", ce.Endpoint, serr)))
@@ -676,6 +777,17 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 		if len(cands) > connectMaxAttempts {
 			cands = cands[:connectMaxAttempts]
 		}
+		// A single cached endpoint is where a dead peer costs the most: every
+		// combination rides it, so one bad endpoint looks like "all relays are
+		// dead" for minutes. Verify it before spending a warmup on it.
+		if len(cands) == 1 {
+			stageMsg(fmt.Sprintf("[%s] 缓存里只有 1 个基础端点，先确认它能转发数据…", label))
+			if berr := probeBaseEndpoint(ctx, opts, cands[0], run); berr != nil {
+				stageMsg(fmt.Sprintf("[%s] %v，重新扫描…", label, berr))
+				markEndpointDead(opts, cands[0])
+				cands = nil
+			}
+		}
 		if len(cands) == 0 {
 			if !opts.scanNow {
 				stageMsg(fmt.Sprintf("[%s] 无可用基础端点，重新扫描…", label))
@@ -692,6 +804,10 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 		return err
 	}
 	stageMsg(fmt.Sprintf("[%s] 准备 Clash 核心…", label))
+	// A read-only install falls back to %APPDATA% for writable data. Restore
+	// the core/geodata shipped next to the exe before probing for them, or the
+	// first launch would try (and often fail) to download a 60 MB core.
+	syncBundledResources(cDir)
 	bin, err := core.EnsureBinary(cDir, opts.corePath)
 	if err != nil {
 		return fmt.Errorf("Clash 核心不可用（应位于 %s）：%w；请放入 mihomo.exe 或用底栏「核心」按钮下载", core.CoreInDir(cDir), err)
@@ -749,12 +865,53 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	stageMsg(fmt.Sprintf("[%s] 出口候选：%d 个基础端点 × %d 个 VPN Gate 节点（最多尝试 %d 组）",
 		label, len(cands), len(relays), min(openvpnMaxAttempts, len(cands)*len(relays))))
 
+	// Attempt order. A pinned relay is the user's explicit choice, so it gets
+	// every base endpoint before anything else is considered: the old nested
+	// loop gave it exactly one combination, and a single unlucky handshake
+	// silently replaced the user's pick with the next relay in the list.
+	type ovpnPair struct {
+		ce  cachedEndpoint
+		idx int
+	}
+	var pairs []ovpnPair
+	pinned := opts.openvpnNodePin != "" && len(relays) > 0 && relays[0].id() == opts.openvpnNodePin
+	if opts.openvpnNodePin != "" && !pinned {
+		stageMsg(fmt.Sprintf("[%s] 固定节点 %s 不在当前 VPN Gate 列表中，本次按排序自动选点", label, opts.openvpnNodePin))
+	}
+	if pinned {
+		for _, ce := range cands {
+			pairs = append(pairs, ovpnPair{ce: ce, idx: 0})
+		}
+		for i := 1; i < len(relays); i++ {
+			for _, ce := range cands {
+				pairs = append(pairs, ovpnPair{ce: ce, idx: i})
+			}
+		}
+	} else {
+		for _, ce := range cands {
+			for i := range relays {
+				pairs = append(pairs, ovpnPair{ce: ce, idx: i})
+			}
+		}
+	}
+	// A pinned relay spends one attempt per base endpoint, so give the run two
+	// extra slots for the fallback relays instead of starving them.
+	maxAttempts := openvpnMaxAttempts
+	if pinned {
+		maxAttempts += 2
+	}
+	total := min(maxAttempts, len(pairs))
+
 	var lastErr error
 	tried := 0
 	slowRejects := 0
-	for _, ce := range cands {
-		for i := range relays {
-			if tried >= openvpnMaxAttempts {
+	deadCE := map[string]bool{}
+	deadRelay := map[int]bool{}
+	baseChecked := map[string]bool{}
+	pinGaveUp := false
+	{
+		for _, pr := range pairs {
+			if tried >= maxAttempts {
 				break
 			}
 			// A cancelled attempt must stop the retry loop here: without this
@@ -763,15 +920,51 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			// A dead underlay fails every relay; skip it instead of burning the
+			// remaining combinations on it. A relay that rejected the handshake
+			// (AUTH_FAILED) fails on every underlay the same way — skip it too.
+			if deadCE[pr.ce.Endpoint] || deadRelay[pr.idx] {
+				continue
+			}
+			ce := pr.ce
+			i := pr.idx
 			tried++
 			node := relays[i]
 			opts.openvpnNode = &node
 			stageMsg(fmt.Sprintf("[%s] 基础端点 %s + 出口节点 %s（%s，组合 %d/%d）…",
-				label, ce.Endpoint, node.id(), node.CountryShort, tried, min(openvpnMaxAttempts, len(cands)*len(relays))))
+				label, ce.Endpoint, node.id(), node.CountryShort, tried, total))
 			state, serr := startAndVerify(ctx, opts, ce, run, bin, cDir, label, nil)
 			if serr != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
+				}
+				// A local failure (port taken by another client, core never
+				// bound) fails identically on every candidate. Say so once and
+				// stop: eight 5-second attempts and a rescan loop turn a
+				// one-line environment problem into "all nodes failed".
+				if localCoreError(serr) {
+					return fmt.Errorf("本地内核无法启动：%v（请关闭占用同一端口的其它代理客户端后重试）", serr)
+				}
+				var auth *authRejectError
+				if errors.As(serr, &auth) {
+					// The relay itself refused the credentials. The handshake
+					// reached it, so the base endpoint is proven healthy — no
+					// self-check — and another base would relay the same refusal,
+					// so this relay is done for the whole run. One attempt, then
+					// straight to the next relay: this is what turns a pinned
+					// node's rejection from a five-base, multi-minute walk into a
+					// two-second hand-off.
+					deadRelay[i] = true
+					lastErr = serr
+					markVPNGateFailed(node.id())
+					if pinned && node.id() == opts.openvpnNodePin && !pinGaveUp {
+						pinGaveUp = true
+						stageMsg(fmt.Sprintf("[%s] 固定节点 %s 被中继拒绝（AUTH_FAILED），本次改用其他节点；你的固定选择仍保留",
+							label, node.id()))
+					} else {
+						stageMsg(fmt.Sprintf("[%s] 中继 %s 拒绝认证（AUTH_FAILED），换下一个中继…", label, node.id()))
+					}
+					continue
 				}
 				var slow *slowRelayError
 				if errors.As(serr, &slow) {
@@ -788,6 +981,22 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 					}
 					continue
 				}
+				// A dead base endpoint fails EVERY relay identically, and a
+				// WireGuard tunnel to a dead peer still "starts" — so the relay
+				// gets blamed for eight attempts in a row. Prove the base once,
+				// before spending the rest of the budget on it.
+				if !baseChecked[ce.Endpoint] {
+					baseChecked[ce.Endpoint] = true
+					stageMsg(fmt.Sprintf("[%s] 自检基础端点 %s（确认它能转发数据）…", label, ce.Endpoint))
+					if berr := probeBaseEndpoint(ctx, opts, ce, run); berr != nil {
+						stageMsg(fmt.Sprintf("[%s] %v，换下一个基础端点…", label, berr))
+						deadCE[ce.Endpoint] = true
+						markEndpointDead(opts, ce)
+						lastErr = berr
+						continue
+					}
+					stageMsg(fmt.Sprintf("[%s] 基础端点正常，问题在中继 %s，换下一个中继…", label, node.id()))
+				}
 			}
 			if serr == nil {
 				clearVPNGateFailure(node.id())
@@ -796,6 +1005,13 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 					fmt.Fprintln(os.Stderr, errPal.warn("state not persisted: "+err.Error()))
 				}
 				stageMsg(fmt.Sprintf("[%s] 连接成功（出口 = VPN Gate %s）", label, node.CountryShort))
+				// A pin that could not connect must not look like it was used:
+				// name the relay that actually carried the session, and keep the
+				// user's pick in settings instead of silently unpinning it.
+				if opts.openvpnNodePin != "" && node.id() != opts.openvpnNodePin {
+					stageMsg(fmt.Sprintf("[%s] 注意：固定节点 %s 本次未能连接，实际出口 = %s（你的固定选择仍保留）",
+						label, opts.openvpnNodePin, node.id()))
+				}
 				// Say it out loud when the session landed somewhere else: the
 				// region is a preference, so a fallback is legitimate — but a
 				// silent one looks like the selector is broken.
@@ -817,17 +1033,23 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			// Deliberately NOT markEndpointDead: a relay failure says nothing
 			// about the WARP underlay, and evicting a healthy endpoint here would
 			// poison the scan cache for every later session.
-			if serr != nil && strings.Contains(serr.Error(), "base endpoint") {
-				// A dead underlay fails every relay; move on to the next base
-				// instead of burning the remaining combinations on it.
-				break
+			if strings.Contains(serr.Error(), "base endpoint") {
+				deadCE[ce.Endpoint] = true
+				continue
 			}
 			// The relay itself failed; the phone client's 10-minute memory keeps
-			// the next attempt (or the automatic retry scan) off this node.
-			markVPNGateFailed(node.id())
-		}
-		if tried >= openvpnMaxAttempts {
-			break
+			// the next attempt (or the automatic retry scan) off this node. A
+			// local failure never reaches this point, so the pool stays honest.
+			if !localCoreError(serr) {
+				markVPNGateFailed(node.id())
+			}
+			if pinned && node.id() == opts.openvpnNodePin && !pinGaveUp && tried >= len(cands) {
+				// The user's pick has now failed on every base endpoint. Say so
+				// before rotating — a silent switch looks like the pin is ignored.
+				pinGaveUp = true
+				stageMsg(fmt.Sprintf("[%s] 固定节点 %s 在 %d 个基础端点上都没握手成功，改试其他节点…",
+					label, node.id(), len(cands)))
+			}
 		}
 	}
 	// Every combination failed: the snapshot may be stale on both axes. One
@@ -946,6 +1168,7 @@ func vpnAuthFailure(line string) string {
 // exits via Psiphon). The base protocol is never verified on its own — the only
 // thing that matters is that the final exit passes real traffic.
 func connectPsiphonOn(ctx context.Context, opts options, ce cachedEndpoint, run protoRun, bin, cDir, label string, l psiphonLaunch) (clientState, error) {
+	l.EgressRegion = guardPsiphonRegion(label, l.EgressRegion)
 	ps := &Psiphon{}
 	state, err := startAndVerify(ctx, opts, ce, run, bin, cDir, label, func() error {
 		// Fail fast. The scan verifies an endpoint inside its own netstack, which
@@ -953,14 +1176,14 @@ func connectPsiphonOn(ctx context.Context, opts options, ce cachedEndpoint, run 
 		// through it — and a dead underlay must cost seconds, not the whole
 		// Psiphon tunnel wait. Probe the underlay inbound once before Psiphon.
 		under := underlaySocksPort(opts.mixedPort)
-		if err := probeUnderlaySocks(ctx, under, 8*time.Second); err != nil {
+		if err := probeUnderlaySocks(ctx, under, underlayProbeTimeout); err != nil {
 			return fmt.Errorf("underlay 数据面不可用 (socks 127.0.0.1:%d): %w", under, err)
 		}
 		stageMsg(fmt.Sprintf("[%s] underlay 数据面可用，启动 Psiphon（上游 %s）…", label, l.Upstream))
 		if err := ps.Start(ctx, l); err != nil {
 			return fmt.Errorf("psiphon start: %w", err)
 		}
-		if err := ps.WaitForSocks(ctx, 60*time.Second); err != nil {
+		if err := ps.WaitForSocks(ctx, psiphonSocksWait); err != nil {
 			return fmt.Errorf("psiphon socks not ready: %w", err)
 		}
 		stageMsg(fmt.Sprintf("[%s] Psiphon SOCKS 127.0.0.1:%d 就绪，等待隧道…", label, ps.Port()))
@@ -994,7 +1217,7 @@ func connectPsiphonOn(ctx context.Context, opts options, ce cachedEndpoint, run 
 		if serr := ps.Start(ctx, l); serr != nil {
 			break
 		}
-		if serr := ps.WaitForSocks(ctx, 60*time.Second); serr != nil {
+		if serr := ps.WaitForSocks(ctx, psiphonSocksWait); serr != nil {
 			break
 		}
 		if serr := ps.WaitForTunnel(ctx, psiphonTunnelWait); serr != nil {
@@ -1005,13 +1228,17 @@ func connectPsiphonOn(ctx context.Context, opts options, ce cachedEndpoint, run 
 	// port (which exits via Psiphon) — record that as the terminal lifecycle
 	// state, distinct from "SOCKS up" and "tunnel established".
 	ps.MarkRealTrafficReady()
+	// Refresh the egress-region list from the server entries Psiphon just
+	// downloaded, once per connect. If the datastore is still locked by the
+	// live process this silently no-ops; Stop() retries after exit.
+	refreshPsiphonRegionsFromDataStore(l.DataDir)
 	// Proto stays the base protocol (A1): the exit switch lives in PsiphonMode,
 	// so a "WG" session with Psiphon on is Proto=wg + PsiphonMode=true, never a
 	// fabricated "Psiphon" protocol that health/repair would mis-route.
 	state.PsiphonMode = true
 	state.PsiphonPID = ps.PID()
 	state.PsiphonSocksPort = ps.Port()
-	state.PsiphonRegion = opts.psiphonRegion
+	state.PsiphonRegion = l.EgressRegion
 	return state, nil
 }
 
@@ -1137,6 +1364,17 @@ func socks5Dial(ctx context.Context, socksPort int, addr string, timeout time.Du
 // wait for a real tunnel) so the verification below already exercises the final
 // egress. Every non-Psiphon caller passes nil and the flow is unchanged.
 func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run protoRun, bin, cDir, label string, afterReady func() error) (clientState, error) {
+	// Last gate before anything is rendered. The build ships no device identity,
+	// so a repair in a process that never connected (app restarted with
+	// auto-repair) must not write an empty private key into a config that then
+	// looks valid and passes nothing.
+	if err := validateAccountFor(opts); err != nil {
+		return clientState{}, err
+	}
+	// Capability-gate the performance tunings before rendering: enable the
+	// additive globals only if this core parses them, and fall back to the
+	// shipped gvisor/bbr when a chosen ip-stack/cc override is unsupported.
+	resolveTuning(&opts, bin, cDir)
 	configYAML, err := renderClientConfig(opts, ce, run)
 	if err != nil {
 		return clientState{}, err
@@ -1168,7 +1406,13 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 		return clientState{}, err
 	}
 	stageMsg(fmt.Sprintf("[%s] Core 已启动 (PID=%d)，等待隧道就绪…", label, c.PID()))
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	waitFor := 15 * time.Second
+	if opts.psiphonMode {
+		// mihomo binds its local mixed/API ports in ~1s; Psiphon's own
+		// readiness is awaited separately in connectPsiphonOn's hook.
+		waitFor = 8 * time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, waitFor)
 	defer cancel()
 	if err := c.WaitReady(waitCtx); err != nil {
 		_ = c.Stop()
@@ -1194,6 +1438,10 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 	if opts.openvpnMode {
 		stageMsg(fmt.Sprintf("[%s] 预热 OpenVPN 中继（握手窗口 %s）…", label, openvpnWarmupWindow))
 		warmCtx, cancelWarm := context.WithCancel(ctx)
+		// Both select arms return or continue past this block; without a defer
+		// the watcher's context stayed live on the success path (and on the
+		// handshake-timeout path), leaking a goroutine per failed relay.
+		defer cancelWarm()
 		fatalCh, stopWatch := watchOpenVPNLogs(warmCtx, opts.apiPort)
 		warmDone := make(chan error, 1)
 		go func() { warmDone <- warmupOpenVPN(warmCtx, opts.mixedPort, label) }()
@@ -1210,7 +1458,7 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 			cancelWarm()
 			stopWatch()
 			_ = c.Stop()
-			return clientState{}, fmt.Errorf("OpenVPN 出口认证被拒绝（%s），立即换节点", reason)
+			return clientState{}, &authRejectError{reason: reason}
 		}
 	}
 
@@ -1246,6 +1494,35 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 		}
 	}
 
+	// A plain WARP/MASQUE endpoint can pass the small payload check yet
+	// deliver only a few tens of KB/s. The picker ranked it by ping alone,
+	// so rotate to another cached endpoint instead of calling that a usable
+	// connection. Bounded: after warpSpeedRetries rejects the rest of the
+	// candidates are accepted, so a genuinely slow network still connects.
+	if opts.speedGate && !opts.openvpnMode && !opts.psiphonMode &&
+		opts.pick == "" && !opts.acceptSlowWarp &&
+		probe.MeasuredBps > 0 && probe.MeasuredBps < warpMinBps {
+		bps := probe.MeasuredBps
+		// A 128 KiB probe sits inside TCP slow start; a healthy endpoint can
+		// look slow there. Confirm with a larger transfer on the now-warm
+		// tunnel before giving up on a working endpoint.
+		if confirm := measureDownBps(opts.mixedPort, warpConfirmBytes, warpConfirmTimeout); confirm >= warpMinBps {
+			bps = confirm
+			probe.MeasuredBps = confirm
+			stageMsg(fmt.Sprintf("[%s] 复测下行 ≈ %d KB/s，端点正常", label, confirm/1024))
+		} else {
+			if confirm > 0 {
+				bps = confirm
+			}
+			stageMsg(fmt.Sprintf("[%s] 下行实测 ≈ %d KB/s，低于 %d KB/s，换端点…", label, bps/1024, warpMinBps/1024))
+			_ = c.Stop()
+			return clientState{}, &slowWarpError{bps: bps}
+		}
+	}
+	if probe.MeasuredBps > 0 {
+		stageMsg(fmt.Sprintf("[%s] 下行实测 ≈ %d KB/s", label, probe.MeasuredBps/1024))
+	}
+
 	// The user-facing protocol: a dialer-proxy chain is WARP-in-WARP or MASQUE
 	// in MASQUE, not the carrier it happens to be rendered as.
 	protoName := run.name
@@ -1254,12 +1531,20 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 	} else if opts.through != "" {
 		protoName = protoWWarp
 	}
+	// ce.Country/Colo describe the WARP *carrier* (usually US). For a
+	// two-axis session (Psiphon / VPN Gate exit) the user-facing exit is a
+	// different country: seeding the carrier geo is exactly what makes the
+	// flag show US first and GB later. Leave those fields to the exit probe.
+	country, colo, city := ce.Country, ce.Colo, ce.NodeCity
+	if opts.psiphonMode || opts.openvpnMode {
+		country, colo, city = "", "", ""
+	}
 	state := clientState{
 		Proto:     protoName,
 		Endpoint:  ce.Endpoint,
-		Country:   ce.Country,
-		Colo:      ce.Colo,
-		NodeCity:  ce.NodeCity,
+		Country:   country,
+		Colo:      colo,
+		NodeCity:  city,
 		LatencyMS: ce.EpPingMS,
 		TunLatMS:  ce.TunPingMS,
 		Connected: true,
@@ -1365,7 +1650,7 @@ func markEndpointDead(opts options, ce cachedEndpoint) {
 	// scanKeyFor, not opts.proto: a chained connect must mark the endpoint
 	// dead in the chain's own cache (wwarp), not in the outer carrier's plain
 	// cache where it never gets looked up again.
-	key := scanCacheKey(scanKeyFor(opts), opts.ipv6)
+	key := scanCacheKey(scanKeyFor(opts), scanFamilyV6())
 	raw, ok := store.Get(key)
 	if !ok {
 		return
@@ -1445,15 +1730,71 @@ func restoreHostProxy(state clientState) {
 		}
 	}
 	if core.SystemProxyEnabledAt(state.MixedPort) {
+		// Restoring the snapshot is not enough when the snapshot itself points at
+		// our own mixed port: that happens when a previous exit failed to clean
+		// up, so every later connect records the dead proxy as "what the user
+		// had" and faithfully restores it. Force it off instead of only warning —
+		// a leftover proxy is the "closed the app and now nothing loads" report,
+		// and a warning the user never sees does not fix their browser.
+		off := &core.ProxySnapshot{}
+		if err := core.UnsetSystemProxy(off); err != nil {
+			if proxyHelperAllowed() {
+				_ = core.RestoreSystemProxyElevated(off)
+			}
+			fmt.Fprintln(os.Stderr, errPal.warn("clear system proxy: "+err.Error()))
+		}
+	}
+	if core.SystemProxyEnabledAt(state.MixedPort) {
 		fmt.Fprintln(os.Stderr, errPal.warn(fmt.Sprintf(
 			"系统代理仍指向 127.0.0.1:%d，请手动关闭系统代理，或以管理员身份运行本程序后断开", state.MixedPort)))
 	}
 }
 
+// clearProxyIfOurs is the state-less fallback: with no state file there is no
+// snapshot to restore, but a host proxy still pointing at our port has to go.
+// Covers every port this install could have used (the configured one and the
+// default), so a hand-edited port does not escape the cleanup.
+func clearProxyIfOurs(ports ...int) {
+	for _, port := range ports {
+		if port <= 0 || !core.SystemProxyEnabledAt(port) {
+			continue
+		}
+		off := &core.ProxySnapshot{}
+		if err := core.UnsetSystemProxy(off); err != nil {
+			if proxyHelperAllowed() {
+				_ = core.RestoreSystemProxyElevated(off)
+			}
+			fmt.Fprintln(os.Stderr, errPal.warn("clear system proxy: "+err.Error()))
+			return
+		}
+	}
+}
+
 // disconnect stops the core and restores the system proxy.
+// coreBinaryPath resolves the bundled core, for the program-level firewall rule
+// that stops Windows asking "allow mihomo.exe?" on the first shared connect.
+func coreBinaryPath(opts options) string {
+	if opts.corePath != "" {
+		return opts.corePath
+	}
+	cDir, err := coreDir()
+	if err != nil {
+		return ""
+	}
+	return core.CoreInDir(cDir)
+}
+
 func runDisconnectCmd(ctx context.Context, opts options) error {
 	state, err := loadState()
 	if err != nil {
+		// No state file means no snapshot, but the host proxy may still point at
+		// this client's port from a session that died badly. Clean it anyway:
+		// returning here is what left users with a dead proxy and no internet.
+		ports := []int{opts.mixedPort, core.DefaultMixedPort}
+		if s := loadSettings(); s.MixedPort > 0 {
+			ports = append(ports, s.MixedPort)
+		}
+		clearProxyIfOurs(ports...)
 		return err
 	}
 	cDir, err := coreDir()
@@ -1602,10 +1943,10 @@ func runListCmd(ctx context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
-	key := scanCacheKey(opts.proto, opts.ipv6)
+	key := scanCacheKey(opts.proto, scanFamilyV6())
 	raw, ok := store.Get(key)
 	if !ok {
-		fmt.Fprintf(os.Stdout, "no cached scan for proto=%s ipv6=%t\n", opts.proto, opts.ipv6)
+		fmt.Fprintf(os.Stdout, "no cached scan for proto=%s ipv6=%t\n", opts.proto, scanFamilyV6())
 		return nil
 	}
 	var cs cachedScan

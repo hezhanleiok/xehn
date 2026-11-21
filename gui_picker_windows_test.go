@@ -2,7 +2,10 @@
 
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestVPNGatePickerTree pins the shape the phone client's picker taught us:
 // countries collapse to one row, the expanded country adds an "auto" row and
@@ -61,14 +64,19 @@ func TestVPNGatePickerTree(t *testing.T) {
 		}
 	}
 
-	if got := vpnNodeLatencyLabel(rows[3].node); got != "31ms" {
-		t.Fatalf("measured latency = %q", got)
+	// 1.0.5: a refresh only reloads the node list, it never TCP-probes, so
+	// unpicked nodes show "未检测" instead of a self-reported latency. Only a
+	// node the user actually probed carries type · latency · speed.
+	for i, row := range rows[3:6] {
+		if got := vpnNodeLatencyLabel(row.node); got != tr("未检测") {
+			t.Fatalf("row %d latency = %q, want %q", i, got, tr("未检测"))
+		}
 	}
-	if got := vpnNodeLatencyLabel(rows[4].node); got != "自报 42ms" {
-		t.Fatalf("residential latency = %q", got)
-	}
-	if got := vpnNodeLatencyLabel(rows[5].node); got != "自报 88ms" {
-		t.Fatalf("datacenter latency = %q", got)
+	probed := rows[3].node
+	probed.ProbeState = "ok"
+	probed.ProbeMS = 31
+	if got := vpnNodeLatencyLabel(probed); !strings.Contains(got, "31ms") {
+		t.Fatalf("probed latency label = %q, want 31ms", got)
 	}
 	if got := vpnCountrySub(u.m.vpnCountries[0]); got != trf("%d 个 · %d 有响应", 3, 1) {
 		t.Fatalf("JP sub = %q", got)

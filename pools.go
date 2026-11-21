@@ -31,6 +31,9 @@ var poolsV6 = []netip.Prefix{
 
 var pools = poolsV4
 
+// v6SampleCap bounds how many addresses one IPv6 prefix contributes to a scan.
+const v6SampleCap = 64
+
 func poolsFor(run protoRun, ipv6 bool) []netip.Prefix {
 	if run.isMASQUE() {
 		if ipv6 {
@@ -117,8 +120,13 @@ func expandV4(p netip.Prefix, perSubnet int) []netip.Addr {
 
 func expandV6(p netip.Prefix, perSubnet int) []netip.Addr {
 	count := perSubnet
-	if count <= 0 || count >= 256 {
-		count = 256
+	// A /48 of Cloudflare anycast is one routing domain: every address inside it
+	// lands on the same edge fleet, so sampling it as densely as IPv4 buys
+	// nothing and costs the scan minutes. 64 per prefix (128 across the two
+	// built-in pools) is plenty to find a working endpoint; an explicit -n still
+	// wins, and an explicit -target is scanned verbatim.
+	if count <= 0 || count >= v6SampleCap {
+		count = v6SampleCap
 	}
 	base := p.Masked().Addr().As16()
 	// Random bytes below the prefix, mirroring upstream endpoint6(): hextet 4

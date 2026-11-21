@@ -172,10 +172,13 @@ func isMihomo(confType string) bool {
 }
 
 const (
-	// AliDNS/DNSPod first: the resolver must answer even where Cloudflare
-	// DNS is blocked in the clear; 1.1.1.1/1.0.0.1 stay as fallbacks and
-	// remain the ones used through the tunnel.
-	warpDNSv4 = "223.5.5.5, 119.29.29.29, 1.1.1.1, 1.0.0.1"
+	// Overseas only. mihomo queries every resolver in parallel and takes the
+	// fastest answer, so a domestic entry here wins by RTT alone — and it answers
+	// CDN front domains with an edge that 502s (or, for a plain lookup, hands the
+	// query to the local ISP resolver, which is the leak the DNS test reports).
+	// Both paths must stay outside the country for a tunnelled session to be
+	// private, so the domestic pair is gone rather than merely demoted.
+	warpDNSv4 = "8.8.8.8, 1.1.1.1, 1.0.0.1"
 	warpDNSv6 = "2606:4700:4700::1111, 2606:4700:4700::1001"
 )
 
@@ -398,7 +401,14 @@ const (
 	// from the inbound dial timeout, so a slow public relay still completes the
 	// handshake while the first client request has already given up; the
 	// connect flow warms the tunnel with retries inside this window.
-	openvpnHandshakeTimeout = 20
+	//
+	// 30s, not 20s: the relays that actually answer are carried through a tunnel
+	// and often need 20-28s to link (measured: 2s direct, 5-8s typical, 20s+ on a
+	// jittery volunteer line). At 20s those were killed mid-handshake and
+	// reported as dead. cfnew (same VPN Gate source, same mihomo outbound) uses
+	// 30. openvpnWarmupWindow follows this value automatically, so the connect
+	// path waits exactly as long as the outbound is willing to try.
+	openvpnHandshakeTimeout = 30
 	// psiphonUnderlayPortGap is the offset of the dedicated SOCKS inbound that
 	// exists only for Psiphon's own dials. Routing that inbound to the base
 	// protocol — instead of relying on process detection — is what makes the
@@ -607,13 +617,21 @@ func mihomoProxy(o options, name, endpoint string, run protoRun, mtu int, dns []
 		return nil, fmt.Errorf("endpoint %q: %w", endpoint, err)
 	}
 
-	p, err := mihomoPeer(run, o.ipFamily(), host, port)
+	p, err := mihomoPeer(run, o.ipFamily(), host, port, effectiveStack(o), effectiveCC(o))
 	if err != nil {
 		return nil, err
 	}
 	p = append([]kv{{"name", quoted(name)}}, p...)
-	if mtu > 0 {
-		p = append(p, kv{"mtu", mtu})
+	// The MASQUE outbound's inner gVisor stack is 1280 bytes; mihomo uses
+	// that as its fallback too, but spelling it out keeps the rendered config
+	// identical in shape to the scan tunnel and capability probe, and keeps
+	// it stable if a future core changes its default.
+	effectiveMTU := mtu
+	if effectiveMTU <= 0 && run.isMASQUE() {
+		effectiveMTU = tunnelMTU
+	}
+	if effectiveMTU > 0 {
+		p = append(p, kv{"mtu", effectiveMTU})
 	}
 	p = append(p, kv{"udp", true})
 	if len(dns) > 0 {
@@ -622,7 +640,7 @@ func mihomoProxy(o options, name, endpoint string, run protoRun, mtu int, dns []
 	return p, nil
 }
 
-func mihomoPeer(run protoRun, family string, host string, port int) ([]kv, error) {
+func mihomoPeer(run protoRun, family string, host string, port int, stack, cc string) ([]kv, error) {
 	if run.isMASQUE() {
 		if masqueAcct == nil {
 			return nil, fmt.Errorf("no MASQUE device in the account file")
@@ -656,10 +674,12 @@ func mihomoPeer(run protoRun, family string, host string, port int) ([]kv, error
 		// VPN Gate exit to a few Mbps here. BBR rides out loss instead.
 		// The inner packets default to mihomo's minimal mips stack; the
 		// bundled core ships with_gvisor, whose TCP stack is the more
-		// complete of the two.
+		// complete of the two. Both are optionized (S1-5): the shipped
+		// defaults are bbr/gvisor, and the connect's capability gate falls
+		// back to them when the running core rejects an override.
 		return append(p,
-			kv{"congestion-controller", "bbr"},
-			kv{"ip-stack", []kv{{"mode", "gvisor"}}},
+			kv{"congestion-controller", cc},
+			kv{"ip-stack", []kv{{"mode", stack}}},
 			kv{"handshake-timeout", 5},
 		), nil
 	}

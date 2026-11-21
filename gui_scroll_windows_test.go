@@ -6,10 +6,18 @@ import "testing"
 
 // The settings scrollbar is the only way to move that page besides the wheel,
 // so its geometry and its mapping from pointer position to scroll offset have
-// to hold at both ends of the track.
+// to hold at both ends of the track. The range is derived from the page's real
+// content height (clampSetScroll recomputes it on every drag), so the test
+// asserts against that range rather than a seeded constant — and it drags the
+// handle by a fraction of its movable span instead of clicking mid-track, which
+// lands inside the handle once the page is only a little taller than the body.
 func TestScrollbarDrag(t *testing.T) {
 	u := &natUI{m: newNatModel(), k: 1, dw: 1080}
-	u.m.setScrollMax = 600
+	u.clampSetScroll()
+	max := u.m.setScrollMax
+	if max <= 0 {
+		t.Fatal("the settings page must overflow the body for this test")
+	}
 
 	trackTop, trackH, thumbTop, thumbH := u.scrollbarGeom()
 	if trackH <= 0 || thumbH <= 0 || thumbH >= trackH {
@@ -26,8 +34,8 @@ func TestScrollbarDrag(t *testing.T) {
 		t.Fatal("drag did not start")
 	}
 	u.dragScrollTo(u.sy(trackTop + trackH))
-	if u.m.setScroll != u.m.setScrollMax {
-		t.Fatalf("drag to bottom = %d, want %d", u.m.setScroll, u.m.setScrollMax)
+	if u.m.setScroll != max {
+		t.Fatalf("drag to bottom = %d, want %d", u.m.setScroll, max)
 	}
 
 	// And back to the top.
@@ -36,12 +44,23 @@ func TestScrollbarDrag(t *testing.T) {
 		t.Fatalf("drag past the top = %d, want 0", u.m.setScroll)
 	}
 
-	// Clicking the middle of the track jumps the handle there, i.e. about half
-	// the range.
-	u.beginScrollDrag(u.sy(trackTop + trackH/2))
-	half := u.m.setScrollMax / 2
-	if d := u.m.setScroll - half; d > 20 || d < -20 {
-		t.Fatalf("mid-track click = %d, want about %d", u.m.setScroll, half)
+	// Dragging the handle a quarter of its movable span scrolls a quarter of
+	// the range, whatever the handle's size.
+	span := trackH - thumbH
+	u.beginScrollDrag(u.sy(thumbTop + 2))
+	u.dragScrollTo(u.sy(thumbTop + 2 + span/4))
+	if q := u.m.setScroll - max/4; q > 20 || q < -20 {
+		t.Fatalf("quarter-span drag = %d, want about %d", u.m.setScroll, max/4)
+	}
+
+	// Clicking the track below the handle jumps it toward the click and clamps
+	// at the end of the range (the press was outside the handle, so it centres
+	// the handle on the pointer rather than keeping a grab offset).
+	u.m.setScroll = 0
+	u.clampSetScroll()
+	u.beginScrollDrag(u.sy(trackTop + trackH - 5))
+	if u.m.setScroll != max {
+		t.Fatalf("track click below the handle = %d, want %d", u.m.setScroll, max)
 	}
 
 	// A page that fits has nothing to drag.

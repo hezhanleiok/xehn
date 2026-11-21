@@ -43,6 +43,23 @@ programs. At minimum:
    `import psiphon-tunnel-core` or link mihomo into your own binary: that would
    make your binary a derivative work of a GPL-3.0 program.
 
+## Linked libraries (compiled into xehn.exe)
+
+Unlike the `core\` binaries above, these are Go packages **linked into** the
+`xehn.exe` image, so their license terms apply to the binary itself:
+
+| component | license | location |
+|---|---|---|
+| lxn/walk (Win32 GUI toolkit) | BSD-3-Clause | vendored at `third_party/walk`, see `third_party/walk/LICENSE` + `AUTHORS` |
+| lxn/win, golang.org/x/*, other Go modules | per-upstream (BSD/MIT/Apache) | pinned in `go.mod`; license text in each module |
+
+`third_party/walk` is a verbatim copy of upstream `lxn/walk`
+`v0.0.0-20210112085537-c389da54e794` plus **one local fix**: `bufferedPaint`
+now disposes its per-frame buffered canvas (`defer buffered.Dispose()` in
+`customwidget.go`), which upstream leaked (one enhanced metafile per repaint).
+The BSD-3 copyright notice and license are retained in that directory; the
+modification is noted here as required by the license.
+
 ## Status
 
 **LEGAL REVIEW REQUIRED.** This file is an engineering inventory, not legal

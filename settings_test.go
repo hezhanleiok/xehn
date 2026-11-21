@@ -20,9 +20,6 @@ func TestSettingsRoundTrip(t *testing.T) {
 	in.MixedPort = 1080
 	in.IPFamily = famV6
 	in.Pin = "2606:4700::1"
-	in.MTU = 1280
-	in.DNSCustom = "223.5.5.5, 1.1.1.1"
-	in.DNSLeak = false
 	in.ProxyMode = modeBlacklist
 	in.CaptureMode = captureTun
 	in.AllowLan = true
@@ -52,20 +49,24 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if out.MixedPort != 1080 {
 		t.Errorf("mixed port = %d, want 1080", out.MixedPort)
 	}
-	if out.IPFamily != famV6 || out.MTU != 1280 {
-		t.Errorf("family/mtu = %q/%d, want v6/1280", out.IPFamily, out.MTU)
+	if out.IPFamily != famV6 {
+		t.Errorf("family = %q, want v6", out.IPFamily)
+	}
+	// Internalized knobs: whatever the file said, the shipped defaults win.
+	if out.MTU != 0 {
+		t.Errorf("mtu = %d, want 0 (internalized)", out.MTU)
 	}
 	if out.Pin != in.Pin {
 		t.Errorf("pin = %q, want %q", out.Pin, in.Pin)
 	}
-	if out.DNSCustom != in.DNSCustom {
-		t.Errorf("dns = %q, want %q", out.DNSCustom, in.DNSCustom)
+	if out.DNSCustom != "" || out.DNSOff {
+		t.Errorf("dns = %q/off=%t, want internalized empty/on", out.DNSCustom, out.DNSOff)
 	}
 	if out.ProxyMode != modeBlacklist {
 		t.Errorf("proxy mode = %q, want %q", out.ProxyMode, modeBlacklist)
 	}
-	if out.DNSLeak {
-		t.Error("dns leak = true, want the persisted false")
+	if !out.DNSLeak {
+		t.Error("dns leak = false, want the internalized always-on true")
 	}
 	if out.CaptureMode != captureTun {
 		t.Errorf("capture = %q, want tun", out.CaptureMode)
@@ -108,6 +109,73 @@ func TestSettingsNormalize(t *testing.T) {
 	}
 	if s.CaptureMode != captureProxy || s.IPFamily != famV4 {
 		t.Errorf("capture/family = %q/%q, want proxy/v4", s.CaptureMode, s.IPFamily)
+	}
+}
+
+// TestSettingsInternalized pins the knobs the settings page no longer exposes:
+// a hand-edited file may carry any of them, but load/save must force the shipped
+// defaults so the UI never shows a state it cannot explain or change back.
+func TestSettingsInternalized(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("WARP_CLIENT_HOME", dir)
+	raw := `{
+		"api_port": 12345,
+		"mtu": 1400,
+		"timeout_sec": 30,
+		"rescan": true,
+		"auto_repair": false,
+		"dns_custom": "9.9.9.9",
+		"dns_off": true,
+		"dns_leak": false
+	}`
+	if err := os.WriteFile(filepath.Join(dir, settingsName), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := loadSettings()
+	if s.APIPort == 12345 {
+		t.Errorf("api port = %d, want the internalized default", s.APIPort)
+	}
+	if s.MTU != 0 || s.TimeoutSec != 2 {
+		t.Errorf("mtu/timeout = %d/%d, want 0/2", s.MTU, s.TimeoutSec)
+	}
+	if s.Rescan || !s.AutoRepair {
+		t.Errorf("rescan/autoRepair = %t/%t, want false/true", s.Rescan, s.AutoRepair)
+	}
+	if s.DNSCustom != "" || s.DNSOff || !s.DNSLeak {
+		t.Errorf("dns = %q/off=%t/leak=%t, want empty/false/true", s.DNSCustom, s.DNSOff, s.DNSLeak)
+	}
+	// The forced values must also survive the write path, not just the read.
+	if err := saveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	out := loadSettings()
+	if out.DNSCustom != "" || out.DNSOff || !out.DNSLeak || out.MTU != 0 {
+		t.Errorf("save/load drifted: %+v", out)
+	}
+}
+
+// TestSettingsFamilyGates pins the IPv6 capability matrix: stacked exits are
+// v4-only, nested WARP protocols cannot carry v6, but subscription mode is not
+// gated on the WARP proto at all (the imported node decides).
+func TestSettingsFamilyGates(t *testing.T) {
+	cases := []struct {
+		name string
+		s    clientSettings
+		want string
+	}{
+		{"psiphon locks v4", clientSettings{Proto: protoWG, IPFamily: famBoth, Psiphon: true}, famV4},
+		{"openvpn locks v4", clientSettings{Proto: protoWG, IPFamily: famV6, OpenVPN: true}, famV4},
+		{"nested proto locks v4", clientSettings{Proto: protoWWarp, IPFamily: famBoth}, famV4},
+		{"capable proto keeps v6", clientSettings{Proto: protoWG, IPFamily: famV6}, famV6},
+		{"subscription ignores warp proto", clientSettings{ConnMode: "subscription", Proto: protoWWarp, IPFamily: famBoth}, famBoth},
+		{"subscription exit still locks", clientSettings{ConnMode: "subscription", Proto: protoWG, IPFamily: famV6, Psiphon: true}, famV4},
+	}
+	for _, tc := range cases {
+		s := tc.s
+		s.normalize()
+		if s.IPFamily != tc.want {
+			t.Errorf("%s: family = %q, want %q", tc.name, s.IPFamily, tc.want)
+		}
 	}
 }
 

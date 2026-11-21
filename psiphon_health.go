@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/xhwarp/warp-client/internal/core"
 )
@@ -96,7 +95,7 @@ func restartPsiphon(ctx context.Context, st clientState, logf func(string)) erro
 		cur.PsiphonSocksPort = l.SocksPort
 		_ = saveState(cur)
 	}
-	if err := ps.WaitForSocks(ctx, 60*time.Second); err != nil {
+	if err := ps.WaitForSocks(ctx, psiphonSocksWait); err != nil {
 		_ = ps.Stop()
 		return fmt.Errorf("等待 SOCKS: %w", err)
 	}

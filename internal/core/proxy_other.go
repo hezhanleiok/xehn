@@ -14,6 +14,8 @@ func UnsetSystemProxy(*ProxySnapshot) error { return nil }
 
 func SystemProxyEnabledAt(port int) bool { return false }
 
+func SystemProxyPointsElsewhere(port int) bool { return false }
+
 func ClearSystemProxy() error { return nil }
 
 func DetectProxyBlocker() string { return "" }
@@ -27,3 +29,11 @@ func SetSystemProxyElevated(port int) error {
 func RestoreSystemProxyElevated(*ProxySnapshot) error { return nil }
 
 func RunProxyHelper([]string) int { return 2 }
+
+func EnsureLanFirewall(int, string) error {
+	return errors.New("core: firewall rules are only supported on Windows")
+}
+
+func LanFirewallReady(int) bool { return false }
+
+func RemoveLanFirewall(int) {}

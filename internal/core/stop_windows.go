@@ -191,3 +191,66 @@ func KillByPID(pid int, expectExe string) error {
 	}
 	return nil
 }
+
+// processImagePath returns the full image path of a live pid.
+func processImagePath(pid int) (string, bool) {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return "", false
+	}
+	defer windows.CloseHandle(h)
+	var buf [windows.MAX_PATH]uint16
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
+		return "", false
+	}
+	return windows.UTF16ToString(buf[:]), true
+}
+
+// KillStalePortableCores terminates cores belonging to ANY XEHN portable folder,
+// not just the copy this build runs from.
+//
+// Updating by extracting a new folder (the normal flow for this app) leaves the
+// previous version's core running: it holds memory, and when it managed to bind
+// it holds the ports the new build needs. KillStaleCores cannot see it because
+// the image path differs from the current build's.
+//
+// The match is deliberately narrow — the file must be the core executable AND
+// its path must contain "xehn" — so a Clash Party / Verge sidecar
+// ("...\resources\sidecar\mihomo.exe") is never touched.
+func KillStalePortableCores() int {
+	want := strings.ToLower(ExeName())
+	if want == "" {
+		return 0
+	}
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(snap)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	killed := 0
+	for err = windows.Process32First(snap, &entry); err == nil; err = windows.Process32Next(snap, &entry) {
+		pid := int(entry.ProcessID)
+		if pid <= 0 || pid == os.Getpid() {
+			continue
+		}
+		if !strings.EqualFold(syscall.UTF16ToString(entry.ExeFile[:]), ExeName()) {
+			continue
+		}
+		image, ok := processImagePath(pid)
+		if !ok {
+			continue
+		}
+		lower := strings.ToLower(image)
+		if !strings.Contains(lower, "xehn") {
+			continue
+		}
+		if err := KillByPID(pid, image); err == nil {
+			killed++
+		}
+	}
+	return killed
+}

@@ -5,63 +5,75 @@ package main
 import "testing"
 
 // TestAboutLayoutFitsBody pins the About page's vertical budget. The page does
-// not scroll, so every card and both footer lines must end above the body's
-// bottom edge: a clipped footer would hide the licence sentence the page exists
-// to carry, and a card that overruns its row would paint over the next one.
+// not scroll, so every card, the link card and both footer lines must end above
+// the body's bottom edge: a clipped footer would hide the licence sentence the
+// page exists to carry, and a card that overruns would paint over the next one.
 func TestAboutLayoutFitsBody(t *testing.T) {
-	row1, row2, row3, footer := aboutLayout(shellBodyY)
+	c1, c2, c3, c4, links, footer := aboutLayout(shellBodyY)
 
-	if row1 != shellBodyY {
-		t.Fatalf("first row starts at %v, want the body top %v", row1, shellBodyY)
+	if c1 != shellBodyY {
+		t.Fatalf("first card starts at %v, want the body top %v", c1, shellBodyY)
 	}
-	if want := row1 + aboutRow1H + aboutGap; row2 != want {
-		t.Fatalf("row 2 starts at %v, want %v", row2, want)
+	for i, got := range []float64{c2, c3, c4} {
+		want := c1 + float64(i+1)*(aboutCardH+aboutGap)
+		if got != want {
+			t.Fatalf("card %d starts at %v, want %v", i+2, got, want)
+		}
 	}
-	if want := row2 + aboutRow2H + aboutGap; row3 != want {
-		t.Fatalf("row 3 starts at %v, want %v", row3, want)
+	if want := c4 + aboutCardH + aboutGap; links != want {
+		t.Fatalf("link card starts at %v, want %v", links, want)
 	}
-	if want := row3 + aboutRow3H + aboutFootG; footer != want {
+	if want := links + aboutLinkH + aboutFootG; footer != want {
 		t.Fatalf("footer starts at %v, want %v", footer, want)
 	}
 
 	bodyBottom := shellBodyY + shellBodyH
-	// Footer: two lines, 18px each, the second one starting 20px lower.
+	// Footer: a rule 7px above the text, then two lines 18px each with the
+	// second starting 20px lower.
 	if bottom := footer + 20 + 18; bottom > bodyBottom {
 		t.Fatalf("footer ends at %v, past the body bottom %v", bottom, bodyBottom)
 	}
-
-	// The link card's five rows: 22px apart from the first row's top, each 20
-	// tall. The last row must stay inside the card.
-	linkLast := row3 + 40 + 4*22 + 20
-	if linkLast > row3+aboutRow3H {
-		t.Fatalf("last link row ends at %v, card ends at %v", linkLast, row3+aboutRow3H)
+	if top := footer - 7; top < links+aboutLinkH {
+		t.Fatalf("footer rule at %v overlaps the link card ending at %v", top, links+aboutLinkH)
 	}
 
-	// Buttons sit 34 tall at +146 / +140 from their row's top.
-	if bottom := row1 + 146 + 34; bottom > row1+aboutRow1H {
-		t.Fatalf("row 1 buttons end at %v, card ends at %v", bottom, row1+aboutRow1H)
+	// Link card: title band, then five rows. The last row stays inside.
+	linkLast := links + 34 + 4*aboutLinkStep + 18
+	if linkLast > links+aboutLinkH {
+		t.Fatalf("last link row ends at %v, card ends at %v", linkLast, links+aboutLinkH)
 	}
-	if bottom := row2 + 140 + 34; bottom > row2+aboutRow2H {
-		t.Fatalf("row 2 buttons end at %v, card ends at %v", bottom, row2+aboutRow2H)
+
+	// Card internals: the action row shares the title line, and the two field
+	// rows must start below it without leaving the card.
+	btnBottom := c1 + aboutBtnTop + aboutBtnH
+	fieldTop := c1 + 34
+	if btnBottom > fieldTop {
+		t.Fatalf("actions end at %v, fields start at %v", btnBottom, fieldTop)
+	}
+	fieldBottom := fieldTop + aboutKVStep + 20
+	if fieldBottom > c1+aboutCardH {
+		t.Fatalf("last field row ends at %v, card ends at %v", fieldBottom, c1+aboutCardH)
 	}
 }
 
-// TestAboutColumnsFitWidth checks the two-column rows at both the default grid
-// and a wide window: half + gap + half has to stay inside the content width, or
-// the right-hand card would be drawn off the page.
-func TestAboutColumnsFitWidth(t *testing.T) {
+// TestAboutWidthsFit checks the single-column card at the default grid and a wide
+// window: the title, the action pair and the two field columns all have to fit
+// inside the card's padded width.
+func TestAboutWidthsFit(t *testing.T) {
 	for _, w := range []float64{858, 1200, 1600} {
-		half := (w - aboutGap) / 2
-		if total := half*2 + aboutGap; total > w {
-			t.Fatalf("width %v: columns span %v", w, total)
+		// Actions: two chips at the minimum width plus the gap and right padding.
+		actsW := 80*2 + aboutBtnGap + aboutBtnPadR
+		if title := 200.0; title+actsW > w-32 {
+			t.Fatalf("width %v: title %v and actions %v collide", w, title, actsW)
 		}
-		// Buttons: 16 margin + two buttons + 10 between them + 16 margin.
-		bw := (half - 16 - 16 - 10) / 2
-		if total := 16 + bw + 10 + bw + 16; total > half {
-			t.Fatalf("width %v: buttons span %v in a %v card", w, total, half)
+		// Fields: two label/value pairs with the gap between them.
+		colW := (w - 32 - aboutFieldGap) / 2
+		if colW < aboutFieldCol+120 {
+			t.Fatalf("width %v: field column %v leaves %v for a value", w, colW, colW-aboutFieldCol)
 		}
-		if bw < 80 {
-			t.Fatalf("width %v: button %v is too narrow for its label", w, bw)
+		// Link rows: label column plus a readable address column.
+		if got := w - 140; got < 300 {
+			t.Fatalf("width %v: link address column is only %v", w, got)
 		}
 	}
 }

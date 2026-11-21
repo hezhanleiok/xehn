@@ -247,11 +247,11 @@ func (u *natUI) ellipseFill(c *walk.Canvas, col walk.Color, cx, cy, ew, eh float
 // colour fades toward the rim. GDI+ has no blur and no alpha in a solid brush,
 // so blending each ring toward the surface colour is how the mock's out-of-focus
 // hills are reproduced.
-func (u *natUI) softEllipse(c *walk.Canvas, base walk.Color, cx, cy, ew, eh, strength float64) {
-	// Many thin rings, mixed from the *local* surface colour toward white: the
-	// outermost ring has to be exactly the surface, or the shape's rim paints a
-	// darker halo and the "blur" shows up as a hard arc (which is what a wash
-	// based on th.window does over a lighter gradient).
+func (u *natUI) softEllipse(c *walk.Canvas, base, toward walk.Color, cx, cy, ew, eh, strength float64) {
+	// Many thin rings, mixed from the *local* surface colour toward the
+	// highlight: the outermost ring has to be exactly the surface, or the
+	// shape's rim paints a darker halo and the "blur" shows up as a hard arc
+	// (which is what a wash based on th.window does over a lighter gradient).
 	const steps = 26
 	for i := steps; i >= 1; i-- {
 		t := float64(i) / float64(steps)
@@ -259,9 +259,39 @@ func (u *natUI) softEllipse(c *walk.Canvas, base walk.Color, cx, cy, ew, eh, str
 		if f <= 0.012 {
 			continue
 		}
-		u.ellipseFill(c, mix(base, rx(255, 255, 255), f),
+		u.ellipseFill(c, mix(base, toward, f),
 			cx, cy, ew*(0.55+0.45*t), eh*(0.55+0.45*t))
 	}
+}
+
+// glowPx paints a soft coloured glow (design units): nested ellipses whose
+// colour fades from the surface toward col. Unlike softEllipse (which fades to
+// white), this tints the glow, so the dark canvas gets a green/cyan aurora and
+// the light canvas a faint wash of the same hue.
+func (u *natUI) glowPx(c *walk.Canvas, base walk.Color, cx, cy, ew, eh float64, col walk.Color, strength float64) {
+	const steps = 24
+	for i := steps; i >= 1; i-- {
+		t := float64(i) / float64(steps)
+		f := strength * (1 - t) * (1 - t)
+		if f <= 0.01 {
+			continue
+		}
+		u.ellipseFill(c, mix(base, col, f), cx, cy, ew*(0.5+0.5*t), eh*(0.5+0.5*t))
+	}
+}
+
+// glowFall is the analytic falloff of glowPx at a point: the innermost ring
+// covering it. wallpaperAt uses it to reproduce the painted surface colour.
+func glowFall(strength, x, y, cx, cy, ew, eh float64) float64 {
+	d := math.Hypot((x-cx)/ew, (y-cy)/eh)
+	if d >= 1 {
+		return 0
+	}
+	t := 2*d - 1
+	if t < 0 {
+		t = 0
+	}
+	return strength * (1 - t) * (1 - t)
 }
 
 func (u *natUI) circleStroke(c *walk.Canvas, col walk.Color, cx, cy, r float64) {
@@ -305,14 +335,144 @@ func mix(a, b walk.Color, t float64) walk.Color {
 		byte(float64(ab)+(float64(bb)-float64(ab))*t))
 }
 
-// radial fills a circle with a soft top-to-bottom gradient, drawn as concentric
-// discs. The step count is fixed: it is a gradient, not a computation.
-func (u *natUI) radial(c *walk.Canvas, from, to walk.Color, cx, cy, r float64) {
-	const steps = 24
-	for i := 0; i < steps; i++ {
-		t := float64(i) / float64(steps-1)
-		u.circleFill(c, mix(from, to, t), cx, cy-t*2, r*(1-0.06*t))
+// ---------------------------------------------------------------------------
+// Hexagon key (v5 connect button)
+//
+// GDI+ has no rounded-polygon primitive and no clip-to-path here, so the
+// hexagon is sampled once per frame into a point list (quadratic corners) and
+// every fill is a stack of horizontal rows whose exact left/right edges come
+// from intersecting the scan line with that polygon. Strokes reuse the same
+// point list as a closed polyline.
+// ---------------------------------------------------------------------------
+
+// hexDesign samples a pointy-top hexagon with rounded corners in design units.
+// cut is how far each corner is trimmed along its two edges.
+func hexDesign(cx, cy, R, cut float64) [][2]float64 {
+	var vert [6][2]float64
+	for i := range vert {
+		a := (-90 + float64(i)*60) * math.Pi / 180
+		vert[i] = [2]float64{cx + R*math.Cos(a), cy + R*math.Sin(a)}
 	}
+	toward := func(a, b [2]float64) [2]float64 {
+		dx, dy := b[0]-a[0], b[1]-a[1]
+		L := math.Hypot(dx, dy)
+		return [2]float64{a[0] + dx/L*cut, a[1] + dy/L*cut}
+	}
+	const cornerSteps = 6
+	pts := make([][2]float64, 0, 6*(cornerSteps+1))
+	for i := 0; i < 6; i++ {
+		v := vert[i]
+		a := toward(v, vert[(i+5)%6])
+		b := toward(v, vert[(i+1)%6])
+		for s := 0; s <= cornerSteps; s++ {
+			t := float64(s) / cornerSteps
+			u1 := 1 - t
+			pts = append(pts, [2]float64{
+				u1*u1*a[0] + 2*u1*t*v[0] + t*t*b[0],
+				u1*u1*a[1] + 2*u1*t*v[1] + t*t*b[1],
+			})
+		}
+	}
+	return pts
+}
+
+// hexVerts are the six sharp vertices, for the node dots on the outer ring.
+func hexVerts(cx, cy, R float64) [][2]float64 {
+	pts := make([][2]float64, 6)
+	for i := range pts {
+		a := (-90 + float64(i)*60) * math.Pi / 180
+		pts[i] = [2]float64{cx + R*math.Cos(a), cy + R*math.Sin(a)}
+	}
+	return pts
+}
+
+// hexPoints is hexDesign in device pixels, ready for polyline strokes.
+func (u *natUI) hexPoints(cx, cy, R, cut float64) []walk.Point {
+	d := hexDesign(cx, cy, R, cut)
+	pts := make([]walk.Point, len(d))
+	for i, p := range d {
+		pts[i] = u.p(p[0], p[1])
+	}
+	return pts
+}
+
+// hexSpan intersects a horizontal scan line with the sampled polygon.
+func hexSpan(pts [][2]float64, y float64) (float64, float64, bool) {
+	xl, xr := math.MaxFloat64, -math.MaxFloat64
+	for i := range pts {
+		a, b := pts[i], pts[(i+1)%len(pts)]
+		if (a[1] <= y && b[1] > y) || (b[1] <= y && a[1] > y) {
+			x := a[0] + (y-a[1])/(b[1]-a[1])*(b[0]-a[0])
+			if x < xl {
+				xl = x
+			}
+			if x > xr {
+				xr = x
+			}
+		}
+	}
+	if xl > xr {
+		return 0, 0, false
+	}
+	return xl, xr, true
+}
+
+// hexStroke outlines the sampled hexagon with a weighted closed polyline.
+func (u *natUI) hexStroke(c *walk.Canvas, col walk.Color, pts []walk.Point, width float64) {
+	closed := make([]walk.Point, len(pts)+1)
+	copy(closed, pts)
+	closed[len(pts)] = pts[0]
+	u.polylineW(c, col, closed, width)
+}
+
+// hexFillGrad fills the hexagon with a top-to-bottom blend, one exact-width row
+// at a time so the rounded corners stay clean without a clip path.
+func (u *natUI) hexFillGrad(c *walk.Canvas, pts [][2]float64, from, to walk.Color, cy, R float64) {
+	step := math.Max(1.0, R/48)
+	for y := cy - R; y < cy+R; y += step {
+		xl, xr, ok := hexSpan(pts, y+step/2)
+		if !ok {
+			continue
+		}
+		t := (y + step/2 - (cy - R)) / (2 * R)
+		u.fillRect(c, mix(from, to, t), u.r(xl, y, xr-xl, step+0.4))
+	}
+}
+
+// hexScan paints the connecting scan band: a horizontal light stripe sweeping
+// down the hexagon, each row blended over the local gradient colour.
+func (u *natUI) hexScan(c *walk.Canvas, pts [][2]float64, from, to walk.Color, cy, R, bandY, bandH float64) {
+	const step = 1.5
+	for y := bandY; y < bandY+bandH; y += step {
+		xl, xr, ok := hexSpan(pts, y+step/2)
+		if !ok {
+			continue
+		}
+		t := (y - bandY) / bandH
+		a := 0.34 * (1 - math.Abs(2*t-1))
+		row := (y + step/2 - (cy - R)) / (2 * R)
+		u.fillRect(c, mix(mix(from, to, row), rx(255, 255, 255), a), u.r(xl, y, xr-xl, step+0.4))
+	}
+}
+
+// hexBracket is one side handle: a cubic bow bulging away from the key, with
+// round caps faked by end dots. side is -1 (left) or +1 (right).
+func (u *natUI) hexBracket(c *walk.Canvas, col walk.Color, cx, cy, R, side, width float64) {
+	x0 := cx + side*R*1.13
+	y0, y1 := cy-R*0.28, cy+R*0.28
+	bx := x0 + side*R*0.09
+	const steps = 16
+	pts := make([]walk.Point, 0, steps+1)
+	for i := 0; i <= steps; i++ {
+		t := float64(i) / steps
+		u1 := 1 - t
+		x := u1*u1*u1*x0 + 3*u1*u1*t*bx + 3*u1*t*t*bx + t*t*t*x0
+		y := u1*u1*u1*y0 + 3*u1*u1*t*(y0+R*0.10) + 3*u1*t*t*(y1-R*0.10) + t*t*t*y1
+		pts = append(pts, u.p(x, y))
+	}
+	u.polylineW(c, col, pts, width)
+	u.circleFill(c, col, x0, y0, width/2)
+	u.circleFill(c, col, x0, y1, width/2)
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +647,21 @@ func (u *natUI) icon(c *walk.Canvas, kind string, x, y, size float64, col walk.C
 	case "copy":
 		u.thickRound(c, col, u.r(x+s*0.34, y+s*0.34, s*0.52, s*0.52), 2, 1.6)
 		u.thickRound(c, col, u.r(x+s*0.10, y+s*0.10, s*0.52, s*0.52), 2, 1.6)
+	case "edit":
+		// A pencil: slanted shaft closed into a nib at the lower-left.
+		u.thickLine(c, col, x+s*0.20, y+s*0.80, x+s*0.68, y+s*0.32, 1.7)
+		u.thickLine(c, col, x+s*0.68, y+s*0.32, x+s*0.82, y+s*0.46, 1.7)
+		u.thickLine(c, col, x+s*0.82, y+s*0.46, x+s*0.34, y+s*0.94, 1.7)
+		u.thickLine(c, col, x+s*0.20, y+s*0.80, x+s*0.34, y+s*0.94, 1.7)
+	case "trash":
+		// A bin: lid with a handle, body, and two ribs.
+		u.thickLine(c, col, x+s*0.16, y+s*0.26, x+s*0.84, y+s*0.26, 1.6)
+		u.thickLine(c, col, x+s*0.38, y+s*0.26, x+s*0.38, y+s*0.13, 1.5)
+		u.thickLine(c, col, x+s*0.62, y+s*0.26, x+s*0.62, y+s*0.13, 1.5)
+		u.thickLine(c, col, x+s*0.38, y+s*0.13, x+s*0.62, y+s*0.13, 1.5)
+		u.strokeRound(c, col, u.r(x+s*0.25, y+s*0.26, s*0.50, s*0.64), 2)
+		u.line(c, col, x+s*0.43, y+s*0.40, x+s*0.43, y+s*0.78)
+		u.line(c, col, x+s*0.57, y+s*0.40, x+s*0.57, y+s*0.78)
 	}
 }
 
@@ -546,45 +721,24 @@ func (u *natUI) bars(c *walk.Canvas, x, y float64, ms int64, col walk.Color) {
 	}
 }
 
-// spark draws one or more normalised series as polylines inside a box. An empty
-// series leaves the box blank rather than drawing a fake flat line.
-func (u *natUI) spark(c *walk.Canvas, x, y, w, h float64, series [][]int64, cols []walk.Color) {
-	var peak int64
-	for _, s := range series {
-		for _, v := range s {
-			if v > peak {
-				peak = v
-			}
-		}
+// spinner draws a rotating ring of fading dots — the "测试中" indicator. The
+// head dot is full colour and the trail fades to the toggle-off grey; u.m.spin
+// advances the head so the ring appears to turn. Only dots are used (no arc
+// primitive), each a disposed circleFill, so it adds no lasting GDI handles.
+func (u *natUI) spinner(c *walk.Canvas, cx, cy, r float64, col walk.Color) {
+	const n = 10
+	head := u.m.spin % n
+	if head < 0 {
+		head += n
 	}
-	if peak <= 0 {
-		return
-	}
-	for si, s := range series {
-		if len(s) < 2 {
-			continue
+	for i := 0; i < n; i++ {
+		a := float64(i) * 2 * math.Pi / n
+		d := (head - i + n) % n
+		t := 1.0 - float64(d)/float64(n)
+		if t < 0.15 {
+			t = 0.15
 		}
-		col := th.accent
-		if si < len(cols) {
-			col = cols[si]
-		}
-		step := w / float64(len(s)-1)
-		px := x
-		py := y + h - float64(s[0])/float64(peak)*h
-		for i := 1; i < len(s); i++ {
-			nx := x + float64(i)*step
-			ny := y + h - float64(s[i])/float64(peak)*h
-			u.line(c, col, px, py, nx, ny)
-			px, py = nx, ny
-		}
-	}
-}
-
-// gridLines draws the faint horizontal rules behind a chart.
-func (u *natUI) gridLines(c *walk.Canvas, x, y, w, h float64, n int) {
-	for i := 1; i < n; i++ {
-		yy := y + h*float64(i)/float64(n)
-		u.fillRect(c, th.line, u.r(x, yy, w, 1))
+		u.circleFill(c, mix(th.toggleOff, col, t), cx+r*math.Cos(a), cy+r*math.Sin(a), r*0.20+0.5)
 	}
 }
 
@@ -608,11 +762,7 @@ func (u *natUI) card(c *walk.Canvas, x, y, w, h float64, title string) float64 {
 func (u *natUI) cardPlain(c *walk.Canvas, x, y, w, h float64) {
 	u.shadowRound(c, u.r(x, y, w, h), cardRadius, shadowTint(), th.window)
 	u.fillRound(c, th.card, u.r(x, y, w, h), cardRadius)
-	rim := mix(th.card, rx(255, 255, 255), 0.55)
-	if th.window.R() < 128 {
-		rim = mix(th.card, rx(255, 255, 255), 0.08)
-	}
-	u.strokeRound(c, rim, u.r(x+0.5, y+0.5, w-1, h-1), cardRadius)
+	u.strokeRound(c, th.line2, u.r(x+0.5, y+0.5, w-1, h-1), cardRadius)
 }
 
 // shadowTint is the colour a card's shadow blends toward. Light: a slightly
@@ -625,43 +775,21 @@ func shadowTint() walk.Color {
 	return mix(th.window, rx(86, 108, 140), 0.30)
 }
 
-// vgrad fills a rectangle with a top-to-bottom colour blend, painted as
-// horizontal bands. Used for the content canvas behind the cards.
-func (u *natUI) vgrad(c *walk.Canvas, x, y, w, h float64, from, to walk.Color) {
-	const steps = 48
-	bh := h / float64(steps)
-	for i := 0; i < steps; i++ {
-		t := float64(i) / float64(steps-1)
-		u.fillRect(c, mix(from, to, t), u.r(x, y+float64(i)*bh, w, bh+0.5))
-	}
-}
-
-// vgradPx is vgrad in device pixels, for surfaces that are not part of the
-// design grid (the sidebar strip and the canvas behind it run edge to edge at
-// any window size, so they must not be letterboxed with the cards).
-func (u *natUI) vgradPx(c *walk.Canvas, r walk.Rectangle, from, to walk.Color) {
-	const steps = 64
-	bh := float64(r.Height) / float64(steps)
-	for i := 0; i < steps; i++ {
-		t := float64(i) / float64(steps-1)
-		u.fillRect(c, mix(from, to, t), walk.Rectangle{
-			X:      r.X,
-			Y:      r.Y + int(float64(i)*bh+0.5),
-			Width:  r.Width,
-			Height: int(bh + 1.5),
-		})
-	}
-}
-
-// rowToggle is a labelled switch with an optional second line.
+// rowToggle is a labelled switch with an optional second line. A disabled row
+// is drawn muted so it reads as unavailable rather than broken; the caller
+// supplies a sub line explaining why (see paintSetExit).
 func (u *natUI) rowToggle(c *walk.Canvas, x, y, w float64, id, label, sub string, on, enabled bool) {
+	lcol, scol := th.text, th.dim
+	if !enabled {
+		lcol, scol = th.faint, th.faint
+	}
 	lh := 20.0
 	if sub != "" {
 		lh = 34
-		u.txt(c, x+16, y+1, w-80, 17, label, u.f.f10, th.text)
-		u.txt(c, x+16, y+19, w-80, 14, sub, u.f.f8, th.dim)
+		u.txt(c, x+16, y+1, w-80, 17, label, u.f.f10, lcol)
+		u.txt(c, x+16, y+19, w-80, 14, sub, u.f.f8, scol)
 	} else {
-		u.txt(c, x+16, y+(38-lh)/2, w-80, lh, label, u.f.f10, th.text)
+		u.txt(c, x+16, y+(38-lh)/2, w-80, lh, label, u.f.f10, lcol)
 	}
 	u.switchAt(c, id, x+w-16-44, y+6, on, enabled)
 	if enabled {
@@ -735,21 +863,6 @@ func popupBelow(ay, ah, ph float64) float64 {
 		py = 4
 	}
 	return py
-}
-
-// rowChips is a label with a set of mutually exclusive chips beside it.
-func (u *natUI) rowChips(c *walk.Canvas, x, y, w float64, idPrefix, label string, ids, labels []string, cur string) {
-	const labelW = 84.0
-	u.txt(c, x+16, y+4, labelW, 22, label, u.f.f10, th.text)
-	cx := x + 16 + labelW
-	for i := range ids {
-		cw := chipWidth(labels[i])
-		if cx+cw > x+w-12 {
-			break
-		}
-		u.chipAt(c, idPrefix+ids[i], labels[i], cx, y, cur == ids[i], true)
-		cx += cw + 6
-	}
 }
 
 // chipAt draws one chip and registers its hit area. Returns its width.
@@ -838,15 +951,6 @@ func (u *natUI) iconButton(c *walk.Canvas, x, y, size float64, id, kind string, 
 	}
 }
 
-// link is an inline text action with an accent colour and an underline on hover.
-func (u *natUI) link(c *walk.Canvas, x, y, w, h float64, id, label string) {
-	u.txt(c, x, y, w, h, label, u.f.f9, th.accent)
-	if u.m.hover == id {
-		u.hline(c, x, y+h-6, float64(len([]rune(label)))*7, th.accent)
-	}
-	u.addSpot(id, u.r(x, y, w, h), true)
-}
-
 // inputBox draws a read-only-looking field. Clicking it opens the text dialog;
 // the field itself never takes focus.
 func (u *natUI) inputBox(c *walk.Canvas, x, y, w, h float64, id, value, placeholder string) {
@@ -885,28 +989,6 @@ func (u *natUI) subtabs(c *walk.Canvas, x, y float64, prefix string, ids, labels
 		cx += w + 6
 	}
 	return cx
-}
-
-// kv is a label/value pair on one line (used by the about cards).
-func (u *natUI) kv(c *walk.Canvas, x, y, w float64, label, value string) {
-	u.txt(c, x+16, y, 84, 22, label, u.f.f9, th.dim)
-	u.txt(c, x+16+84, y, w-32-84, 22, value, u.f.f9, th.text)
-}
-
-// bulletRow is the "icon + text" row used by the split-rule list: a tinted
-// square icon, a title, an optional subtitle and a right-hand state chip.
-func (u *natUI) bulletRow(c *walk.Canvas, x, y, w float64, kind, title, sub, right string, rightCol walk.Color, iconBg walk.Color) {
-	u.fillRound(c, iconBg, u.r(x+16, y+6, 26, 26), 13)
-	u.icon(c, kind, x+16+7, y+6+7, 12, rightCol)
-	if sub == "" {
-		u.txt(c, x+52, y+7, w-160, 24, title, u.f.f10, th.text)
-	} else {
-		u.txt(c, x+52, y+2, w-160, 18, title, u.f.f10, th.text)
-		u.txt(c, x+52, y+20, w-160, 16, sub, u.f.f8, th.dim)
-	}
-	if right != "" {
-		u.textR(c, right, u.f.f9, rightCol, u.r(x+w-16-70, y+7, 70, 24))
-	}
 }
 
 // flagChip draws a flag and the country code from an ISO alpha-2 code.

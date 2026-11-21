@@ -51,6 +51,14 @@ func fetchMeta(ctx context.Context, client *http.Client, url string) (string, bo
 
 const portProbeSample = 12
 
+// isULA reports a unique-local IPv6 address (fc00::/7). Home routers hand these
+// out freely, but they never reach the internet: counting one as "this host has
+// IPv6" is exactly what sends an IPv6-only connect into a scan that cannot
+// succeed, which reads to the user as "it just keeps scanning endpoints".
+func isULA(ip net.IP) bool {
+	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
+}
+
 func haveAddrFamily(v6 bool) bool {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -62,6 +70,9 @@ func haveAddrFamily(v6 bool) bool {
 			continue
 		}
 		if v6 == (ipn.IP.To4() == nil) {
+			if v6 && isULA(ipn.IP) {
+				continue
+			}
 			return true
 		}
 	}
@@ -73,6 +84,57 @@ func famName(v6 bool) string {
 		return "IPv6"
 	}
 	return "IPv4"
+}
+
+// scanFamilyV6 reports whether endpoint discovery should use the IPv6 pools.
+//
+// It follows the host's routes, not the tunnel's family. ip_family decides what
+// the tunnel carries (WARP's own v6 address, v6-only inside the tunnel), while
+// this decides how the encrypted UDP reaches Cloudflare. WARP's IPv4 endpoints
+// are anycast and reachable everywhere; its 2606:4700:d0::/48 v6 pool is blocked
+// on many networks. Deriving the scan family from ip_family is what made "IPv6
+// only" look broken: the client went hunting for v6 endpoints that the network
+// could not reach, while the working v4 path sat unused.
+//
+// Cached for the process: the scan cache key is derived from it, so it must not
+// flap between calls.
+var (
+	scanV6Once sync.Once
+	scanV6Val  bool
+)
+
+func scanFamilyV6() bool {
+	scanV6Once.Do(func() {
+		scanV6Val = !haveAddrFamily(false) && haveAddrFamily(true)
+	})
+	return scanV6Val
+}
+
+// v6EgressReachable answers the one question an IPv6-only connect must settle
+// before scanning: can this host reach the IPv6 internet at all? A ULA-only or
+// IPv4-only host passes haveAddrFamily, then the port sweep spends minutes
+// timing out against every endpoint — the "it just keeps scanning" report.
+//
+// Several targets, and any one answering is enough. A single fixed probe is not
+// safe: Cloudflare's 1.1.1.1 anycast is blocked on some Chinese networks while
+// the host's own IPv6 works fine, and that alone would have reported "no IPv6"
+// on a machine that had it. The list spans CN and global resolvers plus a WARP
+// endpoint, so a probe only fails when IPv6 genuinely has no route.
+func v6EgressReachable(timeout time.Duration) bool {
+	for _, target := range []string{
+		"[2400:3200::1]:53",              // AliDNS v6, reachable from CN
+		"[2402:4e00::]:53",               // DNSPod v6, reachable from CN
+		"[2001:4860:4860::8888]:53",      // Google DNS v6
+		"[2606:4700:4700::1111]:443",     // Cloudflare v6 anycast
+		"[2606:4700:d0::a29f:c001]:2408", // WARP endpoint
+	} {
+		c, err := net.DialTimeout("tcp", target, timeout)
+		if err == nil {
+			_ = c.Close()
+			return true
+		}
+	}
+	return false
 }
 
 func interfaceAddr(name string, v6 bool) (netip.Addr, error) {
@@ -105,6 +167,12 @@ func reachablePorts(ctx context.Context, run protoRun, ips []netip.Addr, timeout
 	ports, err := probePorts(ctx, run, sampled, primaryWarpPorts, timeout, jobs, emit, "Phase 1: probing reachable WARP ports")
 	if err != nil || len(ports) > 0 {
 		return ports, err
+	}
+	// An IPv6 pool is two /48s of the same anycast fleet: when the primary ports
+	// are dead across the sample, sweeping 50 alternate ports cannot rescue it
+	// and only buys another minute of timeouts before the same answer.
+	if len(sampled) > 0 && sampled[0].Is6() {
+		return nil, nil
 	}
 	// No primary port got through: locked-down network, sweep the alternates.
 	return probePorts(ctx, run, sampled, extendedWarpPorts, timeout, jobs, emit, "Phase 1: sweeping alternate WARP ports")

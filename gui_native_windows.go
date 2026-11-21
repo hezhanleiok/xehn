@@ -20,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -44,7 +43,7 @@ const guiNativeAvailable = true
 // related instead of hand-sized.
 type fonts struct {
 	f8, f9, f10, f10b, f11b, f12b, f12, f13, f13b, f15, f15b, f16b, f17b, f18b, f22b, f25b, f30b *walk.Font
-	fmono                                                                                        *walk.Font
+	fmono, fmonoL                                                                                *walk.Font
 }
 
 // fontSpec is one face of the ramp: where to store it, its family and its size
@@ -83,13 +82,32 @@ type natModel struct {
 	vpnPoolBusy  bool
 	vpnPoolNote  string
 	vpnScroll    int  // vpnregion popup scroll (rows)
+	regionScroll int  // Psiphon region popup scroll (rows)
 	vpnProbeBusy bool // latency probe for the cached pool is in flight
 	vpnMeasured  bool // the current pool already carries measured latency
+	// Progress for the manual test, drawn under the picker header.
+	vpnProbeDone  int
+	vpnProbeTotal int
+	// vpnProbeOK / vpnProbeFail split the finished run so the result line says
+	// how many relays actually answered instead of only "12/12 completed",
+	// which read as success when every row had failed.
+	vpnProbeOK   int
+	vpnProbeFail int
+	// probeResults keeps this session's measured state per node ID. The pool
+	// slice is rebuilt on every refresh (which resets every row to 未检测), so
+	// results stored only on the nodes vanished from the list while the header
+	// still said "测试完成". Keyed by id, they survive a rebuild.
+	probeResults    map[string]probeResult
+	vpnProbeCurrent string
+	vpnProbeNote    string // scope: 全部 / 指定国家 / 指定节点
 
 	endpoints []cachedEndpoint
 	pin       string
 	scanFresh bool
 	scanAt    time.Time
+	// subTestAt is when the last subscription latency test finished; the mode
+	// page footer shows it as 上次测试 in subscription mode.
+	subTestAt time.Time
 
 	connecting bool
 	// cancelling is true between the cancel click and the pipeline returning:
@@ -106,6 +124,21 @@ type natModel struct {
 	samples   []int64
 	upRates   []int64 // live throughput samples, bytes/sec (upload)
 	downRates []int64 // live throughput samples, bytes/sec (download)
+	// Session byte totals and per-direction peaks for the home traffic card.
+	// Totals come from the core's /connections counters (cumulative for the
+	// run); peaks are the largest rate sample seen this session. Both clear
+	// with the rate rings on disconnect.
+	sessionUp   int64
+	sessionDown int64
+	peakUp      int64
+	peakDown    int64
+	// shareBytes is the live per-category byte split from /connections, indexed
+	// by the shareCat* constants; shareTotal is their sum. A zero total hides
+	// the share panel rather than drawing a fabricated split.
+	shareBytes [5]int64
+	shareTotal int64
+	// homeNodeScroll is the home node dropdown's list offset, in rows.
+	homeNodeScroll int
 
 	// The machine's own coordinates, shown on the home tiles while no tunnel
 	// is up: the LAN address, and the public IP's country/city.
@@ -125,6 +158,11 @@ type natModel struct {
 	proxyBlocker   string // security suite detected while ProxyWarn is set (banner hint)
 	blockerChecked bool   // DetectProxyBlocker ran once (touched only by statusLoop)
 
+	// proxyLost means the session is up but the host proxy no longer points at
+	// our port (another client rewrote WinINET). Every browser then goes out
+	// directly, so the home page must stop saying 已连接.
+	proxyLost bool
+
 	hover  string
 	spin   int
 	scroll int // node list scroll (rows)
@@ -143,9 +181,18 @@ type natModel struct {
 	nodeFilter      string
 	nodeSort        string
 	nodeVisibleRows int
-	logTab          string
-	logScroll       int // run-log lines scrolled up from the newest; 0 follows live
-	logVisibleRows  int // rows the last run-log paint could show
+	// Subscription grid: rows that fit, and the largest scroll offset. The
+	// wheel uses these instead of the WARP endpoint count in mode B.
+	subVisibleRows int
+	subMaxScroll   int
+	// subTesting marks nodes whose latency test is in flight, so the list can
+	// animate 未检测 → 测试中(spinner) → 延迟. Nil when no test is running.
+	subTesting map[string]bool
+	// subMgrScroll is the subscription-manager popup's list offset, in rows.
+	subMgrScroll   int
+	logTab         string
+	logScroll      int // run-log lines scrolled up from the newest; 0 follows live
+	logVisibleRows int // rows the last run-log paint could show
 
 	// set is the persisted preference file, kept in the model so every page
 	// renders straight from it.
@@ -221,20 +268,29 @@ type natUI struct {
 
 	m *natModel
 
+	// lastHealAt paces the periodic stale-proxy sweep: the startup heal can be
+	// skipped while an orphan core still holds the port, and the orphan dies
+	// seconds later, so one check at launch is not enough.
+	lastHealAt time.Time
+
 	f  fonts
 	sp []spot
 	k  float64
 
-	// The design grid is 1080x700 and is scaled uniformly (u.k) into the client
-	// area: oy is the vertical letterbox offset in device pixels, and dw is the
-	// grid *width* in design units, which grows with a wide window so the cards
-	// take the extra space instead of leaving a blank strip on the right.
+	// The layout is adaptive: k is the display's DPI factor (times a shrink
+	// factor on short non-home pages), ox/oy stay zero, and dw/dh are the
+	// logical client width/height the breakpoints lay out against. dh excludes
+	// the caption band. winW is the DPI-only logical width (no page shrink), so
+	// the sidebar breakpoint does not drift when a short page is scaled down.
 	ox, oy int
-	dw     float64
+	dw, dh float64
+	winW   float64
 	// fonts is the ramp's construction table, and fontK the scale it was built
 	// for: paint rebuilds the whole ramp when the window scale drifts.
 	fonts []fontSpec
 	fontK float64
+
+	glowSpr map[string]*glowSprite
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -251,6 +307,24 @@ type natUI struct {
 	// racing on one cached verdict would let the slower (stale) answer win.
 	controlChecking atomic.Bool
 
+	// rescanBusy keeps a burst of clicks on the refresh button (or a click
+	// landing while the frame is redrawn) from starting several 1-2 minute
+	// scans at once. Each one re-registers, rewrites the endpoint cache and
+	// logs "重新扫描 WARP 端点" — four identical lines in one second were
+	// four concurrent scans, not one.
+	rescanBusy atomic.Bool
+
+	// subDelayBusy keeps only one subscription latency test in flight; each
+	// one starts its own temporary mihomo core.
+	subDelayBusy atomic.Bool
+	// subRefreshBusy keeps only one subscription re-fetch in flight: the
+	// refresh button re-downloads every remembered URL.
+	subRefreshBusy atomic.Bool
+	// probeCarrier is the WARP base the OpenVPN probe dials through, prepared
+	// once per run and cleared when it ends. Written before the probe workers
+	// start, read by them, never touched by the painter.
+	probeCarrier *probeCarrier
+
 	// ni is the tray icon. Closing the window hides it there instead of
 	// quitting, so the tunnel keeps running; the close is only allowed once
 	// u.quitting is set from the tray menu.
@@ -265,6 +339,18 @@ type natUI struct {
 	// the only way to scroll that page, which is what users complained about.
 	scrollDrag   bool
 	scrollGrabDY float64 // pointer offset inside the thumb, design units
+
+	// logDrag is the run-log scrollbar's grab state, same contract as the
+	// settings one: the thumb must be draggable, not wheel-only.
+	logDrag   bool
+	logGrabDY float64
+
+	// pageAnimAt stamps a page switch so paintShell can slide/fade the new page
+	// in; spinLoop keeps repainting until the transition window closes.
+	pageAnimAt time.Time
+	// ax/ay are the transient page-transition offset, in device pixels, added
+	// into sx/sy (and removed in ux/uy). Zero except mid-transition.
+	ax, ay int
 
 	// connectCancel stops the connect pipeline started by connectAsync. The
 	// button stays clickable while connecting, and that click has to do
@@ -286,13 +372,13 @@ func (u *natUI) s(v float64) int { return int(v*u.k + 0.5) }
 // used for an x or a y. Lengths go through s. sy also skips the caption band, so
 // every page can keep using 0 as its own top edge while the window draws its
 // buttons above it.
-func (u *natUI) sx(v float64) int { return u.ox + u.s(v) }
-func (u *natUI) sy(v float64) int { return u.oy + u.s(v+capH) }
+func (u *natUI) sx(v float64) int { return u.ox + u.ax + u.s(v) }
+func (u *natUI) sy(v float64) int { return u.oy + u.ay + u.s(v+capH) }
 
 // ux / uy are the inverse, for the few places that reason about a point the
 // canvas already drew (the sparkline column fill).
-func (u *natUI) ux(px int) float64 { return (float64(px) - float64(u.ox)) / u.k }
-func (u *natUI) uy(px int) float64 { return (float64(px) - float64(u.oy)) / u.k }
+func (u *natUI) ux(px int) float64 { return (float64(px) - float64(u.ox+u.ax)) / u.k }
+func (u *natUI) uy(px int) float64 { return (float64(px) - float64(u.oy+u.ay)) / u.k }
 
 func (u *natUI) r(x, y, w, h float64) walk.Rectangle {
 	return walk.Rectangle{X: u.sx(x), Y: u.sy(y), Width: u.s(w), Height: u.s(h)}
@@ -316,6 +402,7 @@ func (u *natUI) addSpot(id string, r walk.Rectangle, enabled bool) {
 
 func runNativeGUI(ctx context.Context, _ options) error {
 	redirectLogs()
+	logStartupDiagnostics()
 	enableDPIAwareness()
 
 	// Closing the window only hides it, so a second double-click would start a
@@ -347,16 +434,19 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	// centres it once the window knows its monitor.
 	dpi := windowDPI(uintptr(mw.Handle()))
 	if err := mw.SetClientSizePixels(walk.Size{
-		Width:  int(math.Round(designW * dpi / 96)),
-		Height: int(math.Round(designH * dpi / 96)),
+		Width:  int(math.Round(defaultW * dpi / 96)),
+		Height: int(math.Round(defaultH * dpi / 96)),
 	}); err != nil {
 		mw.Dispose()
 		return fmt.Errorf("set client size: %w", err)
 	}
-	// The layout is a uniformly scaled 1080x734 grid, so the floor can sit well
-	// under the design size: everything shrinks with it instead of clipping. The
-	// minimum keeps the design ratio, so a dragged window never letterboxes.
-	mw.SetMinMaxSizePixels(walk.Size{Width: 800, Height: 544}, walk.Size{})
+	// The pages are adaptive, so the floor is the smallest layout they support
+	// rather than a scaled copy of one fixed grid. WM_GETMINMAXINFO enforces the
+	// same floor in physical pixels during a drag.
+	mw.SetMinMaxSizePixels(walk.Size{
+		Width:  int(math.Round(minW * dpi / 96)),
+		Height: int(math.Round(minH * dpi / 96)),
+	}, walk.Size{})
 
 	u := &natUI{
 		mw:  mw,
@@ -400,29 +490,28 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	u.applyTheme()
 	u.applyLang()
 
-	// The reference mock uses one weight throughout: nothing is bold. Every
-	// face is therefore created with style 0 — the *b token names stay because
-	// the paint sites already pick the right role, they just no longer shout.
-	// Hierarchy comes from size and colour, exactly as in the mock.
+	// Hierarchy comes from size and colour; bold is reserved for values and
+	// titles. Nav and body text stay regular so small windows never look chunky.
 	u.fonts = []fontSpec{
-		{&u.f.f8, uiFont, 9, 0},    // caption / hint
-		{&u.f.f9, uiFont, 10, 0},   // label, list text
-		{&u.f.f10, uiFont, 11, 0},  // body
-		{&u.f.f10b, uiFont, 11, 0}, // body (same weight, by design)
-		{&u.f.f11b, uiFont, 11, 0}, // card title
-		{&u.f.f12b, uiFont, 12, 0}, // stat value, tab
-		{&u.f.f12, uiFont, 10, 0},  // small
-		{&u.f.f13, uiFont, 11, 0},  // sidebar status
-		{&u.f.f13b, uiFont, 12, 0}, // brand, button word
-		{&u.f.f15, uiFont, 12, 0},  // placeholder
-		{&u.f.f15b, uiFont, 15, 0}, // page title
-		{&u.f.f16b, uiFont, 13, 0}, // sidebar item
-		{&u.f.f17b, uiFont, 15, 0}, // big value (IP, rate, ms)
-		{&u.f.f18b, uiFont, 17, 0}, // display
-		{&u.f.f22b, uiFont, 18, 0}, // display, large
-		{&u.f.f25b, uiFont, 20, 0}, // hero
-		{&u.f.f30b, uiFont, 24, 0}, // hero, large
+		{&u.f.f8, uiFont, 9, 0},                // caption / hint
+		{&u.f.f9, uiFont, 10, 0},               // label, list text
+		{&u.f.f10, uiFont, 11, 0},              // body
+		{&u.f.f10b, uiFont, 11, walk.FontBold}, // body, emphasised
+		{&u.f.f11b, uiFont, 11, walk.FontBold}, // card title
+		{&u.f.f12b, uiFont, 12, walk.FontBold}, // stat value, tab
+		{&u.f.f12, uiFont, 10, 0},              // small
+		{&u.f.f13, uiFont, 11, 0},              // sidebar status
+		{&u.f.f13b, uiFont, 12, walk.FontBold}, // brand, button word
+		{&u.f.f15, uiFont, 15, 0},              // nav labels, regular weight
+		{&u.f.f15b, uiFont, 15, walk.FontBold}, // page title
+		{&u.f.f16b, uiFont, 13, walk.FontBold}, // sidebar item
+		{&u.f.f17b, uiFont, 15, walk.FontBold}, // big value (IP, rate, ms)
+		{&u.f.f18b, uiFont, 17, walk.FontBold}, // display
+		{&u.f.f22b, uiFont, 18, walk.FontBold}, // display, large
+		{&u.f.f25b, uiFont, 20, walk.FontBold}, // hero
+		{&u.f.f30b, uiFont, 24, walk.FontBold}, // hero, large
 		{&u.f.fmono, "Consolas", 10, 0},
+		{&u.f.fmonoL, "Consolas", 16, 0},
 	}
 	if err := u.rebuildFonts(1); err != nil {
 		mw.Dispose()
@@ -463,10 +552,14 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	cw.MouseWheel().Attach(func(x, y int, b walk.MouseButton) { u.onWheel(x, y, b) })
 
 	go u.statusLoop()
+	go u.shareLoop()
 	go u.spinLoop()
+	go u.guardLogLoop()
 	go u.probeCore()         // stats the core, asks it which protocols it can parse
 	u.reloadEndpoints(false) // fast cache read on the (main) GUI goroutine
-	u.refreshVPNGatePool()   // cached country list for the OpenVPN exit selector
+	// Pool refresh and latency tests are MANUAL ONLY now. Startup only reads an
+	// already cached list: no network fetch, no TCP probe, no classification.
+	u.loadVPNGateCacheOnly()
 
 	// Closing the window parks it in the tray instead of quitting: the session
 	// keeps running, which is what a VPN client has to do. Only the tray menu's
@@ -546,10 +639,19 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	case <-done:
 	case <-time.After(10 * time.Second):
 	}
+	// Last line of defence, and it runs on both paths. runDisconnectCmd restores
+	// the snapshot, but that call can wedge (elevation prompt nobody answered,
+	// security software swallowing the write) and the state file can be missing
+	// entirely. A host proxy pointing at a port whose core just died is the
+	// single worst outcome of this program: the user closes it and every page
+	// times out until they find Windows' proxy settings. Clearing is idempotent
+	// and only touches the proxy when it names our port.
+	clearProxyIfOurs(u.m.set.MixedPort, core.DefaultMixedPort)
 	// Hand health ownership back: this window's claim must not outlive it, or
 	// every other process would keep standing aside for an owner that left.
 	releaseHealthOwner(os.Getpid())
 	u.disposeFonts()
+	u.freeGlowSprites()
 	disposeLogo()
 	cw.Dispose()
 	mw.Dispose()
@@ -560,6 +662,23 @@ func runNativeGUI(ctx context.Context, _ options) error {
 // while nothing is listening on it. It is the startup half of the cleanup: the
 // exit path restores the proxy, and this catches the sessions that never reached
 // it (killed, crashed, or a restore that was blocked).
+// healProxyIfStale clears a host proxy that points at our port while nothing is
+// listening on it. Safe to call off the GUI thread; returns true when it
+// actually cleared something, so the caller can log it once.
+func healProxyIfStale(port int) bool {
+	if port <= 0 {
+		port = core.DefaultMixedPort
+	}
+	if !core.SystemProxyEnabledAt(port) {
+		return false
+	}
+	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
+		_ = conn.Close()
+		return false
+	}
+	return core.ClearSystemProxy() == nil
+}
+
 func (u *natUI) healStaleProxy() {
 	port := u.m.set.MixedPort
 	if port <= 0 {
@@ -568,14 +687,18 @@ func (u *natUI) healStaleProxy() {
 	if !core.SystemProxyEnabledAt(port) {
 		return
 	}
+	// A core left behind by a killed session still holds the port, so the
+	// liveness probe below would see a listener and keep a proxy that is about
+	// to die with the orphan. Sweep the orphans first — that is exactly the
+	// sequence behind "I closed it, reopened it, still no internet": the stale
+	// core answered the probe, the heal was skipped, then the watchdog killed
+	// the core and the proxy was left pointing at nothing.
+	if cDir, err := coreDir(); err == nil {
+		_ = core.KillStaleCores(core.CoreInDir(cDir))
+	}
 	// Only stale when nothing answers: a second instance or a live core would
 	// own this port, and clearing then would break a working session.
-	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
-		_ = conn.Close()
-		return
-	}
-	if err := core.ClearSystemProxy(); err != nil {
-		u.addLog(tr("清理残留的系统代理失败: ")+err.Error(), true)
+	if !healProxyIfStale(port) {
 		return
 	}
 	u.addLog(trf("已清理上次退出残留的系统代理（127.0.0.1:%d）", port), false)
@@ -642,10 +765,31 @@ func (u *natUI) scaleFonts(zoom float64) {
 	}
 }
 
+// syncPanics counts recovered callback panics so a broken worker reports once
+// instead of flooding the panel.
+var syncPanics int
+
 func (u *natUI) sync(f func()) {
-	if u.cw != nil {
-		u.mw.Synchronize(f)
+	if u.cw == nil {
+		return
 	}
+	u.mw.Synchronize(func() {
+		// A worker hands its result back through here. A panic inside the
+		// callback would otherwise unwind the message loop and take the whole
+		// process with it — the "it just closed by itself" report. Recover, log
+		// once, and keep the session alive: whatever the callback failed to
+		// apply is one stale value, not a lost connection.
+		defer func() {
+			if rec := recover(); rec != nil {
+				syncPanics++
+				if syncPanics <= 5 {
+					u.appendLog(fmt.Sprintf("后台回调异常（已跳过该次更新）: %v", rec), 2, false, false)
+					u.invalidate()
+				}
+			}
+		}()
+		f()
+	})
 }
 
 func (u *natUI) invalidate() {
@@ -737,7 +881,92 @@ func (u *natUI) startControlCheck(manual bool) {
 	}()
 }
 
+// guardLogLoop mirrors the detached health guard's findings into the log panel.
+// The guard is a separate process whose stderr lands in xehn.log, not in this
+// window's in-memory log; without this mirror a guard-driven repair or give-up
+// flips the home tile to "disconnected" with no explanation on screen (the
+// "connected then disconnected, but the log says nothing" report). Only lines
+// the guard tags with [guard] are surfaced, so the GUI's own file output and the
+// core's chatter are not duplicated here.
+func (u *natUI) guardLogLoop() {
+	home, err := appDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(home, "xehn.log")
+	var offset int64
+	if fi, serr := os.Stat(path); serr == nil {
+		offset = fi.Size()
+	}
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-u.ctx.Done():
+			return
+		case <-t.C:
+		}
+		f, oerr := os.Open(path)
+		if oerr != nil {
+			continue
+		}
+		fi, serr := f.Stat()
+		if serr != nil {
+			f.Close()
+			continue
+		}
+		if fi.Size() < offset {
+			offset = 0 // truncated or rotated
+		}
+		if fi.Size() == offset {
+			f.Close()
+			continue
+		}
+		if _, serr := f.Seek(offset, io.SeekStart); serr != nil {
+			f.Close()
+			continue
+		}
+		data, _ := io.ReadAll(io.LimitReader(f, 1<<20))
+		f.Close()
+		// Consume only complete lines so a line being appended concurrently is
+		// not split across two ticks.
+		end := strings.LastIndexByte(string(data), '\n')
+		if end < 0 {
+			continue
+		}
+		offset += int64(end + 1)
+		for _, line := range strings.Split(string(data[:end+1]), "\n") {
+			line = strings.TrimRight(line, "\r")
+			i := strings.Index(line, "[guard]")
+			if i < 0 {
+				continue
+			}
+			txt := strings.TrimSpace(line[i+len("[guard]"):])
+			if txt == "" {
+				continue
+			}
+			bad := strings.Contains(txt, "失败") || strings.Contains(txt, "断开") ||
+				strings.Contains(txt, "无法") || strings.Contains(txt, "结束会话")
+			u.sync(func() { u.addLog("守护："+txt, bad) })
+		}
+	}
+}
+
 func (u *natUI) statusLoop() {
+	// A killed client, a crash or a reboot leaves connected:true plus the
+	// PREVIOUS exit IP/country in state.json. The first tick would otherwise
+	// paint that stale (often US) exit for seconds before the idle probe
+	// corrects it — the "starts as America, then shows the local IP" report.
+	// A live mihomo answers its local API instantly; if it does not, there is
+	// no session to display. Do this once at startup, not on every tick.
+	if st, err := loadState(); err == nil && st.Connected {
+		if _, _, terr := core.Traffic(st.APIPort); terr != nil {
+			st.Connected = false
+			st.ExitIP, st.Country, st.Colo, st.NodeCity = "", "", "", ""
+			st.CorePID, st.PsiphonPID = 0, 0
+			_ = saveState(st)
+		}
+	}
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	var blocker string
@@ -918,15 +1147,35 @@ func (u *natUI) statusLoop() {
 				// probing; its snapshot is older than the state already shown.
 				return
 			}
-			// Persist a relay-country correction once, so status/CLI and the
-			// next process agree with what the home page now shows.
-			if st.Connected && st.OpenVPNMode && cc != "" && st.Country != cc {
-				st.Country, st.Colo, st.NodeCity = cc, colo, city
+			// Persist a CONFIRMED exit once, for every mode (not just
+			// OpenVPN). Otherwise each tick re-reads the WARP carrier's US
+			// from state.json, a successful probe paints GB, and the next
+			// failed probe falls back to US — the US/GB flicker.
+			if st.Connected && cc != "" && st.Country != cc {
+				st.Country, st.Colo, st.NodeCity, st.ExitIP = cc, colo, city, exIP
 				_ = saveState(st)
 			}
 			st.ExitIP, st.Country, st.Colo, st.NodeCity = exIP, cc, colo, city
 			u.m.status = st
 			u.m.proxyBlocker = blocker
+			// Keep watching the host proxy for the whole session. Another client
+			// (v2rayN rewrites WinINET on its own timer) can take it away minutes
+			// after connect; the tunnel stays up, the window keeps saying 已连接,
+			// and every browser goes out directly — the user believes they are on
+			// Psiphon while their ISP sees the real address.
+			if u.m.connected && !st.TUN && !st.NoProxy && st.MixedPort > 0 {
+				if !core.SystemProxyEnabledAt(st.MixedPort) {
+					if !u.m.proxyLost {
+						u.m.proxyLost = true
+						u.addLog(trf("系统代理已被其它程序改动，当前流量可能未经过隧道（应为 127.0.0.1:%d）", st.MixedPort), true)
+					}
+				} else if u.m.proxyLost {
+					u.m.proxyLost = false
+					u.addLog(tr("系统代理已恢复，流量重新经过隧道"), false)
+				}
+			} else if u.m.proxyLost {
+				u.m.proxyLost = false
+			}
 			// While an attempt is in flight the pipeline owns this flag. A poll
 			// that read state.json before the cancel landed must not flip the
 			// button back to "已连接" afterwards — that is the "cancelled, then
@@ -934,8 +1183,32 @@ func (u *natUI) statusLoop() {
 			if !u.m.connecting && !u.m.cancelling && !u.m.working {
 				u.m.connected = st.Connected
 			}
-			if u.m.localLan == "" {
-				u.m.localLan = localLanIP()
+			// Recompute on a slow cadence, not just when empty: a machine that
+			// gains a Docker/WSL adapter mid-session would otherwise keep
+			// advertising a 172.x address that no phone can reach, and a Wi-Fi
+			// switch changes the answer too. Enumerating adapters is a few
+			// hundred microseconds, so every 30s is free.
+			if u.m.localLan == "" || localTick%15 == 0 {
+				if ip := localLanIP(); ip != "" {
+					u.m.localLan = ip
+				}
+			}
+			// Periodic stale-proxy sweep. The startup heal runs while an orphan
+			// core from a killed session may still hold the port, so it sees a
+			// listener and backs off; that core then dies and the host proxy is
+			// left pointing at nothing. Re-checking once a minute while idle
+			// catches that window without ever touching a live session.
+			if time.Since(u.lastHealAt) > time.Minute &&
+				!u.m.connected && !u.m.connecting && !u.m.working {
+				u.lastHealAt = time.Now()
+				port := u.m.set.MixedPort
+				go func() {
+					if healProxyIfStale(port) {
+						u.sync(func() {
+							u.addLog(trf("已清理残留的系统代理（127.0.0.1:%d，端口已无监听）", port), false)
+						})
+					}
+				}()
 			}
 			if lip != "" {
 				u.m.localIP, u.m.localCC, u.m.localCity = lip, lcc, lcity
@@ -956,9 +1229,19 @@ func (u *natUI) statusLoop() {
 				if len(u.m.downRates) > 120 {
 					u.m.downRates = u.m.downRates[len(u.m.downRates)-120:]
 				}
+				if up > u.m.peakUp {
+					u.m.peakUp = up
+				}
+				if down > u.m.peakDown {
+					u.m.peakDown = down
+				}
 			}
 			if !st.Connected && (len(u.m.upRates) > 0 || len(u.m.downRates) > 0) {
 				u.m.upRates, u.m.downRates = nil, nil
+				u.m.peakUp, u.m.peakDown = 0, 0
+				u.m.sessionUp, u.m.sessionDown = 0, 0
+				u.m.shareBytes = [5]int64{}
+				u.m.shareTotal = 0
 			}
 			// Never clobber the busy flag while a connect/disconnect is in
 			// flight: first-use connects spend minutes scanning, and wiping
@@ -973,9 +1256,12 @@ func (u *natUI) statusLoop() {
 }
 
 func (u *natUI) spinLoop() {
-	// 40ms (25fps) is the slowest rate at which a rotating arc still reads as
-	// smooth; the previous 60ms tick visibly stepped.
-	t := time.NewTicker(40 * time.Millisecond)
+	// 16ms (~60fps) drives the connect button while a connect/disconnect is in
+	// flight, and the page-switch slide. On the home page the hexagon's slow
+	// breathing glow (2.2-4.5s cycles) only needs ~7.5fps (every 8th tick), so
+	// idle repaints cost half what they did at 15fps on old machines; other
+	// pages cost nothing when nothing animates.
+	t := time.NewTicker(16 * time.Millisecond)
 	defer t.Stop()
 	for {
 		select {
@@ -984,12 +1270,55 @@ func (u *natUI) spinLoop() {
 		case <-t.C:
 		}
 		u.sync(func() {
-			if u.m.connecting {
+			// A minimised or hidden window cannot show a frame, so nothing below
+			// is worth painting. The spin counter still advances so the glow and
+			// spinners resume mid-cycle when the window comes back.
+			hidden := u.windowHidden()
+			if u.m.connecting || u.m.working {
 				u.m.spin++
+				if hidden {
+					return
+				}
+				u.invalidate()
+				return
+			}
+			// The subscription latency test turns a per-node spinner; ~20fps
+			// (every 3rd tick) is smooth enough and only runs while testing.
+			if u.m.page == pageNodes && u.subDelayBusy.Load() {
+				u.m.spin++
+				if u.m.spin%3 == 0 && !hidden {
+					u.invalidate()
+				}
+				return
+			}
+			if u.m.page == "home" {
+				u.m.spin++
+				if u.m.spin%8 == 0 && !hidden {
+					u.invalidate()
+				}
+				return
+			}
+			if time.Since(u.pageAnimAt) < 260*time.Millisecond && !hidden {
 				u.invalidate()
 			}
 		})
 	}
+}
+
+// windowHidden reports a minimised or hidden window. Painting a window nobody
+// can see is the last idle cost worth removing: the home page repaints ~7.8fps
+// for its breathing glow and the connect button runs at 60fps, which a
+// background client should not pay.
+func (u *natUI) windowHidden() bool {
+	if u.mw == nil || !u.mw.Visible() {
+		return true
+	}
+	h := u.mw.Handle()
+	if h == 0 {
+		return true
+	}
+	r, _, _ := proc("IsIconic").Call(uintptr(h))
+	return r != 0
 }
 
 func (u *natUI) reloadEndpoints(force bool) {
@@ -997,6 +1326,11 @@ func (u *natUI) reloadEndpoints(force bool) {
 	outer, inner := u.m.outerProto, u.m.innerProto
 	if force {
 		go func() {
+			if !u.rescanBusy.CompareAndSwap(false, true) {
+				u.sync(func() { u.addLog(tr("已有扫描在进行中，忽略重复点击"), false) })
+				return
+			}
+			defer u.rescanBusy.Store(false)
 			opts := defaultConnectOptions(proto, false, true)
 			if proto == protoWWarp {
 				// Mirror runConnectCmd's chain normalisation: a wwarp scan is
@@ -1083,7 +1417,9 @@ func (u *natUI) refreshVPNGatePool(force ...bool) {
 			case len(fresh) > 0:
 				u.m.vpnNodes = fresh
 				u.m.vpnCountries = vpnGateCountries(fresh)
-				u.m.vpnMeasured = true
+				// A refresh is a pure list fetch: rows stay 未检测 until the
+				// user presses 延迟测试. No TCP probe runs here.
+				u.m.vpnMeasured = false
 				u.m.vpnPoolNote = ""
 				u.addLog(trf("VPN Gate 节点获取成功：%d 个节点，%d 个国家（%s）",
 					len(fresh), len(u.m.vpnCountries), tr(route)), false)
@@ -1108,19 +1444,31 @@ func (u *natUI) refreshVPNGatePool(force ...bool) {
 	}()
 }
 
-// fetchVPNGatePool runs the whole fetch pipeline off the GUI thread and probes
-// latency through whichever route delivered the list. route names the path that
-// answered, for the run log.
+// loadVPNGateCacheOnly fills the picker from the on-disk cache. No network
+// request, no classification lookup and no TCP probe: startup, switch toggle
+// and opening the region picker must never fetch or measure anything. Only the
+// 刷新 button may fetch live data, and only 延迟测试 may measure a node.
+func (u *natUI) loadVPNGateCacheOnly() {
+	nodes, _ := loadVPNGateCache()
+	if len(nodes) == 0 {
+		return
+	}
+	u.m.vpnNodes = nodes
+	u.m.vpnCountries = vpnGateCountries(nodes)
+	// A fresh read carries no measurements: rows show 未检测 until the user
+	// runs the manual OpenVPN handshake/speed test.
+	u.m.vpnMeasured = false
+}
+
+// fetchVPNGatePool pulls the node list and classifies it off the GUI thread.
+// It deliberately does NOT measure latency: a refresh is a pure list fetch.
+// The only latency/speed numbers shown are real OpenVPN handshake + download
+// results produced by the manual 延迟测试 button.
 func (u *natUI) fetchVPNGatePool() ([]vpnGateNode, string, error) {
 	directErr := error(nil)
 	if raw, err := fetchVPNGateDirect(u.ctx); err == nil {
 		if nodes := parseVPNGateCSV(raw); len(nodes) > 0 {
-			u.sync(func() { u.m.vpnPoolNote = tr("正在识别家宽/机房节点…") })
-			enrichCtx, cancel := context.WithTimeout(u.ctx, 20*time.Second)
-			_, _ = enrichVPNGateClasses(enrichCtx, &http.Client{Timeout: 15 * time.Second}, nodes)
-			cancel()
-			u.sync(func() { u.m.vpnPoolNote = tr("正在测量节点延迟…") })
-			measureVPNGateLatency(u.ctx, nodes)
+			u.classifyVPNGatePool(nodes, nil)
 			sortVPNGateNodesByLatency(nodes)
 			return nodes, "直连", nil
 		}
@@ -1133,12 +1481,7 @@ func (u *natUI) fetchVPNGatePool() ([]vpnGateNode, string, error) {
 	if st, lerr := loadState(); lerr == nil && st.Connected && st.MixedPort > 0 {
 		if raw, perr := fetchVPNGateViaProxy(u.ctx, st.MixedPort); perr == nil {
 			if nodes := parseVPNGateCSV(raw); len(nodes) > 0 {
-				u.sync(func() { u.m.vpnPoolNote = tr("正在识别家宽/机房节点…") })
-				enrichCtx, cancel := context.WithTimeout(u.ctx, 20*time.Second)
-				_, _ = enrichVPNGateClasses(enrichCtx, vpnGateProxyClient(st.MixedPort, 15*time.Second), nodes)
-				cancel()
-				u.sync(func() { u.m.vpnPoolNote = tr("正在测量节点延迟…") })
-				measureVPNGateLatency(u.ctx, nodes)
+				u.classifyVPNGatePool(nodes, vpnGateProxyClient(st.MixedPort, 15*time.Second))
 				sortVPNGateNodesByLatency(nodes)
 				return nodes, "本机代理", nil
 			}
@@ -1147,6 +1490,38 @@ func (u *natUI) fetchVPNGatePool() ([]vpnGateNode, string, error) {
 		}
 	}
 
+	// Subscription mode has no WARP tunnel to fall back on, and building one
+	// here would contradict the mode. The honest fallback is the mode's own
+	// first hop: fetch through the imported node the session would use. Without
+	// this, a network that blocks vpngate.net directly left subscription mode
+	// with no way to refresh the exit pool at all ("无法拉取节点").
+	if u.m.set.ConnMode == "subscription" {
+		u.sync(func() {
+			u.m.vpnPoolNote = tr("直连不可用，正在经订阅节点获取节点…")
+			u.addLog(tr("直连不可用，正在经订阅节点获取节点…"), false)
+			u.invalidate()
+		})
+		var lastErr error
+		fronts := subscriptionFronts(u.m.set)
+		for i, front := range fronts {
+			if i > 0 {
+				prev := fronts[i-1]
+				u.sync(func() {
+					u.addLog(trf("前置节点 %s 不可用，换下一个…", prev), false)
+					u.invalidate()
+				})
+			}
+			nodes, serr := fetchVPNGateViaSubscription(u.ctx, u.m.set.CustomProxies, front)
+			if serr == nil {
+				return nodes, "订阅节点", nil
+			}
+			lastErr = serr
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("没有可用于抓取的订阅节点")
+		}
+		return nil, "", fmt.Errorf("%s；订阅节点: %s", vpnShortErr(directErr), vpnShortErr(lastErr))
+	}
 	u.sync(func() {
 		u.m.vpnPoolNote = tr("直连不可用，正在经 WARP 获取节点…")
 		u.addLog(tr("直连不可用，正在经 WARP 获取节点…"), false)
@@ -1157,6 +1532,19 @@ func (u *natUI) fetchVPNGatePool() ([]vpnGateNode, string, error) {
 		return nil, "", fmt.Errorf("%s；WARP: %s", vpnShortErr(proxyErr), vpnShortErr(werr))
 	}
 	return nodes, "WARP 隧道", nil
+}
+
+// classifyVPNGatePool runs the two-source IP classification. proxyClient is
+// non-nil when the pool itself was fetched through the local proxy.
+func (u *natUI) classifyVPNGatePool(nodes []vpnGateNode, proxyClient *http.Client) {
+	u.sync(func() { u.m.vpnPoolNote = tr("正在识别家宽/机房节点…") })
+	client := proxyClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	enrichCtx, cancel := context.WithTimeout(u.ctx, 25*time.Second)
+	defer cancel()
+	_, _ = enrichVPNGateClasses(enrichCtx, client, nodes)
 }
 
 // fetchVPNGatePoolViaWARP builds a throwaway tunnel on the protocol the user
@@ -1178,7 +1566,7 @@ func (u *natUI) fetchVPNGatePoolViaWARP() ([]vpnGateNode, error) {
 		return nil, err
 	}
 	var results []cachedEndpoint
-	if cs, ok := cachedScanFor(underlay, false); ok {
+	if cs, ok := cachedScanFor(underlay, scanFamilyV6()); ok {
 		results = cs.Results
 	}
 	prefer := u.m.pin
@@ -1216,34 +1604,42 @@ func (u *natUI) fetchVPNGatePoolViaWARP() ([]vpnGateNode, error) {
 		}
 		results = fresh
 	}
-	return fetchVPNGateNodesViaWARP(u.ctx, results, run, prefer)
-}
-
-// probeVPNGateLatencyAsync fills in the latency column when the pool came from
-// the cache: the cache intentionally stores no timing, so without this the
-// picker would show "未测" for every node until the next live fetch.
-func (u *natUI) probeVPNGateLatencyAsync() {
-	if u.m.vpnProbeBusy || u.m.vpnMeasured || len(u.m.vpnNodes) == 0 {
-		return
+	// Bound the whole attempt: a dead peer makes every round-trip wait for its
+	// timeout, and two endpoints can hold the "正在获取" note for minutes.
+	fctx, fcancel := context.WithTimeout(u.ctx, 50*time.Second)
+	nodes, ferr := fetchVPNGateNodesViaWARP(fctx, results, run, prefer)
+	fcancel()
+	if ferr == nil {
+		return nodes, nil
 	}
-	u.m.vpnProbeBusy = true
-	nodes := append([]vpnGateNode(nil), u.m.vpnNodes...)
-	go func() {
-		measureVPNGateLatency(u.ctx, nodes)
-		sortVPNGateNodesByLatency(nodes)
+	// The cached endpoints carried nothing. That is the normal state after the
+	// network moved (or after a bad scan): a WireGuard tunnel to a dead peer
+	// still "starts", so the cache keeps claiming the endpoint is working.
+	// One forced rescan and one retry — this is what makes WARP mode able to
+	// fetch the list again instead of reporting failure forever.
+	if len(results) > 0 {
 		u.sync(func() {
-			u.m.vpnProbeBusy = false
-			if u.m.vpnMeasured {
-				// A live refresh finished first; its pool is newer than this
-				// probe's cached copy.
-				return
-			}
-			u.m.vpnMeasured = true
-			u.m.vpnNodes = nodes
-			u.m.vpnCountries = vpnGateCountries(nodes)
+			u.m.vpnPoolNote = tr("缓存端点无法转发，重新扫描 WARP 端点（约 1-2 分钟）…")
+			u.addLog(tr("缓存端点无法转发，重新扫描 WARP 端点（约 1-2 分钟）…"), false)
 			u.invalidate()
 		})
-	}()
+		scanOpts := opts
+		scanOpts.scanNow = true
+		fresh, _, serr := runCachedScan(u.ctx, scanOpts)
+		if serr == nil && len(fresh) > 0 {
+			rctx, rcancel := context.WithTimeout(u.ctx, 50*time.Second)
+			nodes, rerr := fetchVPNGateNodesViaWARP(rctx, fresh, run, "")
+			rcancel()
+			if rerr == nil {
+				return nodes, nil
+			}
+			return nil, fmt.Errorf("%s；重扫后仍失败: %s", vpnShortErr(ferr), vpnShortErr(rerr))
+		}
+		if serr != nil {
+			return nil, fmt.Errorf("%s；重扫: %s", vpnShortErr(ferr), vpnShortErr(serr))
+		}
+	}
+	return nil, ferr
 }
 
 // protoOK reports whether the installed core parses this protocol's config.
@@ -1254,6 +1650,24 @@ func (u *natUI) protoOK(p string) bool {
 		return true
 	}
 	return u.m.capab[p]
+}
+
+// exitOK reports whether the stacked exits (Psiphon / VPN Gate) are available.
+// Subscription mode has no WARP tunnel — the imported node is the underlay —
+// so the leftover WARP protocol choice must not veto the exits there. WARP
+// mode still excludes chained protocols, whose nested tunnel cannot carry a
+// third hop.
+func (u *natUI) exitOK() bool {
+	return u.m.set.ConnMode == "subscription" || !protoChained(u.m.proto)
+}
+
+// exitV6OK reports whether an exit can work on an IPv6-only tunnel. Neither
+// exit can: VPN Gate relays are IPv4-only (and mihomo's openvpn outbound cannot
+// carry a v6 tunnel at all), and Psiphon's own servers are reached over IPv4.
+// A v6-only tunnel has no route to either target, so the switches are disabled
+// instead of being left to fail after a 30-second connect attempt.
+func (u *natUI) exitV6OK() bool {
+	return u.m.set.IPFamily != famV6
 }
 
 // probeCore stats the core binary and, when present, asks it which protocols
@@ -1296,6 +1710,10 @@ func (u *natUI) probeCore() {
 		u.m.capab = supported
 		if perr != nil {
 			u.addLog("Core 能力探测失败: "+perr.Error(), true)
+			// A file that exists but cannot be executed is almost always a
+			// security product or Smart App Control, not a broken download.
+			// Give the exact recovery steps instead of the generic "请升级核心".
+			u.addLog(tr("核心文件存在却无法运行时：请把 XEHN 目录加入杀毒软件白名单；右键 xehn.exe 与 core\\mihomo.exe → 属性 → 勾选「解除锁定」；Windows 安全中心检查「智能应用控制」是否拦截。完成后重启程序"), true)
 		} else {
 			var ok []string
 			for _, r := range protoRuns {
@@ -1310,7 +1728,7 @@ func (u *natUI) probeCore() {
 }
 
 func (u *natUI) applyEndpoints(proto string) {
-	cs, ok := cachedScanFor(proto, false)
+	cs, ok := cachedScanFor(proto, scanFamilyV6())
 	if !ok || len(cs.Results) == 0 {
 		u.m.endpoints = nil
 		u.m.scanFresh = false
@@ -1375,11 +1793,47 @@ func (u *natUI) addLogFull(text string, lv int, core bool) {
 // disconnect, without the core's own chatter.
 func (u *natUI) addLogStage(text string) { u.appendLog(text, 0, false, true) }
 
+// Log retention. The client's own lines are never dropped — a failed connect is
+// diagnosed from them and they arrive at human pace. The core's chatter is what
+// floods: mihomo logs every connection, rule match and DNS lookup, so an
+// unbounded panel grew without limit on a long session (the "memory climbs and
+// the UI freezes" report). maxLogLines is the hard ceiling on the whole panel;
+// maxCoreLogLines is the budget core lines get when a trim happens, so the
+// client's own session lines survive a flood.
+const (
+	maxCoreLogLines = 3000
+	maxLogLines     = 20000
+	trimLogTarget   = 12000
+)
+
 func (u *natUI) appendLog(text string, lv int, core, stage bool) {
-	// The full session log is kept: copy, diagnostics and scrollback must be
-	// able to reach every line, so dropping old entries here silently shortened
-	// exactly the history a failed connect needs.
 	u.m.logs = append(u.m.logs, natLog{at: time.Now(), text: text, lv: lv, core: core, stage: stage})
+	if len(u.m.logs) > maxLogLines {
+		u.trimLogs()
+	}
+}
+
+// trimLogs keeps the newest lines, giving core chatter at most half the budget
+// so the client's own session lines survive a flood. It runs only once the
+// panel passes the hard ceiling, so the scan is amortised over thousands of
+// appends rather than paid per line.
+func (u *natUI) trimLogs() {
+	coreBudget := maxCoreLogLines
+	out := make([]natLog, 0, trimLogTarget)
+	for i := len(u.m.logs) - 1; i >= 0 && len(out) < trimLogTarget; i-- {
+		l := u.m.logs[i]
+		if l.core {
+			if coreBudget == 0 {
+				continue
+			}
+			coreBudget--
+		}
+		out = append(out, l)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	u.m.logs = out
 }
 
 // logText renders every retained line for the clipboard and diagnostics. The
@@ -1454,7 +1908,8 @@ func (u *natUI) action(id string) {
 			// Nested protocols cannot carry IPv6 (inner MTU is below the v6
 			// minimum), so the family follows the capability down to v4 rather
 			// than letting the page offer a choice the renderer would ignore.
-			if !protoV6Capable(p) && m.set.IPFamily != famV4 {
+			// Subscription mode has no WARP tunnel, so the gate skips it.
+			if m.set.ConnMode != "subscription" && !protoV6Capable(p) && m.set.IPFamily != famV4 {
 				u.mutateSettings(func(s *clientSettings) {
 					s.IPFamily = famV4
 					s.Pin = ""
@@ -1470,36 +1925,58 @@ func (u *natUI) action(id string) {
 			}
 		}
 	case id == "psiphon":
+		if !u.exitV6OK() {
+			u.addLog(tr("仅 IPv6 模式下不能启用出口：Psiphon 服务器经 IPv4 出网"), true)
+			return
+		}
 		m.psiphon = !m.psiphon
 		// The two exits replace the same thing; enabling one turns the other
 		// off instead of letting a file/UI carry both.
 		if m.psiphon {
 			m.openvpn = false
+			// The stacked exit is v4-only. Clamp the live family now:
+			// saveSettings normalizes a copy, so without this the in-memory
+			// selector would keep offering a v6 the session cannot carry.
+			if m.set.IPFamily != famV4 {
+				m.pin = ""
+				u.mutateSettings(func(s *clientSettings) {
+					s.IPFamily = famV4
+					s.Pin = ""
+				})
+			}
 		}
 		u.invalidate()
 		// Hot switch, like the protocol chips: a live connection swaps its exit
 		// without making the user disconnect by hand first.
-		if m.connected && !protoChained(m.proto) && !m.working && !m.connecting {
+		if m.connected && u.exitOK() && !m.working && !m.connecting {
 			u.doSwitch()
 		}
 	case id == "openvpn":
-		if protoChained(m.proto) {
+		if !u.exitOK() || !u.exitV6OK() {
 			return
 		}
 		m.openvpn = !m.openvpn
 		if m.openvpn {
 			m.psiphon = false
+			// VPN Gate is v4 end to end; clamp the family like Psiphon does.
+			if m.set.IPFamily != famV4 {
+				m.pin = ""
+				u.mutateSettings(func(s *clientSettings) {
+					s.IPFamily = famV4
+					s.Pin = ""
+				})
+			}
 		}
 		u.invalidate()
 		if m.openvpn {
-			// The dropdown needs the pool; the cached list usually answers
-			// instantly, a stale one refreshes in the background.
-			u.refreshVPNGatePool()
+			// Manual refresh only. Turning the switch on must not fetch the
+			// pool from the network behind the user's back.
+			u.loadVPNGateCacheOnly()
 		}
 		if m.connected && !m.working && !m.connecting {
 			u.doSwitch()
 		}
-	case id == "drop:region", id == "drop:vpnregion", id == "drop:proto", id == "drop:family", id == "drop:preset":
+	case id == "drop:region", id == "drop:vpnregion", id == "drop:proto", id == "drop:family", id == "drop:preset", id == "drop:capture", id == "drop:homenode", id == "drop:connmode", id == "drop:addmenu", id == "drop:submgr":
 		which := strings.TrimPrefix(id, "drop:")
 		if m.dropOpen == which {
 			m.dropOpen = ""
@@ -1507,17 +1984,91 @@ func (u *natUI) action(id string) {
 			m.dropOpen = which
 			if which == "vpnregion" {
 				m.vpnScroll = 0
-				if len(m.vpnCountries) == 0 {
-					u.refreshVPNGatePool()
-				} else if !m.vpnMeasured {
-					u.probeVPNGateLatencyAsync()
-				}
+				// Opening the picker never refreshes the pool and never runs a
+				// TCP probe. Both actions are triggered only by their buttons.
+				u.loadVPNGateCacheOnly()
+			}
+			if which == "region" {
+				m.regionScroll = 0
+				u.regionEnsureSelectedVisible()
+			}
+			if which == "homenode" {
+				m.homeNodeScroll = 0
+			}
+			if which == "submgr" {
+				m.subMgrScroll = 0
 			}
 		}
 		u.debugLogf(fmt.Sprintf("action %s -> dropOpen=%q page=%q", id, m.dropOpen, m.page))
 		u.invalidate()
 	case id == "vpnrefresh":
 		u.refreshVPNGatePool(true)
+	case id == "vpnprobe":
+		u.runVPNProbe()
+	case id == "suburl":
+		m.dropOpen = ""
+		u.importSubscriptionURL()
+	case id == "subfile":
+		m.dropOpen = ""
+		u.importSubscriptionFile()
+	case id == "subclip":
+		m.dropOpen = ""
+		u.importSubscriptionClipboard()
+	case id == "subqr":
+		m.dropOpen = ""
+		u.importSubscriptionQR()
+	case id == "subsingle":
+		m.dropOpen = ""
+		u.importSingleProxy()
+	case id == "subrefresh":
+		m.dropOpen = ""
+		u.refreshSubscriptions()
+	case strings.HasPrefix(id, "connmode:"):
+		mode := strings.TrimPrefix(id, "connmode:")
+		m.dropOpen = ""
+		if mode != m.set.ConnMode && (mode == "warp" || mode == "subscription") {
+			m.set.ConnMode = mode
+			// The family gate depends on the mode (a subscription node carries
+			// its own v6 capability): re-clamp the live copy so it matches the
+			// normalized file saveSettings writes.
+			m.set.normalize()
+			m.pin = m.set.Pin
+			if err := saveSettings(m.set); err != nil {
+				u.addLog(tr("设置保存失败: ")+err.Error(), true)
+			}
+			label := tr("WARP 模式")
+			if mode == "subscription" {
+				label = tr("订阅模式")
+			}
+			u.addLog(tr("模式切换")+": "+label, false)
+			m.scroll = 0
+		}
+		u.invalidate()
+	case id == "submode":
+		u.toggleConnMode()
+	case id == "subnodes":
+		// The home-page pill in subscription mode is the front-node selector:
+		// the actual picking happens on the node page, which owns the grid.
+		u.gotoPage(pageNodes)
+	case id == "subdelay":
+		u.testSubscriptionDelays()
+	case id == "subauto":
+		m.dropOpen = ""
+		u.toggleSubAuto()
+	case strings.HasPrefix(id, "subpick:"):
+		m.dropOpen = ""
+		u.pickSubscriptionProxy(strings.TrimPrefix(id, "subpick:"))
+	case id == "subrefreshcur":
+		u.refreshCurrentSub()
+	case id == "submgr:import":
+		u.subMgrImport()
+	case strings.HasPrefix(id, "subswitch:"):
+		// "" is the "全部订阅" row, so an empty suffix is a real target.
+		u.switchSubscription(strings.TrimPrefix(id, "subswitch:"))
+	case strings.HasPrefix(id, "subedit:"):
+		u.editSubscription(strings.TrimPrefix(id, "subedit:"))
+	case strings.HasPrefix(id, "subdel:"):
+		u.deleteSubscription(strings.TrimPrefix(id, "subdel:"))
 	case strings.HasPrefix(id, "vpncountry:"):
 		cc := strings.TrimPrefix(id, "vpncountry:")
 		if strings.EqualFold(m.vpnExpanded, cc) {
@@ -1571,7 +2122,7 @@ func (u *natUI) action(id string) {
 			u.mutateSettings(func(s *clientSettings) { s.PsiphonRegion = cc })
 			// The region shapes only a Psiphon exit: like the exit switch, a
 			// live Psiphon session re-applies it by reconnecting.
-			if m.connected && m.psiphon && !protoChained(m.proto) && !m.working && !m.connecting {
+			if m.connected && m.psiphon && u.exitOK() && !m.working && !m.connecting {
 				u.doSwitch()
 			}
 		}
@@ -1583,8 +2134,12 @@ func (u *natUI) action(id string) {
 			u.invalidate()
 			return
 		}
-		if f != famV4 && !protoV6Capable(m.proto) {
-			u.addLog(trf("%s 不支持 IPv6：请先切换协议", protoDisplayName(m.proto)), true)
+		if f != famV4 && !u.familyV6OK() {
+			if m.psiphon || m.openvpn {
+				u.addLog(tr("叠加出口仅支持 IPv4：请先关闭出口"), true)
+			} else {
+				u.addLog(trf("%s 不支持 IPv6：请先切换协议", protoDisplayName(m.proto)), true)
+			}
 			u.invalidate()
 			return
 		}
@@ -1632,6 +2187,13 @@ func (u *natUI) action(id string) {
 	case id == "core":
 		u.doCore()
 	case id == "rescannow":
+		// In subscription mode the refresh button belongs to the node list on
+		// screen: re-download the subscriptions. Sweeping WARP endpoints there
+		// refreshed a pool the mode never uses.
+		if u.m.set.ConnMode == "subscription" {
+			u.refreshSubscriptions()
+			return
+		}
 		u.reloadEndpoints(true)
 	case id == "logclear":
 		u.m.logs = nil
@@ -1697,14 +2259,15 @@ func (u *natUI) connectAsync() {
 	// protocol's best going half-dead looks like "nothing connects").
 	o.pick = m.pin
 	// Psiphon / OpenVPN are orthogonal exit switches, never protocols, and are
-	// mutually exclusive: V2 wins when both somehow arrive set. Both need a
-	// plain WG/AWG/MASQUE underlay, so they are ignored for a chain.
+	// mutually exclusive: V2 wins when both somehow arrive set. In WARP mode
+	// they need a plain WG/AWG/MASQUE underlay; in subscription mode the
+	// imported node is the underlay, so the leftover proto must not veto them.
 	switch {
-	case m.openvpn && !protoChained(m.proto):
+	case m.openvpn && u.exitOK():
 		o.openvpnMode = true
 		o.openvpnRegion = m.set.OpenVPNRegion
 		o.openvpnNodePin = m.set.OpenVPNNode
-	case m.psiphon && !protoChained(m.proto):
+	case m.psiphon && u.exitOK():
 		o.psiphonMode = true
 	}
 	if m.proto == protoWWarp {
@@ -1720,11 +2283,59 @@ func (u *natUI) connectAsync() {
 	// once the core dies (EOF) or the window does (ctx).
 	pr, pw := io.Pipe()
 	o.coreLog = pw
+	// A busy session makes the core emit thousands of lines a minute. Posting
+	// one u.sync per line blocked the reader on the UI thread and buried the
+	// repaint queue — the "after a while the window stops responding" report.
+	// Lines are queued instead and flushed in batches; a full queue DROPS rather
+	// than blocks, because blocking here would back up into the core's stdout
+	// and stall the tunnel itself.
+	type coreLine struct {
+		lv  int
+		msg string
+	}
+	lines := make(chan coreLine, 1024)
+	dropped := 0
+	go func() {
+		t := time.NewTicker(150 * time.Millisecond)
+		defer t.Stop()
+		batch := make([]coreLine, 0, 64)
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			out := batch
+			batch = make([]coreLine, 0, 64)
+			u.sync(func() {
+				for _, l := range out {
+					u.addLogFull(l.msg, l.lv, true)
+				}
+				u.invalidate()
+			})
+		}
+		for {
+			select {
+			case <-u.ctx.Done():
+				return
+			case l, ok := <-lines:
+				if !ok {
+					flush()
+					return
+				}
+				batch = append(batch, l)
+				if len(batch) >= 64 {
+					flush()
+				}
+			case <-t.C:
+				flush()
+			}
+		}
+	}()
 	go func() {
 		sc := bufio.NewScanner(pr)
 		// Closing the read end unblocks the exec copier once the scanner exits
 		// (window closed), so the pipe can never wedge the child's stdout.
 		defer pr.Close()
+		defer close(lines)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
 			if line == "" {
@@ -1736,7 +2347,17 @@ func (u *natUI) connectAsync() {
 			default:
 			}
 			lv, msg := parseCoreLine(line)
-			u.sync(func() { u.addLogFull(msg, lv, true) })
+			select {
+			case lines <- coreLine{lv: lv, msg: msg}:
+			default:
+				dropped++
+				if dropped == 1 || dropped%2000 == 0 {
+					n := dropped
+					u.sync(func() {
+						u.addLog(trf("核心日志过多，已丢弃 %d 行（连接不受影响）", n), false)
+					})
+				}
+			}
 		}
 	}()
 	go func() {
@@ -1782,10 +2403,14 @@ func (u *natUI) connectAsync() {
 				u.addLog(err.Error(), true)
 			} else {
 				u.addLog("已连接", false)
+				// A new session starts with a clean slate: any "proxy lost" note
+				// from a previous run describes a session that no longer exists.
+				u.m.proxyLost = false
+				clearProxyLost()
+				// No automatic pool refresh after connecting: the user decides
+				// when to refresh via the button in the region picker.
 				if u.m.openvpn {
-					// The connect refreshed and saved the pool; reload it so the
-					// region dropdown offers the countries it just proved live.
-					u.refreshVPNGatePool()
+					u.loadVPNGateCacheOnly()
 				}
 			}
 			u.applyEndpoints(proto)
@@ -1834,6 +2459,10 @@ func (u *natUI) doDisconnect() {
 			u.m.connecting = false
 			u.m.working = false
 			u.m.connected = false
+			// The session this note described is over; leaving it behind would
+			// make the next launch read a stale warning.
+			u.m.proxyLost = false
+			clearProxyLost()
 			if err != nil {
 				u.addLog(err.Error(), true)
 			} else {
@@ -1955,6 +2584,10 @@ func (u *natUI) onDown(x, y int) {
 			u.beginScrollDrag(y)
 			return
 		}
+		if s.id == "log:scrollbar" {
+			u.beginLogDrag(y)
+			return
+		}
 		u.action(s.id)
 	}
 }
@@ -1970,7 +2603,15 @@ func (u *natUI) clickDebug(x, y int) {
 	if ok {
 		id = s.id
 	}
-	u.debugLogf(fmt.Sprintf("down %d,%d -> %s", x, y, id))
+	u.debugLogf(fmt.Sprintf("down %d,%d -> %s (k=%.3f dw=%.1f dh=%.1f spots=%d)", x, y, id, u.k, u.dw, u.dh, len(u.sp)))
+	// Dump the toolbar/manager regions so a harness click that lands on
+	// "<none>" can be matched against the rect the painter actually published.
+	for _, sp := range u.sp {
+		if strings.HasPrefix(sp.id, "drop:") || strings.HasPrefix(sp.id, "sub") ||
+			strings.HasPrefix(sp.id, "rescan") || strings.HasPrefix(sp.id, "nodesearch") {
+			u.debugLogf(fmt.Sprintf("  %s rect=(%d,%d %dx%d)", sp.id, sp.r.X, sp.r.Y, sp.r.Width, sp.r.Height))
+		}
+	}
 }
 
 // debugLogf appends one line to the harness debug log (env-gated).
@@ -1996,20 +2637,43 @@ func (u *natUI) dropSpotOpen(id string) bool {
 	case "vpnregion":
 		return id == "drop:vpnregion" || strings.HasPrefix(id, "pickvpnregion:") ||
 			strings.HasPrefix(id, "vpncountry:") || strings.HasPrefix(id, "pickvpnnode:") ||
-			id == "vpnrefresh"
+			id == "vpnrefresh" || id == "vpnprobe"
 	case "proto":
 		return id == "drop:proto" || strings.HasPrefix(id, "proto:")
+	case "homenode":
+		return id == "drop:homenode" || strings.HasPrefix(id, "subpick:") ||
+			id == "subauto" || id == "subnodes"
 	case "family":
 		return id == "drop:family" || strings.HasPrefix(id, "pickfamily:")
 	case "preset":
 		return id == "drop:preset" || strings.HasPrefix(id, "pickpreset:")
+	case "capture":
+		return id == "drop:capture" || strings.HasPrefix(id, "pickcapture:")
+	case "connmode":
+		return id == "drop:connmode" || strings.HasPrefix(id, "connmode:")
+	case "addmenu":
+		return id == "drop:addmenu" || id == "suburl" || id == "subsingle" ||
+			id == "subclip" || id == "subfile" || id == "subqr" || id == "subrefresh"
+	case "submgr":
+		return id == "drop:submgr" || id == "submgr:import" ||
+			strings.HasPrefix(id, "subswitch:") ||
+			strings.HasPrefix(id, "subedit:") ||
+			strings.HasPrefix(id, "subdel:")
 	}
 	return false
 }
 
 func (u *natUI) onMove(x, y int, b walk.MouseButton) {
-	// Dragging the scrollbar owns the pointer until the button is released:
-	// walk reports the held button on every move, so no MouseUp hook is needed.
+	// Dragging a scrollbar owns the pointer until the button is released: walk
+	// reports the held button on every move, so no MouseUp hook is needed.
+	if u.logDrag {
+		if b == 0 {
+			u.logDrag = false
+		} else {
+			u.dragLogTo(y)
+			return
+		}
+	}
 	if u.scrollDrag {
 		if b == 0 {
 			u.scrollDrag = false
@@ -2056,6 +2720,57 @@ func (u *natUI) onWheel(x, y int, b walk.MouseButton) {
 		u.invalidate()
 		return
 	}
+	// The Psiphon region popup scrolls its own list: the live egress set can
+	// expose far more countries than fit between the field and the frame.
+	if u.m.dropOpen == "region" {
+		max := 1 + len(currentPsiphonRegions()) - regionPopupRows
+		if max < 0 {
+			max = 0
+		}
+		u.m.regionScroll -= delta / 40
+		if u.m.regionScroll < 0 {
+			u.m.regionScroll = 0
+		}
+		if u.m.regionScroll > max {
+			u.m.regionScroll = max
+		}
+		u.invalidate()
+		return
+	}
+	// The home node dropdown scrolls its own latency-sorted list when it is
+	// taller than the rows that fit between the pill and the frame.
+	if u.m.dropOpen == "homenode" {
+		max := len(u.homeNodeRows()) - u.homeNodeVisible()
+		if max < 0 {
+			max = 0
+		}
+		u.m.homeNodeScroll -= delta / 40
+		if u.m.homeNodeScroll < 0 {
+			u.m.homeNodeScroll = 0
+		}
+		if u.m.homeNodeScroll > max {
+			u.m.homeNodeScroll = max
+		}
+		u.invalidate()
+		return
+	}
+	// The subscription manager scrolls its own source list when there are more
+	// sources than the fixed-height popup can show.
+	if u.m.dropOpen == "submgr" {
+		max := len(u.m.set.SubSources) - subMgrMaxRows
+		if max < 0 {
+			max = 0
+		}
+		u.m.subMgrScroll -= delta / 40
+		if u.m.subMgrScroll < 0 {
+			u.m.subMgrScroll = 0
+		}
+		if u.m.subMgrScroll > max {
+			u.m.subMgrScroll = max
+		}
+		u.invalidate()
+		return
+	}
 	if u.m.page == pageLogs && u.m.logTab == "run" {
 		rows := u.m.logVisibleRows
 		if rows < 1 {
@@ -2065,7 +2780,11 @@ func (u *natUI) onWheel(x, y int, b walk.MouseButton) {
 		if max < 0 {
 			max = 0
 		}
-		u.m.logScroll -= delta / 40
+		// logScroll counts UP from the newest line (0 = follow the live bottom),
+		// the opposite of the top-down offsets the other pages use, so the wheel
+		// sign is flipped here: wheel down heads toward the newest, wheel up
+		// toward older history.
+		u.m.logScroll += delta / 40
 		if u.m.logScroll < 0 {
 			u.m.logScroll = 0
 		}
@@ -2081,19 +2800,20 @@ func (u *natUI) onWheel(x, y int, b walk.MouseButton) {
 		u.invalidate()
 		return
 	}
-	if u.m.page != pageNodes || u.m.nodeVisibleRows == 0 || y < u.sy(shellBodyY+52) {
+	if u.m.page != pageNodes || y < u.sy(shellBodyY) {
 		return
 	}
-	max := len(u.visibleNodeRows()) - u.m.nodeVisibleRows
-	if max < 0 {
-		max = 0
+	// Both modes now render one row table; paintModeTable publishes the visible
+	// row count and the largest scroll offset for whichever mode is active.
+	if u.m.subVisibleRows == 0 {
+		return
 	}
 	u.m.scroll -= delta / 40
 	if u.m.scroll < 0 {
 		u.m.scroll = 0
 	}
-	if u.m.scroll > max {
-		u.m.scroll = max
+	if u.m.scroll > u.m.subMaxScroll {
+		u.m.scroll = u.m.subMaxScroll
 	}
 	u.invalidate()
 }
@@ -2107,9 +2827,13 @@ func (u *natUI) onWheel(x, y int, b walk.MouseButton) {
 var paintPanics int
 
 func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
-	// A paint bug used to end the process: the panic unwinds through walk's
-	// window procedure, and a windowsgui binary simply disappears with the log
-	// saying nothing. One frame is not worth losing the session over.
+	// Hit regions are rebuilt every frame. Publishing a half-built map was
+	// fatal: the old code cleared u.sp first, so any panic or early return left
+	// a black window with ZERO clickable spots — "全黑后怎么点都没反应" was
+	// permanent. Build into a scratch slice and publish only a complete frame.
+	prevSpots := u.sp
+	u.sp = make([]spot, 0, len(prevSpots))
+	frameOK := false
 	defer func() {
 		if rec := recover(); rec != nil {
 			paintPanics++
@@ -2117,6 +2841,13 @@ func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
 				u.appendLog(fmt.Sprintf("界面绘制异常（已跳过该帧）: %v", rec), 2, false, false)
 			}
 			err = nil
+		}
+		if !frameOK {
+			u.sp = prevSpots
+			// Ask for one more frame, but never spin forever on a permanent bug.
+			if paintPanics <= 12 {
+				u.sync(func() { u.invalidate() })
+			}
 		}
 	}()
 	b := u.mw.ClientBoundsPixels()
@@ -2130,44 +2861,61 @@ func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
 	if pxH < 10 {
 		pxH = 700 + capH
 	}
-	// One scale for both axes, and the leftover space distributed as equal
-	// margins. Scaling width and height independently (or top-left anchoring a
-	// uniformly scaled grid) is what makes a maximised window look stretched or
-	// lopsided; this keeps every gap, radius and glyph in the ratio it was
-	// designed with.
-	u.k = math.Min(float64(pxW)/1080.0, float64(pxH)/(700.0+capH))
-	if u.k <= 0 {
-		u.k = 1
-	}
-	// The grid is pinned to the left edge (a sidebar that floats away from the
-	// window edge looks broken) and centred vertically, where the leftover shows
-	// up as canvas either way. Horizontally it *grows*: dw is how many design
-	// units fit across the window, so maximising widens the cards instead of
-	// leaving a blank strip on the right.
-	u.ox = 0
-	u.oy = int((float64(pxH)-(700.0+capH)*u.k)/2 + 0.5)
-	u.dw = float64(pxW) / u.k
-	if u.dw < 1080 {
-		u.dw = 1080
-	}
-	// Type follows the window, not the display: k already carries the DPI.
+	// Adaptive engine: k is the display DPI alone, so a logical pixel is a
+	// physical pixel at 100% and twice that at 200%. dw/dh are the logical
+	// client size the breakpoints lay out against; nothing letterboxes.
 	dpi := c.DPI()
 	if dpi <= 0 {
 		dpi = 96
 	}
-	u.scaleFonts(u.k * 96.0 / float64(dpi))
-	u.sp = u.sp[:0]
-
-	if err := c.FillRectanglePixels(u.brush(th.window), walk.Rectangle{X: 0, Y: 0, Width: b.Width, Height: b.Height}); err != nil {
-		return err
+	u.k = float64(dpi) / 96.0
+	u.ox = 0
+	u.oy = 0
+	// The page-transition offset is transient: clear it before the wallpaper and
+	// sidebar paint so only paintShell's page body ever moves.
+	u.ax, u.ay = 0, 0
+	u.winW = float64(pxW) / u.k
+	u.dw = u.winW
+	u.dh = float64(pxH)/u.k - capH
+	// Every page is authored on a fixed 700-tall grid. When the window is
+	// shorter than that, shrink the whole page to fit instead of clipping.
+	// The factor stays in u.k after paint, so hit-testing matches the frame the
+	// user sees. Home shares the same factor: its sidebar, type and content
+	// must stay the same size as the other pages at the same window size.
+	if u.dh < 700 {
+		u.k *= u.dh / 700
+		u.dw = float64(pxW) / u.k
+		u.dh = float64(pxH)/u.k - capH
 	}
-	u.paintWallpaper(c, b.Width, b.Height)
+	// Type follows the window, not the display: k already carries the DPI, so
+	// dividing it out leaves the pure zoom the font ramp must follow.
+	u.scaleFonts(u.k * 96.0 / float64(dpi))
+
+	// One background brush per frame, always disposed. The old code passed
+	// u.brush() straight into FillRectanglePixels: that handle was never freed
+	// (measured leak ≈ 3.3 GDI objects/second), and any failure returned early
+	// BEFORE wallpaper/shell were drawn. On Windows 11 26H2 a transient GDI or
+	// DPI condition therefore produced a permanently black, unclickable window.
+	// Use the sanitised size too: a 0x0 client bounds rectangle can be valid
+	// during a DPI/resize transition and must not abort the whole frame.
+	if bg := u.brush(th.window); bg != nil {
+		if ferr := c.FillRectanglePixels(bg, walk.Rectangle{X: 0, Y: 0, Width: pxW, Height: pxH}); ferr != nil && paintPanics == 0 {
+			u.appendLog("背景绘制失败（已继续绘制界面）: "+ferr.Error(), 2, false, false)
+		}
+		bg.Dispose()
+	}
+	u.paintWallpaper(c, pxW, pxH)
 	u.paintShell(c)
+	frameOK = true
 	return nil
 }
 
 func (u *natUI) measure(c *walk.Canvas, s string, f *walk.Font) int {
-	b, _, _ := c.MeasureTextPixels(s, f, walk.Rectangle{X: 0, Y: 0, Width: 10000, Height: 200}, walk.TextSingleLine|walk.TextNoPrefix)
+	// TextCalcRect (DT_CALCRECT) is required: walk's MeasureTextPixels draws into
+	// a metafile without it, so DrawTextEx leaves the rect at the proposed width
+	// (10000) instead of shrinking it to the text. Without the flag every
+	// measured width came back 10000, throwing centred brand text off-screen.
+	b, _, _ := c.MeasureTextPixels(s, f, walk.Rectangle{X: 0, Y: 0, Width: 10000, Height: 200}, walk.TextSingleLine|walk.TextNoPrefix|walk.TextCalcRect)
 	return b.Width
 }
 
@@ -2255,11 +3003,36 @@ func fetchLocalProbe() (ip, cc, city string, err error) {
 
 // localProbeClients is the transport set for the idle-state geo probe: direct
 // (with env-proxy support) plus the WinINET system proxy when one is enabled.
+// Probe transports are cached per proxy URL. Building a fresh http.Transport on
+// every poll leaked one connection pool every 2 seconds: the old transport's
+// idle connections and its reader goroutines are never collected, which showed
+// up as ~45 handles and ~2.5MB per minute of working set while connected —
+// the "memory keeps climbing" report. A cached client also reuses the TCP+TLS
+// connection, so the probe itself gets cheaper.
+var (
+	probeClientMu sync.Mutex
+	probeClients  = map[string]*http.Client{}
+)
+
+func probeClientFor(proxyURL string) *http.Client {
+	probeClientMu.Lock()
+	defer probeClientMu.Unlock()
+	if c, ok := probeClients[proxyURL]; ok {
+		return c
+	}
+	t := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	if proxyURL != "" {
+		if pu, err := url.Parse(proxyURL); err == nil {
+			t.Proxy = http.ProxyURL(pu)
+		}
+	}
+	c := &http.Client{Timeout: 6 * time.Second, Transport: t}
+	probeClients[proxyURL] = c
+	return c
+}
+
 func localProbeClients() []*http.Client {
-	clients := []*http.Client{{
-		Timeout:   6 * time.Second,
-		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
-	}}
+	clients := []*http.Client{probeClientFor("")}
 	k, err := registry.OpenKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	if err == nil {
@@ -2270,12 +3043,7 @@ func localProbeClients() []*http.Client {
 			if !strings.Contains(srv, "://") {
 				srv = "http://" + srv
 			}
-			if pu, perr := url.Parse(srv); perr == nil {
-				clients = append(clients, &http.Client{
-					Timeout:   6 * time.Second,
-					Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
-				})
-			}
+			clients = append(clients, probeClientFor(srv))
 		}
 	}
 	return clients
@@ -2299,7 +3067,87 @@ func directLatency() int64 {
 
 // localLanIP returns the machine's LAN address (UDP connect does not send a
 // packet, it just resolves the outbound route).
+// virtualAdapterMarkers are name fragments of adapters that exist only inside
+// this machine: Docker/WSL/Hyper-V vEthernet, VMware, VirtualBox, VPN taps. A
+// phone on the same Wi-Fi cannot route to any of them, so picking one makes
+// "LAN sharing" look broken while the port really is listening on 0.0.0.0.
+var virtualAdapterMarkers = []string{
+	"vethernet", "virtual", "vmware", "virtualbox", "hyper-v", "docker",
+	"wsl", "loopback", "tap-", "tun", "tailscale", "zerotier", "wireguard",
+	"clash", "mihomo", "npcap", "vpn", "teredo", "isatap", "6to4",
+}
+
+func isVirtualAdapterName(name string) bool {
+	low := strings.ToLower(name)
+	for _, m := range virtualAdapterMarkers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// lanScore ranks an IPv4 address as "what another device on this network should
+// dial". 192.168/16 is the home-router default and wins; 10/8 is the corporate
+// equivalent; 172.16/12 is deliberately last because Docker and WSL both live
+// there and a stale container network otherwise wins over the real adapter.
+func lanScore(ip net.IP) int {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return -1
+	}
+	switch {
+	case ip4[0] == 192 && ip4[1] == 168:
+		return 100
+	case ip4[0] == 10:
+		return 90
+	case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
+		return 10
+	case ip4[0] == 169 && ip4[1] == 254:
+		return -1 // APIPA: no DHCP lease, useless
+	default:
+		return 50
+	}
+}
+
+// localLanIP returns the address other devices on the same network should use.
+//
+// The UDP-dial trick alone is not enough: with Docker, WSL or Hyper-V installed
+// the kernel may answer with a vEthernet address (172.17.x.x) that no phone can
+// reach. That is exactly how "the port is listening but the phone cannot
+// connect" happens, and it also put a 172.x address on the home page where the
+// user expects their real 192.168.x one.
 func localLanIP() string {
+	best, bestScore := "", -1
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, ifi := range ifaces {
+			if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			if isVirtualAdapterName(ifi.Name) {
+				continue
+			}
+			addrs, aerr := ifi.Addrs()
+			if aerr != nil {
+				continue
+			}
+			for _, a := range addrs {
+				ipn, ok := a.(*net.IPNet)
+				if !ok || !ipn.IP.IsGlobalUnicast() || ipn.IP.IsLinkLocalUnicast() {
+					continue
+				}
+				if s := lanScore(ipn.IP); s > bestScore {
+					best, bestScore = ipn.IP.To4().String(), s
+				}
+			}
+		}
+	}
+	if best != "" {
+		return best
+	}
+	// No physical adapter answered: fall back to whatever route the kernel
+	// would take, so a machine with only a virtual adapter still shows
+	// something rather than an empty tile.
 	conn, err := net.DialTimeout("udp", "8.8.8.8:80", time.Second)
 	if err != nil {
 		return ""
@@ -2333,30 +3181,6 @@ var (
 	regionOnce sync.Once
 	regionCC   string
 )
-
-func osRegionCC() string {
-	regionOnce.Do(func() {
-		k32 := windows.NewLazySystemDLL("kernel32.dll")
-		proc := k32.NewProc("GetUserDefaultGeoName")
-		if err := proc.Find(); err != nil {
-			return
-		}
-		buf := make([]uint16, 32)
-		n, _, _ := proc.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-		if int32(n) <= 0 {
-			return
-		}
-		name := windows.UTF16ToString(buf)
-		// "CN", or occasionally "CN|China": only the code is of interest.
-		if i := strings.IndexAny(name, "|,"); i > 0 {
-			name = name[:i]
-		}
-		if len(name) == 2 {
-			regionCC = strings.ToUpper(name)
-		}
-	})
-	return regionCC
-}
 
 // displayGeo is the country/city pair under the IP: exit geo when connected,
 // the machine's public-IP geo while idle. An OpenVPN session prefers the relay
@@ -2628,16 +3452,6 @@ var coloCountry = map[string]string{
 	"MSQ": "BY",
 }
 
-// coloFlag resolves a colo or country label to an ISO alpha-2 code for the
-// flag painter. Two-letter values (the trace probe's country) pass through.
-func coloFlag(v string) string {
-	v = strings.ToUpper(strings.TrimSpace(v))
-	if len(v) == 2 {
-		return v
-	}
-	return coloCountry[v]
-}
-
 func orDash(s string) string {
 	if s == "" {
 		return "—"
@@ -2657,15 +3471,4 @@ func sizeText(b int64) string {
 		return strconv.FormatFloat(float64(b)/(1<<20), 'f', 1, 64) + " MB"
 	}
 	return strconv.FormatInt(b/1024, 10) + " KB"
-}
-
-func avgSamples(v []int64) float64 {
-	if len(v) == 0 {
-		return 0
-	}
-	var s int64
-	for _, x := range v {
-		s += x
-	}
-	return float64(s) / float64(len(v))
 }

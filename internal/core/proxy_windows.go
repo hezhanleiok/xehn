@@ -167,6 +167,19 @@ func SystemProxyEnabledAt(port int) bool {
 	return snap.Enable == 1 && strings.EqualFold(snap.Server, fmt.Sprintf("127.0.0.1:%d", port))
 }
 
+// SystemProxyPointsElsewhere distinguishes "another program took the host proxy"
+// from "the user turned the proxy off". The first invalidates the session and
+// deserves a teardown; the second may well be deliberate (the user switched to
+// TUN, or is debugging), and killing their tunnel over it would be rude.
+func SystemProxyPointsElsewhere(port int) bool {
+	snap := readProxySnapshot()
+	if snap.Enable != 1 {
+		return false
+	}
+	server := strings.TrimSpace(snap.Server)
+	return server != "" && !strings.EqualFold(server, fmt.Sprintf("127.0.0.1:%d", port))
+}
+
 // ClearSystemProxy disables the machine proxy outright: the watchdog's last
 // resort when the client died between pointing the proxy at the tunnel and
 // persisting the snapshot that would restore the user's own settings. With
@@ -634,6 +647,165 @@ func SetSystemProxyElevated(port int) error {
 	return verifyProxyReadback(proxyValues{Server: fmt.Sprintf("127.0.0.1:%d", port), Enable: 1})
 }
 
+// hiddenCmd builds a console-less command. netsh is a console program: started
+// from a windowsgui process without CREATE_NO_WINDOW it allocates its own
+// console, which is the black box that flashes on every LAN-share toggle.
+func hiddenCmd(name string, args ...string) *exec.Cmd {
+	c := exec.Command(name, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
+	return c
+}
+
+// lanRuleName is the firewall rule this client owns, one pair per port so a
+// changed mixed port does not leave a stale opening behind. The v2 marker lets a
+// rule built with the old private,domain-only profile be replaced rather than
+// mistaken for the current one.
+func lanRuleName(port int, proto string) string {
+	return fmt.Sprintf("XEHN-LAN-v2-%d-%s", port, proto)
+}
+
+// coreRuleName is the program-level rule pair for the bundled core. Windows
+// asks "allow this program?" per executable, and that prompt is not satisfied by
+// a port rule: the prompt is what appears on the first connect after sharing is
+// turned on. Allowing the binary by path ends it for good, and unlike opening a
+// port it grants nothing to any other program.
+const (
+	coreRuleIn  = "XEHN-CORE-IN"
+	coreRuleOut = "XEHN-CORE-OUT"
+)
+
+// currentProfileIsPublic reports whether Windows classifies the active network
+// as 公用. Plenty of home networks are, and a private,domain-only rule silently
+// does nothing there.
+func currentProfileIsPublic() bool {
+	out, err := hiddenCmd("netsh", "advfirewall", "show", "currentprofile").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	s := string(out)
+	return strings.Contains(s, "公用") || strings.Contains(strings.ToLower(s), "public")
+}
+
+// addLanFirewallRule opens the mixed port for inbound LAN clients and allows the
+// core binary itself. Windows prompts "allow this app to communicate on these
+// networks" for any non-loopback listener; a user who dismisses it — or picks
+// 取消 — leaves allow-lan looking enabled while nothing on the LAN can reach the
+// port. An explicit rule also stops the prompt from appearing at all, which is
+// the "mihomo asks for network permission on every connect" report.
+//
+// All three profiles on purpose: Windows classifies plenty of home networks as
+// 公用 (public), and a private,domain-only rule silently does nothing there —
+// the second half of "sharing is on but the phone cannot connect". The user has
+// already turned sharing on, so opening the port is what they asked for.
+func addLanFirewallRule(port int, corePath string) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid port %d", port)
+	}
+	for _, proto := range []string{"TCP", "UDP"} {
+		name := lanRuleName(port, proto)
+		// Delete first: netsh appends a duplicate rule otherwise, and repeats
+		// of this call must stay idempotent. The v1 name from an earlier build
+		// is cleared too, so the port ends up with exactly one rule pair.
+		_ = hiddenCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name="+name).Run()
+		_ = hiddenCmd("netsh", "advfirewall", "firewall", "delete", "rule",
+			"name="+fmt.Sprintf("XEHN-LAN-%d-%s", port, proto)).Run()
+		out, err := hiddenCmd("netsh", "advfirewall", "firewall", "add", "rule",
+			"name="+name,
+			"dir=in",
+			"action=allow",
+			"protocol="+proto,
+			"localport="+strconv.Itoa(port),
+			"profile=private,domain,public",
+			"enable=yes",
+		).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("netsh add %s: %w (%s)", proto, err, strings.TrimSpace(string(out)))
+		}
+	}
+	// Program-level pair, for the prompt the port rule cannot suppress.
+	if corePath != "" {
+		for _, dir := range []string{"in", "out"} {
+			name := coreRuleIn
+			if dir == "out" {
+				name = coreRuleOut
+			}
+			_ = hiddenCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name="+name).Run()
+			out, err := hiddenCmd("netsh", "advfirewall", "firewall", "add", "rule",
+				"name="+name,
+				"dir="+dir,
+				"action=allow",
+				// Quoted: netsh splits on spaces, and an install under
+				// "C:\Program Files\..." would otherwise be parsed as two
+				// arguments and the rule silently fails to match any binary.
+				"program=\""+corePath+"\"",
+				"profile=any",
+				"enable=yes",
+			).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("netsh add core %s: %w (%s)", dir, err, strings.TrimSpace(string(out)))
+			}
+		}
+	}
+	return nil
+}
+
+// ruleExists is the unprivileged probe: netsh show runs as a normal user, so
+// the connect path can skip the elevation prompt when the rule is already there.
+func ruleExists(name string) bool {
+	out, err := hiddenCmd("netsh", "advfirewall", "firewall", "show", "rule", "name="+name).CombinedOutput()
+	return err == nil && strings.Contains(string(out), name)
+}
+
+// coreRuleExists reports the program-level pair that suppresses the
+// "allow this app?" prompt.
+func coreRuleExists() bool { return ruleExists(coreRuleIn) && ruleExists(coreRuleOut) }
+
+// lanRuleExistsV2 reports the current (all-profiles) port rule.
+func lanRuleExistsV2(port int) bool { return ruleExists(lanRuleName(port, "TCP")) }
+
+// lanPortRuleExists also accepts the v1 name a previous build wrote, so an
+// upgrade on a private network does not ask for elevation again.
+func lanPortRuleExists(port int) bool {
+	return lanRuleExistsV2(port) || ruleExists(fmt.Sprintf("XEHN-LAN-%d-TCP", port))
+}
+
+// EnsureLanFirewall makes the mixed port reachable from the LAN and stops the
+// core's per-program firewall prompt, adding what is missing through the
+// elevated helper. Safe to call on every connect: the common case is a couple of
+// unprivileged netsh queries.
+//
+// A v1-only rule is accepted when the active network is private/domain — it does
+// the job there, and re-prompting for elevation on every upgrade is exactly what
+// users complain about. On a public-classified network it is useless, so the
+// rule is rebuilt.
+func EnsureLanFirewall(port int, corePath string) error {
+	if coreRuleExists() && lanRuleExistsV2(port) {
+		return nil
+	}
+	if coreRuleExists() && lanPortRuleExists(port) && !currentProfileIsPublic() {
+		return nil
+	}
+	return helperCommand(map[string]any{"cmd": "firewall", "port": port, "core": corePath})
+}
+
+// LanFirewallReady reports whether the inbound rule is already in place, for the
+// settings page to tell the user what the switch will do.
+func LanFirewallReady(port int) bool {
+	return lanPortRuleExists(port)
+}
+
+// RemoveLanFirewall drops the rules this client added, so uninstalling or moving
+// to a different port does not leave the port open.
+func RemoveLanFirewall(port int) {
+	for _, proto := range []string{"TCP", "UDP"} {
+		_ = hiddenCmd("netsh", "advfirewall", "firewall", "delete", "rule",
+			"name="+lanRuleName(port, proto)).Run()
+	}
+}
+
 // RestoreSystemProxyElevated restores a snapshot through the elevated daemon.
 func RestoreSystemProxyElevated(snap *ProxySnapshot) error {
 	if snap == nil {
@@ -697,6 +869,20 @@ func RunProxyHelper(args []string) int {
 			return 1
 		}
 		return 0
+	case "firewall":
+		port, err := strconv.Atoi(args[1])
+		if err != nil || port <= 0 || port > 65535 {
+			return 2
+		}
+		corePath := ""
+		if len(args) > 2 {
+			corePath = args[2]
+		}
+		if err := addLanFirewallRule(port, corePath); err != nil {
+			fmt.Fprintln(os.Stderr, "proxy-helper firewall:", err)
+			return 1
+		}
+		return 0
 	}
 	return 2
 }
@@ -733,6 +919,7 @@ func handleHelperConn(conn net.Conn, token string) {
 		Token string         `json:"token"`
 		Cmd   string         `json:"cmd"`
 		Port  int            `json:"port"`
+		Core  string         `json:"core"`
 		Snap  *ProxySnapshot `json:"snap"`
 	}
 	if json.NewDecoder(conn).Decode(&req) != nil || req.Token != token {
@@ -745,6 +932,8 @@ func handleHelperConn(conn net.Conn, token string) {
 		_, err = SetSystemProxy(req.Port)
 	case "restore":
 		err = UnsetSystemProxy(req.Snap)
+	case "firewall":
+		err = addLanFirewallRule(req.Port, req.Core)
 	default:
 		err = fmt.Errorf("unknown cmd %q", req.Cmd)
 	}

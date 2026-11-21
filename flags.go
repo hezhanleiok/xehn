@@ -21,6 +21,10 @@ type options struct {
 	tunPingCount   int
 	threshold      int
 	mtu            int
+	// speedGate enables the connect-time downlink floor for a plain
+	// WARP/MASQUE session; a health repair must never inherit it.
+	speedGate      bool
+	acceptSlowWarp bool
 	port           int
 	proto          string
 	listen         string
@@ -69,13 +73,27 @@ type options struct {
 	// Client-core settings (connect / disconnect / status).
 	tunMode   bool
 	allowLan  bool
+	lanAuth   string // "user:pass" for the LAN listener, empty = no auth
 	mixedPort int
 	apiPort   int
 	corePath  string
-	scanNow   bool
-	topN      int
-	pick      string
-	noProxy   bool
+	// Performance tuning (S1-1 / S1-4 / S1-5). endpointRank orders the working
+	// endpoints (ping default, speed opt-in); ipStack/congestion override the
+	// MASQUE transport (empty = shipped gvisor/bbr); tuningsOK is set by the
+	// connect's capability gate and decides whether the additive globals render.
+	endpointRank string
+	ipStack      string
+	congestion   string
+	tuningsOK    bool
+	// Mode B (Clash subscription): imported proxies replace the WARP base.
+	// Empty connMode means mode A and must not change any existing behaviour.
+	connMode      string
+	customProxies []ProxySpec
+	activeProxy   string
+	scanNow       bool
+	topN          int
+	pick          string
+	noProxy       bool
 	// family is the tunnel address family (v4/v6/both). Empty means v4 for the
 	// CLI; ipv6 stays the endpoint-pool selector -6 has always meant.
 	family string
@@ -469,6 +487,11 @@ func setupConnectFlags(fs *flag.FlagSet, o *options) {
 	fs.IntVar(&o.topN, "top", 0, "")
 	fs.StringVar(&o.pick, "pick", "", "")
 	fs.BoolVar(&o.noProxy, "no-proxy", false, "")
+	// Performance tuning (S1-1 / S1-5). Empty keeps the shipped defaults; the
+	// WARP_ENDPOINT_RANK / WARP_IP_STACK / WARP_CC env vars override these.
+	fs.StringVar(&o.endpointRank, "endpoint-rank", "", "ping|speed (default ping)")
+	fs.StringVar(&o.ipStack, "ip-stack", "", "gvisor|system|mixed (default gvisor)")
+	fs.StringVar(&o.congestion, "cc", "", "bbr|bbr3|cubic|reno (default bbr)")
 	// V1 Psiphon exit: --psiphon enables it; --psiphon-exe overrides the binary
 	// location (else PSIPHON_EXE env or <coreDir>/psiphon.exe).
 	fs.BoolVar(&o.psiphonMode, "psiphon", false, "")
@@ -499,6 +522,7 @@ func applyCommonFlags(fs *flag.FlagSet, o *options) {
 		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", fs.Arg(0))
 		os.Exit(2)
 	}
+	overrideTuningFromEnv(o)
 	if awgI1 == i1Keyword {
 		awgI1 = ""
 	}

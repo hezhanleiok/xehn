@@ -1,14 +1,17 @@
 // Command mklogo regenerates the GUI logo assets from a high-resolution source
-// PNG (square). It produces two artifacts:
+// PNG. The source is the borderless brand mark (any aspect); it is not required
+// to be square. It produces two artifacts:
 //
-//   - a downscaled PNG for go:embed (default assets/logo.png): the in-app brand
-//     mark and the runtime window/taskbar icon both render from it;
+//   - a downscaled PNG for go:embed (default assets/logo.png) that preserves the
+//     mark's aspect (longest edge = embed): the in-app brand mark renders from it
+//     directly, so it must stay borderless and transparent;
 //   - a multi-size Windows .ico (16/24/32/48/64/256, PNG-compressed frames) that
-//     rsrc embeds into the exe so Explorer shows it as the program icon.
+//     rsrc embeds into the exe so Explorer shows it as the program icon. Each
+//     frame pads the mark into a transparent square so the icon is not stretched.
 //
 // Usage (from the xehn directory):
 //
-//	go run ./tools/mklogo -src ../../logo.png -png assets/logo.png -ico logo.ico
+//	go run ./tools/mklogo -src ../../ui-mockups/logo-mark.png -png assets/logo.png -ico logo.ico
 package main
 
 import (
@@ -24,30 +27,37 @@ import (
 )
 
 func main() {
-	src := flag.String("src", "../../logo.png", "source PNG (must be square, high-res)")
+	src := flag.String("src", "../../ui-mockups/logo-mark.png", "source PNG (borderless brand mark, any aspect, high-res)")
 	outPNG := flag.String("png", "assets/logo.png", "output downscaled PNG for go:embed")
 	outICO := flag.String("ico", "logo.ico", "output multi-size .ico for rsrc")
-	embed := flag.Int("embed", 512, "edge length of the embedded PNG")
+	embed := flag.Int("embed", 512, "longest edge of the embedded PNG")
 	flag.Parse()
 
 	img, err := loadPNG(*src)
 	if err != nil {
 		fatal(err)
 	}
-	if b := img.Bounds(); b.Dx() != b.Dy() {
-		fatal(fmt.Errorf("source %s is not square (%dx%d)", *src, b.Dx(), b.Dy()))
+	b := img.Bounds()
+	sw, sh := b.Dx(), b.Dy()
+	scale := float64(*embed) / float64(max(sw, sh))
+	ow, oh := int(float64(sw)*scale+0.5), int(float64(sh)*scale+0.5)
+	if ow < 1 {
+		ow = 1
+	}
+	if oh < 1 {
+		oh = 1
 	}
 
-	if err := writePNG(*outPNG, resize(img, *embed, *embed)); err != nil {
+	if err := writePNG(*outPNG, resize(img, ow, oh)); err != nil {
 		fatal(err)
 	}
-	fmt.Printf("wrote %s (%dx%d)\n", *outPNG, *embed, *embed)
+	fmt.Printf("wrote %s (%dx%d)\n", *outPNG, ow, oh)
 
 	sizes := []int{16, 24, 32, 48, 64, 256}
 	frames := make([]frame, 0, len(sizes))
 	for _, s := range sizes {
 		var buf bytes.Buffer
-		if err := png.Encode(&buf, resize(img, s, s)); err != nil {
+		if err := png.Encode(&buf, fitSquare(img, s)); err != nil {
 			fatal(err)
 		}
 		frames = append(frames, frame{size: s, png: buf.Bytes()})
@@ -162,4 +172,32 @@ func resize(src image.Image, w, h int) *image.NRGBA {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "mklogo:", err)
 	os.Exit(1)
+}
+
+// fitSquare fits the mark inside a size×size transparent square, preserving its
+// aspect, for an ICO frame. Windows icons are square; padding (rather than
+// stretching) keeps the wider-than-tall XH mark undistorted at every size.
+func fitSquare(src image.Image, size int) *image.NRGBA {
+	dst := image.NewNRGBA(image.Rect(0, 0, size, size))
+	sb := src.Bounds()
+	w, h := size, size
+	if sb.Dx()*h > sb.Dy()*w {
+		h = size * sb.Dy() / sb.Dx()
+	} else {
+		w = size * sb.Dx() / sb.Dy()
+	}
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	scaled := resize(src, w, h)
+	ox, oy := (size-w)/2, (size-h)/2
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.SetNRGBA(ox+x, oy+y, scaled.NRGBAAt(x, y))
+		}
+	}
+	return dst
 }

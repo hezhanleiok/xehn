@@ -8,6 +8,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -324,7 +325,9 @@ func waitPortFree(host string, port int, timeout time.Duration) error {
 // (ms) of the named proxy or proxy-group, through the given test URL. The GUI
 // poller feeds this into its latency chart.
 func ProxyDelay(apiPort int, name, testURL string) (int64, error) {
-	base := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/proxies/" + name + "/delay"
+	// Proxy names come from user subscriptions and can contain spaces, '#' or
+	// non-ASCII characters; the API path must be escaped or mihomo answers 404.
+	base := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/proxies/" + url.PathEscape(name) + "/delay"
 	client := httpClient(6 * time.Second)
 	u := base + "?url=" + url.QueryEscape(testURL) + "&timeout=5000"
 	resp, err := client.Get(u)
@@ -342,6 +345,69 @@ func ProxyDelay(apiPort int, name, testURL string) (int64, error) {
 		return 0, err
 	}
 	return body.Delay, nil
+}
+
+// ProxyGroupDelay asks the core to test every proxy of a group in one call.
+// This is the same endpoint Clash clients (Clash Party / mihomo-party, Clash
+// Verge) use for their 延迟测试: the core schedules the probes itself with its
+// own concurrency and its unified-delay accounting, so the numbers match what
+// those clients show for the same subscription. Hammering /proxies/{name}/delay
+// from the outside instead produced far more timeouts and inflated values.
+//
+// The returned map only contains proxies that answered; a proxy missing from it
+// timed out or failed.
+func ProxyGroupDelay(apiPort int, group, testURL string, timeoutMS int) (map[string]int64, error) {
+	if timeoutMS <= 0 {
+		timeoutMS = 5000
+	}
+	base := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/group/" + url.PathEscape(group) + "/delay"
+	u := base + "?url=" + url.QueryEscape(testURL) + "&timeout=" + strconv.Itoa(timeoutMS)
+	// The whole group runs inside the core; give it room over the per-proxy
+	// timeout, since a slow group of 100+ nodes finishes well after 5s.
+	client := httpClient(time.Duration(timeoutMS)*time.Millisecond + 20*time.Second)
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("core: group delay %d", resp.StatusCode)
+	}
+	var body map[string]int64
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(body))
+	for name, ms := range body {
+		if ms > 0 {
+			out[name] = ms
+		}
+	}
+	return out, nil
+}
+
+// SelectProxy points a selector group at one proxy, so a single mixed-port
+// download can be attributed to exactly that node.
+func SelectProxy(apiPort int, group, name string) error {
+	u := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/proxies/" + url.PathEscape(group)
+	payload, err := json.Marshal(map[string]string{"name": name})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPut, u, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(5 * time.Second).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("core: select %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // Traffic samples the core's live throughput counters once. The /traffic
@@ -366,6 +432,52 @@ func Traffic(apiPort int) (up, down int64, err error) {
 		return 0, 0, err
 	}
 	return body.Up, body.Down, nil
+}
+
+// Connection is one live session as the core reports it. Upload/Download are
+// cumulative bytes for that session; Metadata carries the process and host the
+// traffic-share view groups by.
+type Connection struct {
+	Upload      int64    `json:"upload"`
+	Download    int64    `json:"download"`
+	Chains      []string `json:"chains"`
+	Rule        string   `json:"rule"`
+	RulePayload string   `json:"rulePayload"`
+	Metadata    struct {
+		Network       string `json:"network"`
+		Type          string `json:"type"`
+		Host          string `json:"host"`
+		Process       string `json:"process"`
+		ProcessPath   string `json:"processPath"`
+		DestinationIP string `json:"destinationIP"`
+	} `json:"metadata"`
+}
+
+// ConnectionsSnapshot is the /connections payload: the cumulative byte totals
+// for the whole run plus every live session. The totals are what the home
+// page's "本次会话总流量" reads; the per-session bytes feed the traffic share.
+type ConnectionsSnapshot struct {
+	UploadTotal   int64        `json:"uploadTotal"`
+	DownloadTotal int64        `json:"downloadTotal"`
+	Connections   []Connection `json:"connections"`
+}
+
+// Connections reads the core's live connection table once.
+func Connections(apiPort int) (*ConnectionsSnapshot, error) {
+	u := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/connections"
+	resp, err := httpClient(3 * time.Second).Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("core: connections %d", resp.StatusCode)
+	}
+	var snap ConnectionsSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+		return nil, err
+	}
+	return &snap, nil
 }
 
 func pingController(base string) bool {

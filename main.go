@@ -32,7 +32,15 @@ func setupScan(opts options) (protoRun, []netip.Addr, error) {
 		return run, nil, err
 	}
 
-	pools = poolsFor(run, opts.ipv6)
+	// The endpoint family and the tunnel's family are two different questions.
+	// -6 / ip_family says what the tunnel carries (WARP's own v6 address, v6-only
+	// inside); it says nothing about how the encrypted UDP gets to Cloudflare.
+	// WARP's endpoints are IPv4 anycast and reachable everywhere, while its
+	// 2606:4700:d0::/48 v6 pool is blocked on many networks — scanning v6 because
+	// the user picked "IPv6 only" is exactly what made that mode look broken.
+	// So: scan IPv4 unless the host has no IPv4 route at all.
+	scanV6 := !haveAddrFamily(false) && haveAddrFamily(true)
+	pools = poolsFor(run, scanV6)
 	if len(opts.targets) > 0 {
 		pools = opts.targets
 	}
@@ -42,16 +50,21 @@ func setupScan(opts options) (protoRun, []netip.Addr, error) {
 		if !deviceBindSupported {
 			return run, nil, fmt.Errorf("-interface requires Linux (SO_BINDTODEVICE)")
 		}
-		ip, err := interfaceAddr(opts.iface, opts.ipv6)
+		ip, err := interfaceAddr(opts.iface, scanV6)
 		if err != nil {
 			return run, nil, err
 		}
 		scanInterface = opts.iface
 		scanSourceIP = ip
-	} else if opts.through == "" && !haveAddrFamily(opts.ipv6) {
+	} else if opts.through == "" && !haveAddrFamily(scanV6) {
 		// With -through the endpoints are dialled from inside the outer tunnel,
 		// which carries both families whatever the host has.
-		return run, nil, fmt.Errorf("no routable %s address on this host - nothing to scan", famName(opts.ipv6))
+		return run, nil, fmt.Errorf("no routable %s address on this host - nothing to scan", famName(scanV6))
+	} else if opts.through == "" && scanV6 && !v6EgressReachable(1500*time.Millisecond) {
+		// An address exists but the IPv6 internet does not answer. Failing here
+		// (1.5s) is the difference between a clear reason and a port sweep that
+		// runs for minutes and then reports "no reachable WARP port".
+		return run, nil, fmt.Errorf("本机没有可用的 IPv6 出网（IPv6 探测超时）：当前网络无法直连 Cloudflare 的 IPv6 端点。请改用 IPv4 或双栈")
 	}
 
 	sample := opts.perSubnet
@@ -102,6 +115,10 @@ func runRegisterCmd(ctx context.Context, opts options) error {
 	if err := saveAccount(opts.accountPath, a); err != nil {
 		return fmt.Errorf("could not save account to %s: %v", opts.accountPath, err)
 	}
+	// The connect pipeline renders from the package globals; without applying
+	// here the very first connect after a fresh registration would validate
+	// against an empty key and fail until a second attempt reloads the file.
+	applyAccount(a)
 	what := "Registered fresh WARP account"
 	if a.ID == existing.ID {
 		what = "Rotated the keys of the existing WARP account"
@@ -206,9 +223,9 @@ func runScanCmd(ctx context.Context, opts options) error {
 	if opts.through == "" {
 		if ces := projectCacheEndpoints(ph); len(ces) > 0 {
 			if store, err := cache.Open(cache.Options{TTL: scanTTL}); err == nil {
-				cs := cachedScan{Proto: opts.proto, IPv6: opts.ipv6, At: time.Now(), Results: ces}
+				cs := cachedScan{Proto: opts.proto, IPv6: scanFamilyV6(), At: time.Now(), Results: ces}
 				if raw, err := json.Marshal(cs); err == nil {
-					_ = store.Put(scanCacheKey(opts.proto, opts.ipv6), raw)
+					_ = store.Put(scanCacheKey(opts.proto, scanFamilyV6()), raw)
 					fmt.Fprintln(os.Stderr, errPal.dim(fmt.Sprintf("cached %d working endpoint(s) for later connects", len(ces))))
 				}
 			}
@@ -540,6 +557,9 @@ func runScan(ctx context.Context, opts options, run protoRun, ips []netip.Addr, 
 		}
 		if len(open) == 0 {
 			emit(stepMsg{fail: true, summary: "no WARP port is reachable on this network"})
+			if len(ips) > 0 && ips[0].Is6() {
+				return phaseResult{}, fmt.Errorf("IPv6 下没有任何 WARP 端口可达：当前网络无法直连 Cloudflare 的 IPv6 端点（2606:4700:d0::/48）。这是网络限制，不是客户端故障")
+			}
 			return phaseResult{}, fmt.Errorf("no reachable WARP port")
 		}
 		warpPorts = open

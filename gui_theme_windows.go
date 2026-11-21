@@ -23,75 +23,102 @@ import (
 type uiPalette struct {
 	// Surfaces, from the window down to the smallest control.
 	window, sidebar, card, cardHover, line, input walk.Color
+	// inset is the recessed surface (stat tiles, sidebar, badge wells); overlay
+	// is the raised popup surface; line2 the subtler inner border.
+	inset, overlay, line2 walk.Color
 	// Text: primary, secondary, and the faintest (hints, disabled).
 	text, dim, faint walk.Color
 	// Accent and status.
 	accent, accentText, accentSoft, accentLine walk.Color
 	ok, okSoft, warn, warnSoft, bad, badSoft   walk.Color
+	// The v4 data-viz accents: cyan secondary, bright-green download, blue
+	// upload, and the pink/violet used by the traffic-share categories.
+	accent2, ok2, up, mag, vio walk.Color
 	// Controls. Logs deliberately share the same card language as the rest of
 	// the client rather than looking like a separate terminal window.
 	chip, chipText, toggleOff walk.Color
-	// The connect button's fill, top to bottom.
+	// The connect disc's radial fill, highlight to shadow.
 	connectFrom, connectTo walk.Color
+	// The v5 hexagon key's idle/connecting gradient, top to bottom.
+	hexFrom, hexTo walk.Color
 }
 
-// The light palette is sampled from the reference: nothing on this page is
-// pure white. The page is a blue-grey wash, the panels are a *pale blue*
-// translucent glass (not white), and the type is a slate blue that stays
-// readable on it. "Card = #FFFFFF" is exactly what made the old build look
-// bleached next to the mock.
+// The palettes are the home-v4 design tokens. Dark is the primary look: a deep
+// blue-black canvas, layered surfaces, and a small set of full-chroma data
+// accents (green download, blue upload, cyan secondary). Light keeps the same
+// hues but darkens the semantic text colours so values stay readable on white.
 var paletteLight = uiPalette{
-	window:      rx(224, 236, 250), // #E0ECFA: the wash the banks sit on
-	sidebar:     rx(245, 250, 255), // veil over the wash
-	card:        rx(243, 248, 254), // #F3F8FE: same material as the disc and the pill
-	cardHover:   rx(250, 253, 255),
-	line:        rx(220, 231, 245),
-	input:       rx(233, 241, 252),
-	text:        rx(93, 114, 146),  // #5D7292 slate blue: values, titles
-	dim:         rx(147, 163, 190), // #93A3BE labels
-	faint:       rx(183, 196, 216), // #B7C4D8 hints
-	accent:      rx(110, 155, 214), // #6E9BD6 periwinkle icons
-	accentText:  rx(255, 255, 255),
-	accentSoft:  rx(219, 232, 249), // badge / chip fill
-	accentLine:  rx(200, 217, 240),
-	ok:          rx(95, 185, 143), // mint: download
-	okSoft:      rx(216, 240, 229),
-	warn:        rx(232, 170, 82),
-	warnSoft:    rx(252, 241, 224),
-	bad:         rx(224, 108, 108),
-	badSoft:     rx(250, 232, 232),
-	chip:        rx(232, 241, 252),
-	chipText:    rx(132, 150, 180),
-	toggleOff:   rx(205, 219, 236),
-	connectFrom: rx(255, 255, 255), // the disc: frosted white, cooling downward
-	connectTo:   rx(228, 240, 253),
+	window:     rx(235, 242, 252), // #EBF2FC pale periwinkle canvas
+	sidebar:    rx(246, 250, 254), // #F6FAFE rail
+	card:       rx(255, 255, 255), // surface
+	cardHover:  rx(246, 250, 254),
+	line:       rx(226, 234, 246), // #E2EAF6 border
+	line2:      rx(233, 240, 249), // #E9F0F9 inner border
+	input:      rx(246, 250, 254),
+	inset:      rx(246, 250, 254), // recessed tiles
+	overlay:    rx(255, 255, 255),
+	text:       rx(30, 41, 59),    // #1E293B slate
+	dim:        rx(100, 116, 139), // #64748B muted
+	faint:      rx(148, 163, 184), // #94A3B8
+	accent:     rx(37, 99, 235),   // #2563EB reference blue
+	accentText: rx(255, 255, 255),
+	accentSoft: rx(232, 240, 254),
+	accentLine: rx(191, 219, 254),
+	accent2:    rx(37, 99, 235), // active nav / icons share the reference blue
+	ok:         rx(22, 163, 74),
+	ok2:        rx(34, 197, 94), // #22C55E download line
+	okSoft:     rx(230, 247, 237),
+	warn:       rx(217, 119, 6),
+	warnSoft:   rx(253, 245, 224),
+	bad:        rx(220, 38, 38),
+	badSoft:    rx(252, 235, 235),
+	up:         rx(59, 130, 246),
+	mag:        rx(219, 39, 119),
+	vio:        rx(124, 58, 237),
+	chip:       rx(246, 250, 254),
+	chipText:   rx(100, 116, 139),
+	toggleOff:  rx(214, 222, 233),
+	connectFrom: rx(74, 222, 128), // ring highlight
+	connectTo:   rx(22, 163, 74),  // ring shadow
+	hexFrom:     rx(77, 163, 255), // #4DA3FF hexagon top
+	hexTo:       rx(29, 111, 224), // #1D6FE0 hexagon foot
 }
 
 var paletteDark = uiPalette{
-	window:     rx(20, 24, 31),
-	sidebar:    rx(25, 30, 38),
-	card:       rx(32, 38, 48),
-	cardHover:  rx(40, 47, 58),
-	line:       rx(45, 53, 65),
-	input:      rx(40, 47, 58),
-	text:       rx(196, 209, 227),
-	dim:        rx(146, 161, 183),
-	faint:      rx(105, 121, 143),
-	accent:     rx(122, 168, 232),
-	accentText: rx(18, 23, 30),
-	accentSoft: rx(30, 43, 60),
-	accentLine: rx(42, 58, 78),
-	ok:         rx(95, 185, 143),
-	okSoft:     rx(26, 44, 36),
-	warn:       rx(232, 170, 82),
-	warnSoft:   rx(52, 42, 24),
-	bad:        rx(224, 108, 108),
-	badSoft:    rx(52, 32, 34),
-	chip:       rx(37, 43, 53),
-	chipText:   rx(146, 161, 183),
-	toggleOff:  rx(56, 65, 78),
-	connectFrom: rx(36, 42, 52),
-	connectTo:   rx(26, 31, 39),
+	window:     rx(11, 14, 20),   // #0B0E14 canvas
+	sidebar:    rx(16, 21, 31),   // #10151F rail
+	card:       rx(20, 26, 36),   // #141A24 surface
+	cardHover:  rx(26, 34, 48),   // #1A2230 overlay
+	line:       rx(35, 44, 58),   // #232C3A border
+	line2:      rx(30, 39, 51),   // #1E2733 inner border
+	input:      rx(16, 21, 31),
+	inset:      rx(16, 21, 31),
+	overlay:    rx(26, 34, 48),
+	text:       rx(230, 237, 245), // #E6EDF5
+	dim:        rx(138, 151, 168), // #8A97A8 muted
+	faint:      rx(93, 107, 126),  // #5D6B7E
+	accent:     rx(59, 130, 246),  // #3B82F6
+	accentText: rx(255, 255, 255),
+	accentSoft: rx(27, 42, 66),
+	accentLine: rx(45, 72, 92),
+	accent2:    rx(34, 211, 238), // #22D3EE
+	ok:         rx(34, 197, 94),  // #22C55E
+	ok2:        rx(74, 222, 128), // #4ADE80
+	okSoft:     rx(24, 48, 44),
+	warn:       rx(251, 191, 36), // #FBBF24
+	warnSoft:   rx(52, 45, 26),
+	bad:        rx(248, 113, 113), // #F87171
+	badSoft:    rx(54, 34, 38),
+	up:         rx(96, 165, 250), // #60A5FA
+	mag:        rx(244, 114, 182), // #F472B6
+	vio:        rx(167, 139, 250), // #A78BFA
+	chip:       rx(16, 21, 31),
+	chipText:   rx(138, 151, 168),
+	toggleOff:  rx(45, 55, 70),
+	connectFrom: rx(52, 211, 119), // #34D377 disc highlight
+	connectTo:   rx(21, 128, 61),  // #15803D disc shadow
+	hexFrom:     rx(76, 130, 247), // #4C82F7 hexagon top
+	hexTo:       rx(42, 85, 208),  // #2A55D0 hexagon foot
 }
 
 func rx(r, g, b byte) walk.Color { return walk.RGB(r, g, b) }

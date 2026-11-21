@@ -16,6 +16,17 @@ const (
 	designH = 700.0 + capH
 )
 
+// The window is adaptive: it opens near 1280x860 logical pixels, resizes freely
+// on both axes, and the pages re-layout through breakpoints instead of keeping
+// one fixed ratio. These are the preferred startup size and the smallest layout
+// the pages support, all in 96-DPI logical pixels.
+const (
+	defaultW = 1280.0
+	defaultH = 860.0
+	minW     = 880.0
+	minH     = 560.0
+)
+
 // The window has no OS caption: the reference draws only three round buttons in
 // the top-right corner over the same background as the page, and no title text
 // on the left. capH is that band, in design units; every page is offset below it
@@ -123,98 +134,26 @@ func frameDeltas(hwnd uintptr) (int32, int32) {
 		(wr.bottom - wr.top) - (cr.bottom - cr.top)
 }
 
-// maxDesignClient is the largest 1080:734 client whose outer window still fits
-// the given work area.
-func maxDesignClient(workW, workH, fw, fh int32) (int32, int32) {
-	k := math.Min(float64(workW-fw)/designW, float64(workH-fh)/designH)
-	if k <= 0 {
-		return int32(designW), int32(designH)
-	}
-	return int32(k * designW), int32(k * designH)
-}
-
-// defaultClientSize is the startup client area: the design grid at the display's
-// DPI, so a 200% screen gets a twice-as-large window instead of a half-size one
-// with tiny text. It is capped at 90% of the work area — both axes by the same
-// factor, so the 1080:734 ratio survives the cap.
+// defaultClientSize is the startup client area in physical pixels: the
+// preferred 1280x860 logical window scaled by the display DPI, shrunk to fit
+// the work area (80% wide, 85% tall) but never below the 880x560 logical floor
+// unless the screen itself is smaller. Width and height shrink independently —
+// the layout is adaptive, so the window carries no fixed aspect ratio.
 func defaultClientSize(dpi float64, workW, workH, fw, fh int32) (int32, int32) {
-	cw := designW * dpi / 96
-	ch := designH * dpi / 96
-	const fill = 0.9
-	if f := math.Min(float64(workW-fw)*fill/cw, float64(workH-fh)*fill/ch); f > 0 && f < 1 {
-		cw *= f
-		ch *= f
-	}
+	availW := math.Max(float64(workW-fw), 1)
+	availH := math.Max(float64(workH-fh), 1)
+	k := dpi / 96
+	cw := math.Min(availW*0.8, defaultW*k)
+	ch := math.Min(availH*0.85, defaultH*k)
+	cw = math.Max(cw, math.Min(minW*k, availW))
+	ch = math.Max(ch, math.Min(minH*k, availH))
 	return int32(math.Round(cw)), int32(math.Round(ch))
 }
 
-// aspectLockRect rewrites the rectangle Windows proposes while an edge is being
-// dragged, keeping the client at 1080:734. The edge that is not moving stays
-// anchored, so the window grows away from the grabbed side. WM_SIZING fires on
-// every mouse move of the drag; correcting only after WM_EXITSIZEMOVE lets the
-// window distort visibly and makes the final snap feel like a jump.
-func aspectLockRect(edge uintptr, r *winRect, fw, fh int32) {
-	const (
-		wmszLeft        = 1
-		wmszRight       = 2
-		wmszTop         = 3
-		wmszTopLeft     = 4
-		wmszTopRight    = 5
-		wmszBottom      = 6
-		wmszBottomLeft  = 7
-		wmszBottomRight = 8
-	)
-	cw := r.right - r.left - fw
-	ch := r.bottom - r.top - fh
-	if cw < 1 || ch < 1 {
-		return
-	}
-	switch edge {
-	case wmszTop, wmszBottom: // width follows height, anchored left
-		w := int32(math.Round(float64(ch) * designW / designH))
-		r.right = r.left + w + fw
-	case wmszLeft: // height follows width, anchored top
-		h := int32(math.Round(float64(cw) * designH / designW))
-		r.bottom = r.top + h + fh
-	case wmszRight, wmszBottomLeft, wmszBottomRight: // anchored top-left
-		h := int32(math.Round(float64(cw) * designH / designW))
-		r.bottom = r.top + h + fh
-	case wmszTopLeft, wmszTopRight: // anchored bottom
-		h := int32(math.Round(float64(cw) * designH / designW))
-		r.top = r.bottom - (h + fh)
-	}
-}
-
-// snapDesignAspect re-imposes the design ratio when a resize ends. WM_SIZING
-// already locks it during the drag; this catches the one- or two-pixel drift a
-// min/max clamp can leave behind. The height follows the width, so the canvas
-// always fills the client instead of letterboxing inside it.
-func snapDesignAspect(hwnd uintptr) {
-	var cr winRect
-	proc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&cr)))
-	cw, ch := cr.right-cr.left, cr.bottom-cr.top
-	if cw < 1 {
-		return
-	}
-	want := int32(math.Round(float64(cw) * designH / designW))
-	if want < 1 || (ch-want >= -2 && ch-want <= 2) {
-		return
-	}
-	_, fh := frameDeltas(hwnd)
-	const (
-		swpNoMove     = 0x0002
-		swpNoZOrder   = 0x0004
-		swpNoActivate = 0x0010
-	)
-	proc("SetWindowPos").Call(hwnd, 0, 0, 0, 0, uintptr(uint32(want+fh)),
-		swpNoMove|swpNoZOrder|swpNoActivate)
-}
-
 // fitDesignWindow sizes the client for the current display and centres it. The
-// design grid is 1080x734 at 96 DPI, so the client is scaled by the display's
-// DPI before it is capped to the work area; without that a 200% screen shows
-// the whole window at half its intended apparent size. A window that keeps the
-// design ratio never letterboxes, and never ends up under the taskbar.
+// preferred size is scaled by the display DPI before it is capped to the work
+// area; without that a 200% screen shows the whole window at half its intended
+// apparent size. The pages adapt to whatever size results.
 func (u *natUI) fitDesignWindow() {
 	if u.mw == nil {
 		return
@@ -262,10 +201,10 @@ func (u *natUI) fitDesignWindow() {
 	}
 }
 
-// constrainWindowToWorkArea removes the OS caption's consequences: maximise is
-// clamped to a design-ratio rectangle centred in the work area (instead of the
-// full monitor, which would cover the taskbar and letterbox the page), and a
-// manually resized window snaps back to the same ratio when the drag ends.
+// constrainWindowToWorkArea installs a minimum track size so the window cannot
+// be dragged below the smallest layout the pages support. Maximise is left to
+// the OS, which already keeps the window inside the work area; the pages are
+// adaptive, so no aspect clamp is needed any more.
 func (u *natUI) constrainWindowToWorkArea() {
 	hwnd := uintptr(u.mw.Handle())
 	callOld := proc("CallWindowProcW")
@@ -274,39 +213,13 @@ func (u *natUI) constrainWindowToWorkArea() {
 	if wndProcNew == 0 {
 		wndProcNew = windows.NewCallback(func(h, msg, wp, lp uintptr) uintptr {
 			r, _, _ := callOld.Call(wndProcOld, h, msg, wp, lp)
-			const (
-				wmGetMinMaxInfo = 0x0024
-				wmSizing        = 0x0214
-				wmExitSizeMove  = 0x0232
-			)
-			switch {
-			case msg == wmGetMinMaxInfo && lp != 0:
-				mon, _, _ := proc("MonitorFromWindow").Call(h, 2) // nearest
-				var mi monitorInfo
-				mi.cbSize = uint32(unsafe.Sizeof(mi))
-				if ok, _, _ := proc("GetMonitorInfoW").Call(mon, uintptr(unsafe.Pointer(&mi))); ok != 0 {
-					workW := mi.rcWork.right - mi.rcWork.left
-					workH := mi.rcWork.bottom - mi.rcWork.top
-					fw, fh := frameDeltas(h)
-					cw, ch := maxDesignClient(workW, workH, fw, fh)
-					mm := (*minMaxInfo)(unsafe.Pointer(lp))
-					mm.ptMaxSize.x = cw + fw
-					mm.ptMaxSize.y = ch + fh
-					mm.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left + (workW-mm.ptMaxSize.x)/2
-					mm.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top + (workH-mm.ptMaxSize.y)/2
-					mm.ptMaxTrackSize.x = mm.ptMaxSize.x
-					mm.ptMaxTrackSize.y = mm.ptMaxSize.y
-				}
-			case msg == wmSizing && lp != 0:
-				if z, _, _ := proc("IsZoomed").Call(h); z == 0 {
-					fw, fh := frameDeltas(h)
-					aspectLockRect(wp, (*winRect)(unsafe.Pointer(lp)), fw, fh)
-				}
-				return 1
-			case msg == wmExitSizeMove:
-				if z, _, _ := proc("IsZoomed").Call(h); z == 0 {
-					snapDesignAspect(h)
-				}
+			const wmGetMinMaxInfo = 0x0024
+			if msg == wmGetMinMaxInfo && lp != 0 {
+				fw, fh := frameDeltas(h)
+				k := windowDPI(h) / 96
+				mm := (*minMaxInfo)(unsafe.Pointer(lp))
+				mm.ptMinTrackSize.x = int32(math.Round(minW*k)) + fw
+				mm.ptMinTrackSize.y = int32(math.Round(minH*k)) + fh
 			}
 			return r
 		})

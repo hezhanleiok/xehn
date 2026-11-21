@@ -205,10 +205,29 @@ func protoSupportedBy(bin, workDir, proto string) bool {
 	return supported[proto]
 }
 
-// coreCapabilities caches one probe round per binary path.
+// coreFileKey identifies the exact bytes on disk, not just the path. Caching
+// on path alone kept a stale verdict after a core was replaced or quarantined,
+// and one transient "probe never ran" could disable every protocol until the
+// process restarted.
+type coreFileKey struct {
+	path string
+	size int64
+	mod  int64
+}
+
+func coreFileKeyOf(bin string) coreFileKey {
+	k := coreFileKey{path: bin}
+	if fi, err := os.Stat(bin); err == nil {
+		k.size = fi.Size()
+		k.mod = fi.ModTime().UnixNano()
+	}
+	return k
+}
+
+// coreCapabilities caches one probe round per binary file.
 var (
 	capMu     sync.Mutex
-	capBin    string
+	capKey    coreFileKey
 	capVer    string
 	capResult map[string]bool
 )
@@ -222,12 +241,11 @@ func probeDebugf(format string, args ...any) {
 }
 
 // resetCoreCapabilityCache drops the cached probe result so the next
-// probeCoreCapabilities re-runs against a (possibly replaced) binary — a
-// re-download lands on the same path the cache is keyed by.
+// probeCoreCapabilities re-runs against a (possibly replaced) binary.
 func resetCoreCapabilityCache() {
 	capMu.Lock()
 	capResult = nil
-	capBin = ""
+	capKey = coreFileKey{}
 	capMu.Unlock()
 }
 
@@ -236,12 +254,22 @@ func resetCoreCapabilityCache() {
 func probeCoreCapabilities(bin, workDir string) (version string, supported map[string]bool, err error) {
 	capMu.Lock()
 	defer capMu.Unlock()
-	if capResult != nil && capBin == bin {
+	key := coreFileKeyOf(bin)
+	if capResult != nil && capKey == key {
 		return capVer, capResult, nil
 	}
 	ver, verr := core.BinaryVersion(bin)
 	supported = map[string]bool{}
 	var firstErr error
+	// unknown stays true when a probe never reached the core (or the core could
+	// not even report its version). Such a round is handed back to the caller
+	// with every protocol enabled, but is NOT cached: otherwise one antivirus
+	// hiccup would freeze a wrong verdict for the whole session.
+	unknown := false
+	if verr != nil {
+		unknown = true
+		firstErr = verr
+	}
 	names := make([]string, 0, len(protoRuns)+1)
 	for _, r := range protoRuns {
 		names = append(names, r.name)
@@ -276,6 +304,7 @@ func probeCoreCapabilities(bin, workDir string) (version string, supported map[s
 				continue
 			}
 			supported[name] = true
+			unknown = true
 			if firstErr == nil {
 				firstErr = fmt.Errorf("%v：%s", crash, crash.Hint())
 			}
@@ -288,6 +317,7 @@ func probeCoreCapabilities(bin, workDir string) (version string, supported map[s
 			// here would leave the user with an unusable client and a message
 			// about the wrong thing.
 			supported[name] = true
+			unknown = true
 			if firstErr == nil {
 				firstErr = terr
 			}
@@ -301,6 +331,8 @@ func probeCoreCapabilities(bin, workDir string) (version string, supported map[s
 	if verr != nil && firstErr == nil {
 		firstErr = verr
 	}
-	capBin, capVer, capResult = bin, ver, supported
+	if !unknown {
+		capKey, capVer, capResult = key, ver, supported
+	}
 	return ver, supported, firstErr
 }

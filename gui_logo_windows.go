@@ -37,15 +37,21 @@ func logoImage() image.Image {
 	return logoSrc
 }
 
+// logoAspect is the brand mark's height/width. The approved art is 512x321, so
+// every placement derives its height from the width it is given instead of
+// assuming a square (the old square asset stretched the XH mark).
+const logoAspect = 321.0 / 512.0
+
 // drawLogo paints the logo at a design-grid rect (x, y, size), replacing the
-// vector brand mark. The image is area-averaged down to the exact device size
-// and cached, so a HiDPI window gets a crisp logo without re-scaling per frame.
+// vector brand mark. size is the WIDTH; the height follows the mark's aspect.
+// The image is area-averaged down to the exact device size and cached, so a
+// HiDPI window gets a crisp logo without re-scaling per frame.
 func (u *natUI) drawLogo(c *walk.Canvas, x, y, size float64) {
 	px := u.s(size)
 	bmp := logoBitmap(px)
 	if bmp == nil {
 		// Embedded logo unavailable: keep the old vector mark rather than a hole.
-		u.icon(c, "shield", x, y, size, th.accent)
+		u.icon(c, "shield", x, y, size*logoAspect, th.accent)
 		return
 	}
 	_ = c.DrawImagePixels(bmp, walk.Point{X: u.sx(x), Y: u.sy(y)})
@@ -56,7 +62,8 @@ var (
 	logoBmps  = map[int]*walk.Bitmap{}
 )
 
-// logoBitmap returns the logo scaled to px×px device pixels, cached per size.
+// logoBitmap returns the logo scaled to px wide (height follows logoAspect),
+// cached per width.
 func logoBitmap(px int) *walk.Bitmap {
 	if px <= 0 {
 		return nil
@@ -70,7 +77,11 @@ func logoBitmap(px int) *walk.Bitmap {
 	if src == nil {
 		return nil
 	}
-	b, err := walk.NewBitmapFromImage(resizeImage(src, px, px))
+	h := int(float64(px)*logoAspect + 0.5)
+	if h < 1 {
+		h = 1
+	}
+	b, err := walk.NewBitmapFromImage(resizeImage(src, px, h))
 	if err != nil {
 		return nil
 	}
@@ -102,12 +113,45 @@ func (u *natUI) setWindowIcon() {
 		return
 	}
 	// 64px downscales cleanly to every size SetIcon asks for (16/32/48) and is
-	// cheap for GDI to resample; no need to hand it the full 512px asset.
-	icon, err := walk.NewIconFromImage(resizeImage(src, 64, 64))
+	// cheap for GDI to resample; no need to hand it the full 512px asset. The
+	// mark is wider than tall, so it is centred in a square transparent canvas
+	// rather than stretched to fill one.
+	icon, err := walk.NewIconFromImage(logoSquare(64))
 	if err != nil {
 		return
 	}
 	_ = u.mw.SetIcon(icon)
+}
+
+// logoSquare fits the brand mark inside a size×size transparent square,
+// preserving its aspect, for the window/taskbar icon.
+func logoSquare(size int) *image.NRGBA {
+	dst := image.NewNRGBA(image.Rect(0, 0, size, size))
+	src := logoImage()
+	if src == nil {
+		return dst
+	}
+	sb := src.Bounds()
+	w, h := size, size
+	if sb.Dx()*h > sb.Dy()*w {
+		h = size * sb.Dy() / sb.Dx()
+	} else {
+		w = size * sb.Dx() / sb.Dy()
+	}
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	scaled := resizeImage(src, w, h)
+	ox, oy := (size-w)/2, (size-h)/2
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.SetNRGBA(ox+x, oy+y, scaled.NRGBAAt(x, y))
+		}
+	}
+	return dst
 }
 
 // resizeImage area-averages src down to exactly w×h. Box averaging keeps a

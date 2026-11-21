@@ -47,3 +47,6 @@ PSIPHON_*.md
 .warp-portable
 .DS_Store
 Thumbs.db
+
+# go-winres output, rebuilt by pack.ps1
+rsrc_windows_amd64.syso

@@ -6,24 +6,6 @@ import (
 	"sync"
 )
 
-func runPool(workers, n int, fn func(i int)) {
-	if workers < 1 {
-		workers = 1
-	}
-	sem := make(chan struct{}, workers)
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			fn(i)
-		}(i)
-	}
-	wg.Wait()
-}
-
 func runTunnelPool(workers int, run protoRun, n int, fn func(tn tunnel, i int)) error {
 	if workers < 1 {
 		workers = 1

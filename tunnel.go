@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -69,10 +70,24 @@ func newWGTunnel(awg bool) (*wgTunnel, error) {
 	if outer != nil {
 		mtu = tunnelMTU - nestedOverhead
 	}
-	tunDev, stack, err := newIPStack([]netip.Addr{
-		netip.MustParseAddr(warpAddress),
-		netip.MustParseAddr(warpAddressV6),
-	}, mtu)
+	// Addresses come from the account. IPv6 is optional: an account registered
+	// without one (or a build with no built-in identity at all) simply runs v4
+	// instead of borrowing another device's address.
+	addrs := make([]netip.Addr, 0, 2)
+	if warpAddress != "" {
+		if a, aerr := netip.ParseAddr(warpAddress); aerr == nil {
+			addrs = append(addrs, a)
+		}
+	}
+	if warpAddressV6 != "" {
+		if a, aerr := netip.ParseAddr(warpAddressV6); aerr == nil {
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("账号没有可用的隧道地址：请重新注册 WARP 账号")
+	}
+	tunDev, stack, err := newIPStack(addrs, mtu)
 	if err != nil {
 		return nil, err
 	}
@@ -237,27 +252,60 @@ func (s *ipStack) speedTest(ctx context.Context) (float64, bool) {
 	return sampleThroughput(resp.Body)
 }
 
-func sampleThroughput(body io.Reader) (float64, bool) {
-	buf := make([]byte, 64<<10)
-	var got int64
-	var start time.Time
-	for {
-		n, err := body.Read(buf)
-		got += int64(n)
-		if start.IsZero() && got >= speedWarmupBytes {
-			got, start = 0, time.Now()
-		}
-		if err != nil {
-			break
-		}
-		if !start.IsZero() && time.Since(start) >= speedSample {
-			break
-		}
-	}
-	if start.IsZero() || got == 0 {
+// speedTestMulti is the ranking probe: rankStreams concurrent downloads through
+// the same tunnel, their steady-state segments pooled and reduced to a median.
+// One stream under-fills a fat tunnel and over-reacts to a single loss; the
+// concurrent median is what the endpoint ranking compares. It shares the scan
+// speedtest's caliber (warmup dropped, fixed segments, median) so a number
+// measured here means the same thing as one from the standalone speedtest.
+func (s *ipStack) speedTestMulti(ctx context.Context, streams int) (float64, bool) {
+	reqCtx, cancel := context.WithTimeout(ctx, speedTimeout)
+	defer cancel()
+	if !resolveMetaAddr(reqCtx, s.tnet) {
 		return 0, false
 	}
-	return mbits(got, time.Since(start)), true
+	if streams < 1 {
+		streams = 1
+	}
+	s.client.Timeout = speedTimeout
+	var (
+		mu  sync.Mutex
+		all []float64
+		wg  sync.WaitGroup
+	)
+	for i := 0; i < streams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, speedURL, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Referer", metaReferer)
+			resp, err := s.client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			segs := collectSegments(resp.Body, rankWarmup, rankSeg, rankWindow)
+			mu.Lock()
+			all = append(all, segs...)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	m := medianMbps(all)
+	return m, m > 0
+}
+
+// sampleThroughput reduces one download to the unified steady-state caliber:
+// drop the warmup prefix, bucket the rest into 500ms segments, take the median.
+// The previous whole-window average let a single stall or burst decide the
+// number; the median is what makes two endpoints comparable.
+func sampleThroughput(body io.Reader) (float64, bool) {
+	segs := collectSegments(body, rankWarmup, rankSeg, speedSample)
+	m := medianMbps(segs)
+	return m, m > 0
 }
 
 func mbits(bytes int64, d time.Duration) float64 {

@@ -4,16 +4,40 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// errPsiphonPolicyBlocked marks a Windows Smart App Control / WDAC refusal to
+// load psiphon.exe. This is environmental and permanent for that file: rotating
+// WARP endpoints or rescanning cannot fix it, so the connect loop aborts at
+// once instead of burning every candidate (and confusing the user with a wall
+// of "underlay 数据面不可用" follow-on errors).
+var errPsiphonPolicyBlocked = errors.New("psiphon.exe blocked by Windows code integrity policy")
+
+// isPolicyBlocked recognises the forms CreateProcess reports when a code
+// integrity policy refuses an unsigned image: WinError 4551, "An Application
+// Control policy has blocked this file", or a Device Guard message.
+func isPolicyBlocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "application control policy") ||
+		strings.Contains(s, "blocked this file") ||
+		strings.Contains(s, "device guard") ||
+		strings.Contains(s, "4551")
+}
 
 // Psiphon wraps the external Psiphon executable as a localhost SOCKS5 proxy
 // (V1 exit). xehn starts it, learns the dynamic SOCKS port from the
@@ -23,16 +47,16 @@ import (
 // none of that. This file is the lifecycle only: no health guard, no repair
 // loop, no endpoint manager, no GUI.
 type Psiphon struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	cancel   context.CancelFunc
-	pid      int
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	cancel    context.CancelFunc
+	pid       int
 	socksPort int
-	state    psiphonState
-	dataDir  string
-	exePath  string
-	upstream string
-	done     chan struct{}
+	state     psiphonState
+	dataDir   string
+	exePath   string
+	upstream  string
+	done      chan struct{}
 }
 
 type psiphonState int
@@ -254,6 +278,10 @@ func (p *Psiphon) Start(ctx context.Context, l psiphonLaunch) error {
 		p.cancel = nil
 		p.done = nil
 		p.mu.Unlock()
+		if isPolicyBlocked(err) {
+			return fmt.Errorf("%w: Windows 智能应用控制/代码完整性策略阻止加载 %s（psiphon.exe 未签名、无发布者信誉）。请在 Windows 安全中心关闭智能应用控制、换用已签名的 psiphon.exe，或暂时改用 OpenVPN 出口（不依赖该进程）: %v",
+				errPsiphonPolicyBlocked, l.ExePath, err)
+		}
 		return fmt.Errorf("psiphon: start %s: %w", l.ExePath, err)
 	}
 	p.mu.Lock()
@@ -333,6 +361,157 @@ func (p *Psiphon) handleNotice(line string) {
 		p.mu.Unlock()
 	case "ListeningHttpProxyPort":
 		// ignored for V1 (we use the SOCKS port)
+	case "AvailableEgressRegions":
+		// Psiphon emits this whenever it refreshes its server list (it checks
+		// for updates on every run), so the UI's region dropdown tracks the
+		// live egress set without a timer of our own.
+		if regions := noticeRegions(n.Data); len(regions) > 0 {
+			savePsiphonRegions(regions)
+		}
+	}
+}
+
+// noticeRegions parses the AvailableEgressRegions payload: {"regions":["US",…]}.
+func noticeRegions(raw json.RawMessage) []string {
+	var m struct {
+		Regions []string `json:"regions"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return m.Regions
+}
+
+// psiphonRegionsFile is the cached egress-region list (psiphon-regions.json in
+// the app dir). It survives between runs so the dropdown shows the latest known
+// set even before the first connect of a session.
+type psiphonRegionsFile struct {
+	At      time.Time `json:"at"`
+	Regions []string  `json:"regions"`
+}
+
+func psiphonRegionsPath() string {
+	dir, err := appDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "psiphon-regions.json")
+}
+
+// savePsiphonRegions normalises (trim, upper-case, 2-letter, dedupe, sort) and
+// writes the cache. Best effort: it runs on the notice-reader goroutine and
+// must never disturb the connect path. An unchanged list keeps the old file so
+// the recorded timestamp stays "when the set last changed".
+func savePsiphonRegions(regions []string) {
+	p := psiphonRegionsPath()
+	if p == "" {
+		return
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range regions {
+		r = strings.ToUpper(strings.TrimSpace(r))
+		if len(r) != 2 || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return
+	}
+	sort.Strings(out)
+	if old := loadPsiphonRegions(); len(old) == len(out) {
+		same := true
+		for i := range out {
+			if old[i] != out[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return
+		}
+	}
+	b, err := json.MarshalIndent(psiphonRegionsFile{At: time.Now(), Regions: out}, "", "  ")
+	if err != nil {
+		return
+	}
+	// Atomic replace: the GUI and the connect path read this file concurrently.
+	tmp := p + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) != nil {
+		return
+	}
+	if os.Rename(tmp, p) != nil {
+		_ = os.Remove(tmp)
+	}
+}
+
+// loadPsiphonRegions reads the cached list; nil when absent or unreadable.
+func loadPsiphonRegions() []string {
+	p := psiphonRegionsPath()
+	if p == "" {
+		return nil
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var f psiphonRegionsFile
+	if json.Unmarshal(b, &f) != nil {
+		return nil
+	}
+	return f.Regions
+}
+
+// guardPsiphonRegion drops a saved region the latest server list no longer
+// offers: Psiphon would silently ignore it anyway, so say so once and fall back
+// to automatic. An empty cache (first run / offline) never overrides the pick.
+func guardPsiphonRegion(label, region string) string {
+	region = strings.ToUpper(strings.TrimSpace(region))
+	if region == "" {
+		return ""
+	}
+	regions := loadPsiphonRegions()
+	if len(regions) == 0 {
+		return region
+	}
+	for _, r := range regions {
+		if r == region {
+			return region
+		}
+	}
+	stageMsg(fmt.Sprintf("[%s] 出口地区 %s 已不在 Psiphon 最新地区列表中，本次改用自动选择", label, region))
+	return ""
+}
+
+// psiphonDataStoreRegionRE matches the plaintext region fields inside Psiphon's
+// bolt datastore: server entries are stored as JSON values ("region":"US").
+var psiphonDataStoreRegionRE = regexp.MustCompile(`"region"\s*:\s*"([A-Za-z]{2})"`)
+
+// refreshPsiphonRegionsFromDataStore rebuilds the region cache from Psiphon's
+// own server-list datastore. The AvailableEgressRegions notice fires before
+// the server list finishes downloading (and arrives empty in current builds),
+// so notices alone never fill the list; the datastore holds every discovered
+// server's region in plaintext once the list is loaded. Best effort: a locked
+// or absent file simply keeps the previous cache.
+func refreshPsiphonRegionsFromDataStore(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	matches, _ := filepath.Glob(filepath.Join(dataDir, "*", "datastore", "psiphon.boltdb"))
+	var regions []string
+	for _, m := range matches {
+		b, err := os.ReadFile(m)
+		if err != nil {
+			continue
+		}
+		for _, hit := range psiphonDataStoreRegionRE.FindAllSubmatch(b, -1) {
+			regions = append(regions, string(hit[1]))
+		}
+	}
+	if len(regions) > 0 {
+		savePsiphonRegions(regions)
 	}
 }
 
@@ -486,6 +665,7 @@ func (p *Psiphon) Stop() error {
 	cancel := p.cancel
 	cmd := p.cmd
 	done := p.done
+	dataDir := p.dataDir
 	p.state = psiphonStopping
 	p.mu.Unlock()
 	if cancel != nil {
@@ -515,6 +695,10 @@ func (p *Psiphon) Stop() error {
 		p.state = psiphonStopped
 	}
 	p.mu.Unlock()
+	// The process is gone, so its bolt datastore lock is released: refresh the
+	// region list from the server entries it just downloaded. Per-run cadence —
+	// every connect cycle leaves the dropdown with the latest known set.
+	refreshPsiphonRegionsFromDataStore(dataDir)
 	return nil
 }
 

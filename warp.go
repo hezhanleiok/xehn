@@ -19,14 +19,25 @@ var (
 )
 
 // Registration (register.go) overwrites these in place, so var not const.
+//
+// There is deliberately NO built-in device identity. Every install must create
+// its own WARP device on first run: a hardcoded private key (and the IPv6 that
+// belongs to it) is somebody else's device — Cloudflare routes v6 per device,
+// so traffic from a borrowed address is dropped, and a shared key makes every
+// user of this build look like one client to the API. validateAccountFor()
+// refuses to render anything until registration or an account file filled
+// these in.
 var (
-	warpPrivateKey = "4OnO86dDLpqJ2U10ODwX3tarx6xlRGLfkmbSBtMgaHg="
+	warpPrivateKey = ""
 	warpPublicKey  = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-	warpAddress    = "172.16.0.2"
-	// Replaced by the account's own v6 when the file carries one. The fallback is
-	// someone else's device address: it renders a usable config line, but traffic
-	// sent from it is dropped, because WARP routes v6 per device instead of NAT-ing it.
-	warpAddressV6 = "2606:4700:110:8d87:b0ba:4148:5a61:4873"
+	// warpAddress is WARP's fixed client-side IPv4. It is the same on every
+	// device (the tunnel is addressed per key, not per address), so it is safe
+	// as a default; the account's own v4 replaces it when present.
+	warpAddress = "172.16.0.2"
+	// warpAddressV6 is device-specific and comes from the account. Empty means
+	// "this account has no IPv6": IPv6 families are refused rather than faked
+	// with an address that belongs to another device.
+	warpAddressV6 = ""
 )
 
 const (
@@ -112,6 +123,9 @@ func base64ToHex(b64 string) (string, error) {
 }
 
 func baseUAPI(awg bool) (string, error) {
+	if warpPrivateKey == "" {
+		return "", fmt.Errorf("尚未注册 WARP 账号：首次连接会自动注册，若一直失败请检查网络或运行 xehn register")
+	}
 	privHex, err := base64ToHex(warpPrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("private key: %w", err)

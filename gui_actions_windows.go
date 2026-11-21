@@ -93,7 +93,7 @@ func (u *natUI) actionPages(id string) {
 		ep := strings.TrimPrefix(id, "star:")
 		u.mutateSettings(func(s *clientSettings) { s.Starred = toggleStar(s.Starred, ep) })
 
-	case strings.HasPrefix(id, "set:"):
+	case strings.HasPrefix(id, "set:"), strings.HasPrefix(id, "pickcapture:"):
 		u.actionSetting(id)
 	case strings.HasPrefix(id, "about:"):
 		u.actionAbout(id)
@@ -207,8 +207,14 @@ func (u *natUI) gotoPage(page string) {
 	default:
 		return
 	}
+	// Stamp a real page change so the shell slides the new page in; re-selecting
+	// the current page is a no-op and must not replay the transition.
+	if page != u.m.page {
+		u.pageAnimAt = time.Now()
+	}
 	u.m.page = page
 	u.m.scroll = 0
+	u.m.dropOpen = ""
 	if page != pageSettings {
 		u.m.setScroll = 0
 	}
@@ -241,9 +247,28 @@ func (u *natUI) actionSetting(id string) {
 	switch id {
 	case "set:allowlan":
 		toggle(func(s *clientSettings) { s.AllowLan = !s.AllowLan })
-		return
-	case "set:rescan":
-		toggle(func(s *clientSettings) { s.Rescan = !s.Rescan })
+		// Widen the firewall the moment sharing is switched on, not at connect
+		// time: Windows prompts for any non-loopback listener, and that prompt
+		// arriving mid-connect is what made the core look like it was asking for
+		// network permission out of nowhere. Doing it here also means the user
+		// sees the one UAC consent while they are already in a settings dialog.
+		if u.m.set.AllowLan {
+			port := u.m.set.MixedPort
+			coreBin := coreBinaryPath(options{})
+			go func() {
+				err := core.EnsureLanFirewall(port, coreBin)
+				u.sync(func() {
+					if err != nil {
+						u.addLog(trf("局域网共享：未能自动放行端口 %d（%v）。若其它设备连不上，请在 Windows 防火墙里允许 mihomo.exe", port, err), true)
+					} else {
+						u.addLog(trf("局域网共享已开启：端口 %d 与内核已放行，其它设备填 %s:%d", port, u.m.localLan, port), false)
+					}
+					u.invalidate()
+				})
+			}()
+		} else {
+			u.addLog(tr("局域网共享已关闭：监听回到 127.0.0.1"), false)
+		}
 		return
 	case "set:autostart":
 		next := !u.m.set.AutoStart
@@ -256,48 +281,13 @@ func (u *natUI) actionSetting(id string) {
 	case "set:autoconnect":
 		toggle(func(s *clientSettings) { s.AutoConnect = !s.AutoConnect })
 		return
-	case "set:autorepair":
-		toggle(func(s *clientSettings) { s.AutoRepair = !s.AutoRepair })
-		return
-	case "set:dnsdi":
-		toggle(func(s *clientSettings) { s.DNSOff = !s.DNSOff })
-		return
-	case "set:dnsleak":
-		// The switch is disabled in the paint when the configuration cannot
-		// honour it; the guard keeps a stale click from lying about the result.
-		if u.m.set.DNSOff || u.m.set.ProxyMode == modeDirect {
-			return
-		}
-		toggle(func(s *clientSettings) { s.DNSLeak = !s.DNSLeak })
-		return
-	case "set:reset":
-		if u.confirm(tr("恢复默认设置？"), tr("所有设置将回到初始值，需要重新连接才生效。")) {
-			// Autostart lives in the registry, not only in the file: resetting
-			// the file alone would leave the program starting with Windows while
-			// the switch says it does not.
-			if u.m.set.AutoStart {
-				_ = setAutoStart(false)
-			}
-			u.m.set = defaultSettings()
-			if err := saveSettings(u.m.set); err != nil {
-				u.addLog(tr("设置保存失败: ")+err.Error(), true)
-			}
-			u.m.pin = ""
-			u.applyTheme()
-			u.applyLang()
-			u.syncSessionFromSettings()
-		}
-		return
-	case "set:connect":
-		if u.m.connected {
-			u.doSwitch()
-		} else {
-			u.doConnect()
-		}
-		return
 	}
 
-	if v, ok := strings.CutPrefix(id, "set:capture:"); ok {
+	if v, ok := strings.CutPrefix(id, "pickcapture:"); ok {
+		u.m.dropOpen = ""
+		if v != captureProxy && v != captureTun {
+			return
+		}
 		if v == captureTun && !core.IsElevated() {
 			// Stored first: the choice survives either answer, so a user who
 			// relaunches later gets the mode they picked.
@@ -315,13 +305,6 @@ func (u *natUI) actionSetting(id string) {
 			return
 		}
 		toggle(func(s *clientSettings) { s.CaptureMode = v })
-		return
-	}
-	if v, ok := strings.CutPrefix(id, "set:dns:"); ok {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n < len(dnsPresets) {
-			val := dnsPresets[n].value
-			toggle(func(s *clientSettings) { s.DNSCustom = val })
-		}
 		return
 	}
 
@@ -343,6 +326,16 @@ func (u *natUI) actionSetting(id string) {
 		return nil
 	}
 	fields := map[string]field{
+		"set:lanuser": {tr("局域网共享的登录用户名；与密码同时填写才生效，留空表示不验证"),
+			u.m.set.LanUser, func(s *clientSettings, v string) error {
+				s.LanUser = strings.TrimSpace(v)
+				return nil
+			}},
+		"set:lanpass": {tr("局域网共享的登录密码；与用户名同时填写才生效，留空表示不验证"),
+			u.m.set.LanPass, func(s *clientSettings, v string) error {
+				s.LanPass = strings.TrimSpace(v)
+				return nil
+			}},
 		"set:mixedport": {tr("请输入 1-65535 之间的端口号"), itoa(int64(u.m.set.MixedPort)), func(s *clientSettings, v string) error {
 			n, err := strconv.Atoi(v)
 			if err != nil {
@@ -352,43 +345,6 @@ func (u *natUI) actionSetting(id string) {
 				return err
 			}
 			s.MixedPort = n
-			return nil
-		}},
-		"set:apiport": {tr("请输入 1-65535 之间的端口号"), itoa(int64(u.m.set.APIPort)), func(s *clientSettings, v string) error {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				return fmt.Errorf("%s", tr("端口必须是数字"))
-			}
-			if err := port(n, s.MixedPort, tr("API 端口")); err != nil {
-				return err
-			}
-			s.APIPort = n
-			return nil
-		}},
-		"set:mtu": {tr("0 = 自动"), itoa(int64(u.m.set.MTU)), func(s *clientSettings, v string) error {
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 || n > 9000 {
-				return fmt.Errorf("%s", tr("MTU 必须在 0-9000 之间（0 = 自动）"))
-			}
-			s.MTU = n
-			return nil
-		}},
-		"set:timeout": {tr("1-60 秒"), itoa(int64(u.m.set.TimeoutSec)), func(s *clientSettings, v string) error {
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 || n > 60 {
-				return fmt.Errorf("%s", tr("连接超时必须在 1-60 秒之间"))
-			}
-			s.TimeoutSec = n
-			return nil
-		}},
-		"set:dns": {tr("逗号分隔，如 223.5.5.5, 1.1.1.1"), u.m.set.DNSCustom, func(s *clientSettings, v string) error {
-			v = strings.TrimSpace(v)
-			for _, item := range fieldList(v) {
-				if _, err := netip.ParseAddr(item); err != nil {
-					return fmt.Errorf("%s", trf("无效的 DNS 地址: %s", item))
-				}
-			}
-			s.DNSCustom = v
 			return nil
 		}},
 		"set:domdirect": {tr("逗号分隔的域名后缀，如 example.com；留空不启用"), u.m.set.DomainDirect, func(s *clientSettings, v string) error {
@@ -473,18 +429,14 @@ func fieldTitle(id string) string {
 	switch id {
 	case "set:mixedport":
 		return "本地代理端口"
-	case "set:apiport":
-		return "API 端口"
-	case "set:mtu":
-		return "MTU"
-	case "set:timeout":
-		return "连接超时（秒）"
-	case "set:dns":
-		return "自定义 DNS"
 	case "set:domdirect":
 		return "直连域名"
 	case "set:domproxy":
 		return "代理域名"
+	case "set:lanuser":
+		return "共享认证用户名"
+	case "set:lanpass":
+		return "共享认证密码"
 	default:
 		return "默认节点"
 	}
@@ -597,8 +549,3 @@ func (u *natUI) actionUpdate(id string) {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}

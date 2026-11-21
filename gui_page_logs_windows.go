@@ -11,7 +11,7 @@ import (
 var logTabIDs = []string{"run", "conn", "debug"}
 
 func (u *natUI) paintLogs(c *walk.Canvas) {
-	x, y, w := shellContentX, shellBodyY, u.contentW()
+	x, y, w := u.contentX(), shellBodyY, u.contentW()
 	labels := []string{tr("运行日志"), tr("连接记录"), tr("调试信息")}
 	u.subtabs(c, x, y, "logtab:", logTabIDs, labels, u.m.logTab)
 	u.paintLogActions(c, x, y, w)
@@ -115,44 +115,134 @@ func (u *natUI) paintRunLog(c *walk.Canvas, x, y, w float64) {
 	lines := all[start:end]
 	ly := y + 14
 	for _, l := range lines {
-		// Core chatter stays identifiable by its tag instead of being faded out:
-		// it is the bulk of the log and has to remain readable.
-		tag, tagCol := "INFO", th.dim
+		// Level pill: a soft tinted chip carries the level so a wall of core
+		// chatter stays scannable, and warnings/errors jump out by colour.
+		tag, pillBg, pillCol := "INFO", th.inset, th.dim
 		msgCol := th.text
 		switch {
 		case l.lv == 2:
-			tag, tagCol, msgCol = "ERR", th.bad, th.bad
+			tag, pillBg, pillCol, msgCol = "ERR", th.badSoft, th.bad, th.bad
 		case l.lv == 1:
-			tag, tagCol, msgCol = "WARN", th.warn, th.warn
+			tag, pillBg, pillCol, msgCol = "WARN", th.warnSoft, th.warn, th.warn
 		case l.core:
-			tag = "CORE"
+			tag, pillBg, pillCol = "CORE", mix(th.vio, th.card, 0.86), th.vio
 		}
-		u.txt(c, x+16, ly, 64, lineH, l.at.Format("15:04:05"), u.f.fmono, th.dim)
-		u.txt(c, x+86, ly, 52, lineH, tag, u.f.fmono, tagCol)
-		u.txt(c, x+144, ly, w-160, lineH, l.text, u.f.fmono, msgCol)
+		u.txt(c, x+16, ly, 62, lineH, l.at.Format("15:04:05"), u.f.fmono, th.faint)
+		pill := u.r(x+84, ly+3, 50, lineH-6)
+		u.fillRound(c, pillBg, pill, 5)
+		u.textC(c, tag, u.f.f8, pillCol, pill)
+		u.txt(c, x+142, ly, w-158, lineH, l.text, u.f.fmono, msgCol)
 		ly += lineH
 	}
-	u.paintLogScrollbar(c, x, y, w, h, maxScroll)
+	u.paintLogScrollbar(c, x, y, w, h)
 }
 
-// paintLogScrollbar mirrors the settings column's slim indicator: shown only
-// when history spills past one screen, thumb at the bottom while following.
-func (u *natUI) paintLogScrollbar(c *walk.Canvas, x, y, w, h float64, maxScroll int) {
-	if maxScroll <= 0 {
-		return
+// runLogBox is the run-log card's box in design units. Paint and the scrollbar
+// drag handlers both derive their geometry from it so the handle can never
+// drift from the card it belongs to.
+func (u *natUI) runLogBox() (x, y, w, h float64) {
+	x, w = u.contentX(), u.contentW()
+	y = shellBodyY + 46
+	h = 670 - y
+	return
+}
+
+// logScrollbarGeom returns the run-log scrollbar in design units plus the
+// largest scroll offset. logScroll counts up from the newest line, so the thumb
+// rests at the bottom while following live output and climbs toward the top as
+// the reader scrolls back into history.
+func (u *natUI) logScrollbarGeom(x, y, w, h float64) (trackX, trackTop, trackH, thumbTop, thumbH float64, maxScroll int) {
+	trackX = x + w - 12
+	trackTop = y + 8
+	trackH = h - 16
+	rows := u.m.logVisibleRows
+	if rows < 1 {
+		rows = 1
 	}
-	trackX := x + w - 10
-	top := y + 8
-	trackH := h - 16
-	u.fillRound(c, mix(th.line, th.card, 0.45), u.r(trackX, top, 4, trackH), 2)
-	total := float64(len(u.m.logs))
-	thumbH := trackH * float64(u.m.logVisibleRows) / total
+	maxScroll = len(u.m.logs) - rows
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if maxScroll <= 0 {
+		return trackX, trackTop, trackH, 0, 0, 0
+	}
+	thumbH = trackH * float64(rows) / float64(len(u.m.logs))
 	if thumbH < 42 {
 		thumbH = 42
 	}
 	off := float64(maxScroll-u.m.logScroll) / float64(maxScroll)
-	thumbY := top + off*(trackH-thumbH)
-	u.fillRound(c, mix(th.accent, th.card, 0.28), u.r(trackX, thumbY, 4, thumbH), 2)
+	thumbTop = trackTop + off*(trackH-thumbH)
+	return
+}
+
+// paintLogScrollbar is the slim draggable indicator on the card's right margin.
+// It only appears when history spills past one screen; the thumb brightens on
+// hover and while grabbed so the handle reads as interactive, not decoration.
+func (u *natUI) paintLogScrollbar(c *walk.Canvas, x, y, w, h float64) {
+	trackX, trackTop, trackH, thumbTop, thumbH, maxScroll := u.logScrollbarGeom(x, y, w, h)
+	if maxScroll <= 0 {
+		return
+	}
+	u.fillRound(c, mix(th.line, th.card, 0.45), u.r(trackX, trackTop, 4, trackH), 2)
+	thumbCol := mix(th.accent, th.card, 0.28)
+	if u.m.hover == "log:scrollbar" || u.logDrag {
+		thumbCol = mix(th.accent, th.card, 0.08)
+	}
+	u.fillRound(c, thumbCol, u.r(trackX, thumbTop, 4, thumbH), 2)
+	// A wider grab strip than the 4px thumb so the handle is easy to catch.
+	u.addSpot("log:scrollbar", u.r(x+w-16, y+8, 14, h-16), true)
+}
+
+// beginLogDrag starts a drag on the run-log scrollbar, same contract as the
+// settings one: pressing the handle keeps the pointer's offset inside it,
+// pressing the track jumps the handle there first and carries on from there.
+func (u *natUI) beginLogDrag(py int) {
+	x, y, w, h := u.runLogBox()
+	_, _, _, thumbTop, thumbH, maxScroll := u.logScrollbarGeom(x, y, w, h)
+	if maxScroll <= 0 {
+		return
+	}
+	yy := u.uy(py) - capH
+	if yy >= thumbTop && yy <= thumbTop+thumbH {
+		u.logGrabDY = yy - thumbTop
+	} else {
+		u.logGrabDY = thumbH / 2
+	}
+	u.logDrag = true
+	u.dragLogTo(py)
+}
+
+// dragLogTo maps the pointer's position on the track onto logScroll. The thumb
+// runs bottom (newest) to top (oldest), so the offset is inverted back into the
+// lines-up-from-newest count the reader uses.
+func (u *natUI) dragLogTo(py int) {
+	x, y, w, h := u.runLogBox()
+	_, trackTop, trackH, _, thumbH, maxScroll := u.logScrollbarGeom(x, y, w, h)
+	if maxScroll <= 0 {
+		return
+	}
+	yy := u.uy(py) - capH
+	top := yy - u.logGrabDY
+	if top < trackTop {
+		top = trackTop
+	}
+	if maxTop := trackTop + trackH - thumbH; top > maxTop {
+		top = maxTop
+	}
+	span := trackH - thumbH
+	if span <= 0 {
+		u.m.logScroll = 0
+	} else {
+		off := (top - trackTop) / span
+		u.m.logScroll = int((1 - off) * float64(maxScroll))
+	}
+	if u.m.logScroll < 0 {
+		u.m.logScroll = 0
+	}
+	if u.m.logScroll > maxScroll {
+		u.m.logScroll = maxScroll
+	}
+	u.invalidate()
 }
 
 // paintSessions shows only the connection pipeline's own lines: the connect

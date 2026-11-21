@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -303,6 +305,47 @@ func TestVPNGateFailureMemory(t *testing.T) {
 	got = vpnGateCandidates(ctx, nodes, "JP", "", 24)
 	if len(got) != 2 || got[0].id() != nodes[0].id() {
 		t.Fatalf("cleared relay not restored: %+v", got)
+	}
+}
+
+// TestVPNGatePinBypassesFailureMemory pins the rule that an explicit pin is
+// always tried first even right after a failure: the memory serves auto
+// selection and must never silently replace the user's choice (the "I pinned
+// X but it connected through Y" report).
+func TestVPNGatePinBypassesFailureMemory(t *testing.T) {
+	t.Setenv("WARP_CLIENT_HOME", t.TempDir())
+	nodes := []vpnGateNode{
+		{IP: "203.0.113.41", Port: 443, Proto: "tcp", Profile: "p", CountryShort: "JP", Class: "residential", LatencyMS: 10},
+		{IP: "203.0.113.42", Port: 443, Proto: "tcp", Profile: "p", CountryShort: "JP", Class: "residential", LatencyMS: 20},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	markVPNGateFailed(nodes[0].id())
+	got := vpnGateCandidates(ctx, nodes, "JP", nodes[0].id(), 24)
+	if len(got) != 2 || got[0].id() != nodes[0].id() {
+		t.Fatalf("pinned relay must stay first despite the failure memory: %+v", got)
+	}
+	// Auto selection still skips the failed relay.
+	got = vpnGateCandidates(ctx, nodes, "JP", "", 24)
+	if len(got) != 1 || got[0].id() != nodes[1].id() {
+		t.Fatalf("auto mode must still skip the failed relay: %+v", got)
+	}
+}
+
+// TestAuthRejectError pins the classification the connect loop relies on: an
+// AUTH_FAILED rejection is its own type (so the loop drops the relay on every
+// base at once) and is not a local core error (which would abort the run).
+func TestAuthRejectError(t *testing.T) {
+	err := fmt.Errorf("wrap: %w", &authRejectError{reason: "AUTH_FAILED"})
+	var auth *authRejectError
+	if !errors.As(err, &auth) || auth.reason != "AUTH_FAILED" {
+		t.Fatalf("errors.As lost the auth rejection: %v", err)
+	}
+	if localCoreError(err) {
+		t.Fatal("auth rejection must not be treated as a local core error")
+	}
+	if !strings.Contains(err.Error(), "AUTH_FAILED") {
+		t.Fatalf("message lost the reason: %v", err)
 	}
 }
 

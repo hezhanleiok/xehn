@@ -43,19 +43,23 @@ New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
 if (-not $SkipBuild) {
     # Environment: keep Go caches inside the workspace when unset outside.
-    if (-not $env:GOMODCACHE) { $env:GOMODCACHE = 'E:\xiaohe\xhwarp\.gomod' }
-    if (-not $env:GOCACHE)    { $env:GOCACHE    = 'E:\xiaohe\xhwarp\.gocache' }
-    if (-not $env:GOPATH)     { $env:GOPATH     = 'E:\xiaohe\xhwarp\.gopath' }
+    # Caches live in the workspace root, next to warp-client/. Resolve them
+    # from this script's location so a moved repo or changed drive still builds.
+    $ws = Split-Path -Parent $here
+    if (-not $env:GOMODCACHE) { $env:GOMODCACHE = Join-Path $ws '.gomod' }
+    if (-not $env:GOCACHE)    { $env:GOCACHE    = Join-Path $ws '.gocache' }
+    if (-not $env:GOPATH)     { $env:GOPATH     = Join-Path $ws '.gopath' }
     if (-not $env:GOPROXY)    { $env:GOPROXY    = 'https://goproxy.cn,direct' }
     $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
 
     Push-Location $here
 
-    # Regenerate the logo artifacts from the source art: the embedded PNG the
-    # in-app brand + window/taskbar icon render from, and the multi-size .ico
-    # rsrc bakes into the exe as the program icon. The source lives one level up
-    # (the workspace root); a missing source leaves the committed artifacts.
-    $logoSrc = Join-Path $here '..\logo.png'
+    # Regenerate the logo artifacts from the approved borderless brand mark: the
+    # embedded PNG the in-app brand + window/taskbar icon render from, and the
+    # multi-size .ico rsrc bakes into the exe as the program icon. The mark lives
+    # in ui-mockups/ (extracted from the raw square art, white background and
+    # watermark removed); a missing source leaves the committed artifacts.
+    $logoSrc = Join-Path $here '..\ui-mockups\logo-mark.png'
     if (Test-Path $logoSrc) {
         go run ./tools/mklogo -src $logoSrc -png assets/logo.png -ico logo.ico
         if ($LASTEXITCODE -ne 0) { Pop-Location; throw "mklogo failed to build the logo artifacts" }
@@ -129,7 +133,18 @@ New-Item -ItemType Directory -Force -Path "$root\core" | Out-Null
 
 Copy-Item $bin (Join-Path $root 'xehn.exe')
 
-# Core: bundled when provided, otherwise the GUI downloads it on first run.
+# Core: a release ZIP without mihomo.exe is the number-one cause of first-run
+# "Clash 核心不可用" reports. Default to the core in the source tree and refuse
+# to package anything that lacks a real binary.
+if (-not $MihomoPath) { $MihomoPath = Join-Path $here 'core\mihomo.exe' }
+if (-not (Test-Path $MihomoPath)) {
+    throw "mihomo core not found at $MihomoPath; pass -MihomoPath <path>"
+}
+if ((Get-Item $MihomoPath).Length -lt 1MB) {
+    throw "mihomo core at $MihomoPath is too small; refusing to ship a broken core"
+}
+# download.go's defaultVersion must match this binary's version, otherwise a
+# repair download could silently install an older core.
 if ($MihomoPath -and (Test-Path $MihomoPath)) {
     Copy-Item $MihomoPath (Join-Path $root 'core\mihomo.exe') -Force
     Write-Host "bundled core: $([math]::Round((Get-Item $MihomoPath).Length/1MB,1)) MB"
@@ -199,7 +214,7 @@ if (Test-Path $gpl) {
 # registers a new device on the recipient's first connect/scan.
 $forbiddenNames = @(
     'warpscout-account.json', 'state.json', 'settings.json', 'cache.json',
-    'config.yaml', 'cache.db', 'xehn.log',
+    'config.yaml', 'cache.db', 'xehn.log', 'psiphon-regions.json',
     'vpngate-underlay.json', 'vpngate-failed.json', 'vpngate-last.json',
     'vpngate-nodes.json', 'vpngate-nodes-v2.json'
 )
@@ -216,6 +231,24 @@ if ($leaks.Count -gt 0) {
 $topExes = @(Get-ChildItem $root -File -Filter *.exe)
 if ($topExes.Count -ne 1 -or $topExes[0].Name -ne 'xehn.exe') {
     throw "release must expose exactly one top-level program: xehn.exe"
+}
+
+# Smart App Control / SmartScreen judge an unsigned exe by its EXACT file hash.
+# 1.0.3 / 1.0.4 run on the very same enforced host because those hashes were
+# published and indexed by Microsoft; a freshly built 1.0.5 hash has zero
+# reputation and is blocked (Code Integrity 3077/3033) until it is indexed.
+# Rebuilding overwrites the hash and throws that reputation away, so freeze the
+# binary at release time and print the hash that must be kept.
+$exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $root 'xehn.exe')).Hash
+Write-Host "xehn.exe SHA256: $exeHash"
+Write-Host "IMPORTANT: publish this exact binary and do NOT rebuild/overwrite it. A new hash resets Microsoft cloud reputation and will be blocked by Smart App Control until indexed again."
+# NOTE: core\mihomo.exe and core\psiphon.exe are separate PE images checked by
+# SAC at launch as well (xehn.log: "An Application Control policy has blocked
+# this file"); keep those binaries fixed for the same reason.
+
+$bundledCore = Join-Path $root 'core\mihomo.exe'
+if (-not (Test-Path $bundledCore) -or (Get-Item $bundledCore).Length -lt 1MB) {
+    throw "release staging tree is missing core\mihomo.exe"
 }
 
 # Zip it. Compress-Archive opens every file without sharing, and a freshly
@@ -250,7 +283,7 @@ try {
     $archive.Dispose()
 }
 $leakedEntries = @($entries | Where-Object {
-    $_ -match '(^|/)(warpscout-account\.json|state\.json|settings\.json|cache\.json|config\.yaml|cache\.db|xehn\.log)$' -or
+    $_ -match '(^|/)(warpscout-account\.json|state\.json|settings\.json|cache\.json|config\.yaml|cache\.db|xehn\.log|psiphon-regions\.json)$' -or
     $_ -match '(^|/)vpngate-.*\.json$' -or
     $_ -match '(^|/)warp-report-.*\.txt$'
 })
@@ -260,6 +293,9 @@ if ($leakedEntries.Count -gt 0) {
 $zipExes = @($entries | Where-Object { $_ -match '^XEHN/[^/]+\.exe$' })
 if ($zipExes.Count -ne 1) {
     throw "archive must contain exactly one top-level program, found: $($zipExes -join ', ')"
+}
+if (-not ($entries -contains 'XEHN/core/mihomo.exe')) {
+    throw "archive is missing XEHN/core/mihomo.exe - this build would fail on first launch"
 }
 
 Write-Host ""

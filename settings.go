@@ -83,8 +83,8 @@ type clientSettings struct {
 	// OpenVPN is the V2 egress switch: a VPN Gate relay dialled from inside the
 	// base protocol. Mutually exclusive with Psiphon — both replace the final
 	// exit, and a session can only land in one place.
-	OpenVPN    bool   `json:"openvpn"`
-	AutoRepair bool   `json:"auto_repair"`
+	OpenVPN    bool `json:"openvpn"`
+	AutoRepair bool `json:"auto_repair"`
 	// PsiphonRegion is the preferred Psiphon exit country (ISO alpha-2, upper
 	// case). Empty means "automatic" — Psiphon picks the region itself.
 	PsiphonRegion string `json:"psiphon_region"`
@@ -98,11 +98,37 @@ type clientSettings struct {
 	// fastest cached endpoint wins.
 	Pin string `json:"pin"`
 
+	// Mode B (Clash subscription): imported proxies are the base outbound.
+	// ConnMode empty or "warp" keeps the original WARP pipeline untouched, so
+	// an upgraded 1.0.4 install behaves exactly as before.
+	ConnMode      string      `json:"conn_mode,omitempty"`
+	Subscriptions []string    `json:"subscriptions,omitempty"`
+	CustomProxies []ProxySpec `json:"custom_proxies,omitempty"`
+	ActiveProxy   string      `json:"active_proxy,omitempty"`
+	// SubAutoSelect makes the connect pick the lowest-latency measured proxy
+	// instead of the one the user clicked. DelayMS is filled by the node
+	// page's "延迟测试" action.
+	SubAutoSelect bool `json:"sub_auto_select,omitempty"`
+	// SubSources are the managed subscriptions (name + group + origin). Each
+	// imported node carries the matching SubID. Subscriptions []string above is
+	// the legacy URL-only list, kept so an old file still loads; loadSettings
+	// migrates it into SubSources and normalize keeps the two in sync.
+	SubSources []SubSource `json:"sub_sources,omitempty"`
+	// ActiveSub is the subscription the node page is filtered to ("" = all).
+	// It is a VIEW filter only: the connect pipeline still uses ActiveProxy
+	// over the full CustomProxies, so switching the view never drops a tunnel.
+	ActiveSub string `json:"active_sub,omitempty"`
+
 	// Local proxy: where clients point, where the core's API listens, and
 	// whether other devices on the LAN may use the mixed port.
-	MixedPort   int  `json:"mixed_port"`
-	APIPort     int  `json:"api_port"`
-	AllowLan    bool `json:"allow_lan"`
+	MixedPort int  `json:"mixed_port"`
+	APIPort   int  `json:"api_port"`
+	AllowLan  bool `json:"allow_lan"`
+	// LanUser/LanPass gate the LAN listener. Empty means "no auth", which is the
+	// common case on a home network; setting both makes mihomo demand
+	// user:password on the mixed port.
+	LanUser     string `json:"lan_user,omitempty"`
+	LanPass     string `json:"lan_pass,omitempty"`
 	CaptureMode string `json:"capture_mode"`
 
 	// Network. IPFamily is the tunnel's address family (v4/v6/both); it is
@@ -111,6 +137,17 @@ type clientSettings struct {
 	IPFamily   string `json:"ip_family"`
 	MTU        int    `json:"mtu"`
 	TimeoutSec int    `json:"timeout_sec"`
+
+	// Performance tuning. EndpointRank orders the working endpoints a connect
+	// tries: "ping" (lowest latency, the historical default) or "speed"
+	// (steady-state throughput tiers, latency only within a tier). Empty keeps
+	// ping, so an upgraded install behaves exactly as before until opted in.
+	EndpointRank string `json:"endpoint_rank,omitempty"`
+	// IPStack and Congestion override the MASQUE inner gVisor stack and the QUIC
+	// congestion controller. Empty keeps the shipped defaults (gvisor / bbr);
+	// the renderer falls back to those if the running core rejects a choice.
+	IPStack    string `json:"ip_stack,omitempty"`
+	Congestion string `json:"congestion_controller,omitempty"`
 
 	// DNS: DNSCustom is a comma separated resolver list (empty = not set);
 	// DNSOff stops the client from handing any resolver to the tunnel at all;
@@ -159,19 +196,19 @@ const settingsName = "settings.json"
 
 func defaultSettings() clientSettings {
 	return clientSettings{
-		Theme:        themeLight,
-		Lang:         langZH,
-		Proto:        protoAWG,
-		OuterProto:   protoWG,
-		InnerProto:   protoWG,
-		AutoRepair:   true,
-		MixedPort:    core.DefaultMixedPort,
-		APIPort:      core.DefaultAPIPort,
-		CaptureMode:  captureProxy,
-		IPFamily:     famV4,
-		TimeoutSec:   2,
-		DNSLeak:      true,
-		ProxyMode:    modeCustom,
+		Theme:       themeLight,
+		Lang:        langZH,
+		Proto:       protoAWG,
+		OuterProto:  protoWG,
+		InnerProto:  protoWG,
+		AutoRepair:  true,
+		MixedPort:   core.DefaultMixedPort,
+		APIPort:     core.DefaultAPIPort,
+		CaptureMode: captureProxy,
+		IPFamily:    famV4,
+		TimeoutSec:  2,
+		DNSLeak:     true,
+		ProxyMode:   modeCustom,
 	}
 }
 
@@ -220,6 +257,29 @@ func loadSettings() clientSettings {
 	if json.Unmarshal(raw, &legacy) == nil && legacy.GeoSplit && s.ProxyMode == legacyModeRule {
 		s.ProxyMode = modeBypass
 	}
+	// Subscriptions used to be a URL-only list with no names or groups. Migrate
+	// each remembered URL into a managed SubSource once; normalize then clears
+	// the legacy list so it is never written again.
+	if len(s.SubSources) == 0 && len(s.Subscriptions) > 0 {
+		for _, u := range s.Subscriptions {
+			if u = strings.TrimSpace(u); u != "" {
+				s.SubSources = append(s.SubSources, SubSource{
+					ID: newSubID(), Name: subNameFromURL(u), URL: u, Kind: "url",
+				})
+			}
+		}
+		// Legacy nodes carry no source link. With exactly one migrated source
+		// they almost certainly all came from it, so adopt them; with several
+		// there is no honest way to tell, so they stay ungrouped under "全部".
+		if len(s.SubSources) == 1 {
+			id := s.SubSources[0].ID
+			for i := range s.CustomProxies {
+				if s.CustomProxies[i].SubID == "" {
+					s.CustomProxies[i].SubID = id
+				}
+			}
+		}
+	}
 	s.normalize()
 	return s
 }
@@ -242,6 +302,51 @@ func saveSettings(s clientSettings) error {
 // unopenable window — a bad port, MTU or page name here would look like "the
 // client is broken", not "the file is wrong".
 func (s *clientSettings) normalize() {
+	// Mode B defaults to off: an upgraded install must keep the WARP path.
+	if s.ConnMode != "subscription" {
+		s.ConnMode = "warp"
+	}
+	if len(s.SubSources) > 64 {
+		s.SubSources = s.SubSources[:64]
+	}
+	seenSub := make(map[string]bool, len(s.SubSources))
+	subs := s.SubSources[:0]
+	for _, src := range s.SubSources {
+		src.Name = strings.TrimSpace(src.Name)
+		src.Group = strings.TrimSpace(src.Group)
+		src.URL = strings.TrimSpace(src.URL)
+		if src.ID == "" || seenSub[src.ID] {
+			src.ID = newSubID()
+		}
+		seenSub[src.ID] = true
+		if src.Name == "" {
+			if src.URL != "" {
+				src.Name = subNameFromURL(src.URL)
+			} else {
+				src.Name = "订阅"
+			}
+		}
+		switch src.Kind {
+		case "url", "file", "clipboard", "qr", "single":
+		default:
+			if src.URL != "" {
+				src.Kind = "url"
+			} else {
+				src.Kind = "single"
+			}
+		}
+		subs = append(subs, src)
+	}
+	s.SubSources = subs
+	// The legacy URL-only list is migration input only; never persist it again.
+	s.Subscriptions = nil
+	// ActiveSub is a view filter: keep it only when it names a live source.
+	if s.ActiveSub != "" && s.subSourceByID(s.ActiveSub) == nil {
+		s.ActiveSub = ""
+	}
+	if len(s.CustomProxies) > 512 {
+		s.CustomProxies = s.CustomProxies[:512]
+	}
 	switch s.Theme {
 	case themeLight, themeDark, themeAuto:
 	default:
@@ -290,15 +395,21 @@ func (s *clientSettings) normalize() {
 	}
 	// A nested tunnel's inner MTU (1220) is below IPv6's 1280-byte minimum, so
 	// those protocols cannot carry v6 at all. Clamp rather than render a
-	// config whose v6 half silently blackholes.
-	if !protoV6Capable(s.Proto) {
+	// config whose v6 half silently blackholes. Subscription mode has no WARP
+	// tunnel: the imported node decides what it carries, so the proto gate
+	// does not apply there.
+	if s.ConnMode != "subscription" && !protoV6Capable(s.Proto) {
 		s.IPFamily = famV4
 	}
 	// OpenVPN is IPv4-only end to end: VPN Gate hands out v4 relays and mihomo's
-	// openvpn outbound carries no v6 half. The two exits also replace the same
-	// thing, so a file with both on is resolved to the newer switch.
+	// openvpn outbound carries no v6 half. Psiphon's exit is likewise v4 in
+	// practice and unverified for v6, so both stacked exits lock the family.
+	// The two exits also replace the same thing, so a file with both on is
+	// resolved to the newer switch.
 	if s.OpenVPN {
 		s.Psiphon = false
+	}
+	if s.OpenVPN || s.Psiphon {
 		s.IPFamily = famV4
 	}
 	s.Pin = strings.TrimSpace(s.Pin)
@@ -316,23 +427,36 @@ func (s *clientSettings) normalize() {
 	default:
 		s.ProxyMode = modeCustom
 	}
+	// Internalized choices: the settings page no longer exposes these, so the
+	// shipped defaults are forced on every load and save. A hand-edited file
+	// cannot re-enable a knob the UI can no longer show or explain.
+	s.APIPort = core.DefaultAPIPort
+	s.MTU = 0
+	s.TimeoutSec = 2
+	s.Rescan = false
+	s.AutoRepair = true
+	s.DNSCustom = ""
+	s.DNSOff = false
+	s.DNSLeak = true
+
+	// LAN credentials: a colon is the user/password separator inside mihomo's
+	// single "user:pass" entry, so it cannot appear in either half; both are
+	// trimmed so a stray space in the dialog does not silently change the
+	// password. A half-filled pair is kept in the file (the user is midway
+	// through filling it in) but apply() only renders a complete one.
+	s.LanUser = strings.TrimSpace(strings.ReplaceAll(s.LanUser, ":", ""))
+	s.LanPass = strings.TrimSpace(strings.ReplaceAll(s.LanPass, ":", ""))
 	if s.MixedPort < 1 || s.MixedPort > 65535 {
 		s.MixedPort = core.DefaultMixedPort
-	}
-	if s.APIPort < 1 || s.APIPort > 65535 {
-		s.APIPort = core.DefaultAPIPort
 	}
 	if s.APIPort == s.MixedPort {
 		s.APIPort = s.MixedPort + 1
 	}
-	// 0 means "let the core pick" (mihomo's own default), which is what an
-	// unset MTU has always meant here.
-	if s.MTU < 0 || s.MTU > 9000 {
-		s.MTU = 0
-	}
-	if s.TimeoutSec < 1 || s.TimeoutSec > 60 {
-		s.TimeoutSec = 2
-	}
+	// Performance tuning: clamp to the known spellings so a hand-edited file
+	// cannot render a transport the core rejects. Empty keeps the defaults.
+	s.EndpointRank = normalizeRank(s.EndpointRank)
+	s.IPStack = normalizeStack(s.IPStack)
+	s.Congestion = normalizeCC(s.Congestion)
 	// The egress region is an ISO alpha-2 hint or empty for automatic.
 	s.PsiphonRegion = strings.ToUpper(strings.TrimSpace(s.PsiphonRegion))
 	if len(s.PsiphonRegion) != 2 {
@@ -360,6 +484,31 @@ func (s *clientSettings) normalize() {
 // domainDirectList / domainProxyList are the two domain suffix lists.
 func (s clientSettings) domainDirectList() []string { return fieldList(s.DomainDirect) }
 func (s clientSettings) domainProxyList() []string  { return fieldList(s.DomainProxy) }
+
+// subSourceByID returns the managed subscription with this id, or nil. The
+// pointer addresses the live slice element so callers may edit it in place.
+func (s *clientSettings) subSourceByID(id string) *SubSource {
+	if id == "" {
+		return nil
+	}
+	for i := range s.SubSources {
+		if s.SubSources[i].ID == id {
+			return &s.SubSources[i]
+		}
+	}
+	return nil
+}
+
+// nodesOfSub counts the imported nodes belonging to one subscription.
+func (s *clientSettings) nodesOfSub(id string) int {
+	n := 0
+	for i := range s.CustomProxies {
+		if s.CustomProxies[i].SubID == id {
+			n++
+		}
+	}
+	return n
+}
 
 // fieldList splits a comma/semicolon/whitespace separated list, de-duplicated.
 func fieldList(raw string) []string {
@@ -431,6 +580,11 @@ func (s clientSettings) apply(o *options) {
 		o.apiPort = s.APIPort
 	}
 	o.allowLan = s.AllowLan
+	// Only a complete pair becomes an authentication entry; normalize already
+	// cleared half-filled ones.
+	if s.AllowLan && s.LanUser != "" && s.LanPass != "" {
+		o.lanAuth = s.LanUser + ":" + s.LanPass
+	}
 	o.family = s.IPFamily
 	// The scan cache and the endpoint pools are keyed by a single family; a
 	// dual-stack tunnel still scans v4 endpoints (it carries both either way).
@@ -449,7 +603,21 @@ func (s clientSettings) apply(o *options) {
 	o.domainDirect = s.domainDirectList()
 	o.domainProxy = s.domainProxyList()
 	o.noGuard = !s.AutoRepair
+	o.endpointRank = normalizeRank(s.EndpointRank)
+	o.ipStack = normalizeStack(s.IPStack)
+	o.congestion = normalizeCC(s.Congestion)
+	overrideTuningFromEnv(o)
 	o.psiphonRegion = s.PsiphonRegion
 	o.openvpnRegion = s.OpenVPNRegion
 	o.openvpnNodePin = s.OpenVPNNode
+	// Mode B: imported Clash proxies become the base outbound. Leaving these
+	// empty in mode A is exactly the previous behaviour.
+	o.connMode = s.ConnMode
+	o.customProxies = s.CustomProxies
+	o.activeProxy = s.ActiveProxy
+	if s.ConnMode == "subscription" && s.SubAutoSelect {
+		if best := bestMeasuredProxy(s.CustomProxies); best != "" {
+			o.activeProxy = best
+		}
+	}
 }

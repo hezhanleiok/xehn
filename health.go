@@ -269,6 +269,20 @@ func optionsFromState(st clientState) options {
 	// A Psiphon session re-launches its exit with the same region it was
 	// started with, so a repair never swaps the user's chosen country.
 	opts.psiphonRegion = st.PsiphonRegion
+	// Mode B: the front node and the whole proxy list live in settings.json,
+	// not in state.json. A repair that skipped them would render a WARP config
+	// for a session that never used WARP.
+	if st.SubMode {
+		opts.connMode = "subscription"
+		s := loadSettings()
+		opts.customProxies = s.CustomProxies
+		opts.activeProxy = s.ActiveProxy
+		if s.SubAutoSelect {
+			if best := bestMeasuredProxy(s.CustomProxies); best != "" {
+				opts.activeProxy = best
+			}
+		}
+	}
 	// An OpenVPN session must come back as the SAME kind of session: without the
 	// exit descriptor a repair would rebuild the bare underlay and silently
 	// drop the relay the user picked.
@@ -276,6 +290,10 @@ func optionsFromState(st clientState) options {
 		opts.openvpnMode = true
 		opts.openvpnRegion = st.OpenVPNRegion
 		opts.openvpnNode = st.OpenVPNNode
+		// subscriptionRelayCandidates orders by the pin, not by openvpnNode, so
+		// without this a repair would rotate off the relay the user fixed — the
+		// exact silent swap the pinned-failure dialog exists to prevent.
+		opts.openvpnNodePin = loadSettings().OpenVPNNode
 		// The relay is IPv4-only; a v6 endpoint family would fail verification
 		// on a chain that can never carry it.
 		opts.ipv6 = false
@@ -391,8 +409,21 @@ func nextCandidates(results []cachedEndpoint, tried map[string]bool, max int) []
 // sidecar is restarted on a fresh socks port that the same render names — and a
 // bare WARP tunnel is never what comes back.
 func repairOnce(ctx context.Context, opts options, dead string, tried map[string]bool, logf func(string)) (clientState, bool) {
+	// A subscription session has no endpoint pool to rotate: the front node is
+	// the user's choice and the whole repair is "bring the same chain back".
+	if opts.connMode == "subscription" {
+		return repairSubscriptionOnce(ctx, opts, logf)
+	}
 	if dead != "" {
 		tried[dead] = true
+	}
+	// A repair can be the first thing this process does (auto-repair after a
+	// restart), and a warm scan cache would otherwise skip the account load
+	// that doScan performs. Without it the config renders with no device
+	// identity at all — there is no built-in fallback any more.
+	if err := ensureAccount(ctx, opts); err != nil {
+		logf(fmt.Sprintf("修复失败：%v", err))
+		return clientState{}, false
 	}
 	cDir, err := coreDir()
 	if err != nil {
@@ -499,13 +530,13 @@ func repairOnce(ctx context.Context, opts options, dead string, tried map[string
 			ps = &Psiphon{}
 			afterReady = func() error {
 				under := underlaySocksPort(opts.mixedPort)
-				if uerr := probeUnderlaySocks(ctx, under, 8*time.Second); uerr != nil {
+				if uerr := probeUnderlaySocks(ctx, under, underlayProbeTimeout); uerr != nil {
 					return fmt.Errorf("underlay 数据面不可用: %w", uerr)
 				}
 				if serr := ps.Start(ctx, launch); serr != nil {
 					return fmt.Errorf("psiphon start: %w", serr)
 				}
-				if werr := ps.WaitForSocks(ctx, 60*time.Second); werr != nil {
+				if werr := ps.WaitForSocks(ctx, psiphonSocksWait); werr != nil {
 					return fmt.Errorf("psiphon socks 未就绪: %w", werr)
 				}
 				if werr := ps.WaitForTunnel(ctx, psiphonTunnelWait); werr != nil {
@@ -558,6 +589,14 @@ func repairOnce(ctx context.Context, opts options, dead string, tried map[string
 // nothing about the tunnel underneath it, and evicting healthy WARP endpoints
 // on a VPN Gate outage would poison the scan cache.
 func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (clientState, bool) {
+	// A subscription front + VPN Gate exit has no WARP endpoint pool: the WARP
+	// scan below would reject proto "订阅" and the repair would die instantly,
+	// taking a recoverable session down with it (the "connected, then home shows
+	// disconnected" report). Rebuild through the subscription pipeline instead —
+	// it keeps the user's front node and rotates the relay, exactly as connect does.
+	if st.SubMode {
+		return repairSubscriptionOnce(ctx, optionsFromState(st), logf)
+	}
 	cDir, err := coreDir()
 	if err != nil {
 		logf(fmt.Sprintf("修复失败：无法定位核心目录：%v", err))
@@ -575,9 +614,11 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 		logf(fmt.Sprintf("修复失败：无法获取端点列表：%v", err))
 		return clientState{}, false
 	}
-	// Forced refresh: the relay pool is the thing being repaired, and re-picking
-	// from the same cached list would walk straight back into the dead nodes.
-	nodes, err := vpnGateNodesFor(ctx, results, run, true)
+	// Pool refresh is manual only. A health repair re-picks from the cached
+	// list (rotating past the failed relay via the failure memory) rather than
+	// triggering a network fetch and a fresh TCP measurement behind the user's
+	// back.
+	nodes, err := vpnGateNodesFor(ctx, results, run, false)
 	if err != nil {
 		logf(fmt.Sprintf("修复失败：无法获取 VPN Gate 节点：%v", err))
 		return clientState{}, false
@@ -741,6 +782,43 @@ func giveUp(logf func(string)) {
 // It exits on its own as soon as the session is gone - disconnected by another
 // process, or the host's proxy pointed somewhere else by hand - so a guard is
 // never a stray process with its own ideas about the machine.
+// proxyLostPath is where the guard records "the host proxy no longer points at
+// us". A separate file rather than a state.json field: the guard and the GUI
+// both write state, and a read-modify-write race there would clobber a fresh
+// connect's snapshot.
+func proxyLostPath() string {
+	home, err := appDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "proxy-lost.json")
+}
+
+// markProxyLost leaves a note the GUI turns into a visible warning. Silence is
+// the dangerous outcome: a session that looks connected while every packet goes
+// out directly is worse than a session that clearly failed.
+func markProxyLost(st clientState) {
+	p := proxyLostPath()
+	if p == "" {
+		return
+	}
+	rec := map[string]any{
+		"at":   time.Now().Format(time.RFC3339),
+		"port": st.MixedPort,
+		"exit": st.ExitIP,
+	}
+	raw, _ := json.Marshal(rec)
+	_ = os.WriteFile(p, raw, 0o644)
+}
+
+// clearProxyLost drops the marker; called when a session starts or ends, so the
+// warning never outlives the session it described.
+func clearProxyLost() {
+	if p := proxyLostPath(); p != "" {
+		_ = os.Remove(p)
+	}
+}
+
 func runHealthGuardCmd(ctx context.Context, opts options) error {
 	if opts.mixedPort <= 0 {
 		opts.mixedPort = core.DefaultMixedPort
@@ -771,6 +849,10 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 	var (
 		psiphonRestarts      int
 		psiphonUnderlayFails int
+		// proxyTakebacks bounds the tug-of-war with another client that keeps
+		// rewriting WinINET. Two attempts is enough to survive a one-off grab;
+		// beyond that the honest answer is "this session is not proxied".
+		proxyTakebacks int
 	)
 	for {
 		select {
@@ -794,7 +876,32 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 		// had us set it, and a blocked proxy write left it as-is: in all three
 		// the host proxy is not our signal, so only read it when we did set it.
 		if !st.TUN && !st.NoProxy && st.ProxyWarn == "" && !core.SystemProxyEnabledAt(st.MixedPort) {
-			logf("系统代理已不再指向本端口，退出守护")
+			// Another client (v2rayN and friends rewrite WinINET on their own
+			// timer) took the host proxy. Exiting here used to be silent, so the
+			// window kept showing "已连接" while every browser went out directly —
+			// the user believes they are on Psiphon and are actually on their ISP.
+			// Try once to take it back; if that fails, record the loss so the GUI
+			// can stop claiming the tunnel is carrying traffic.
+			if proxyTakebacks < 2 {
+				proxyTakebacks++
+				if _, rerr := core.SetSystemProxy(st.MixedPort); rerr == nil {
+					logf(fmt.Sprintf("系统代理被其它程序改动，已恢复（第 %d 次）", proxyTakebacks))
+					continue
+				}
+			}
+			markProxyLost(st)
+			if core.SystemProxyPointsElsewhere(st.MixedPort) {
+				// Another client holds the proxy: this tunnel carries nothing, and
+				// leaving it lit is the "connected but every page goes direct"
+				// report. End the session honestly.
+				logf("系统代理被其它程序占用，无法恢复：结束本次会话")
+				giveUp(logf)
+				return nil
+			}
+			// The proxy is simply off. That may be deliberate (the user switched
+			// to TUN, or is troubleshooting), so keep watching instead of tearing
+			// the session down — the UI already shows 直连中.
+			logf("系统代理已关闭，本次会话不再经过代理（可在设置里重新开启）")
 			return nil
 		}
 		res := checkDataPlane(st.MixedPort, st.Family)
@@ -847,7 +954,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			//  - underlay alive: the Psiphon sidecar itself is at fault, so
 			//    restart it on the SAME port (mihomo's config names it).
 			under := underlaySocksPort(st.MixedPort)
-			if uerr := probeUnderlaySocks(ctx, under, 8*time.Second); uerr != nil {
+			if uerr := probeUnderlaySocks(ctx, under, underlayProbeTimeout); uerr != nil {
 				logf(fmt.Sprintf("基础协议 underlay 不可用 (%v)：重建基础协议并在其上恢复 Psiphon", uerr))
 				psiphonUnderlayFails++
 				if psiphonUnderlayFails > psiphonUnderlayLimit {

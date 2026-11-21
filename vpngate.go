@@ -47,7 +47,11 @@ const (
 	vpnGateConnectNodes = 24
 	// vpnGateFetchTimeout bounds the direct fetch; the WARP fallback has its
 	// own, longer budget because a handshake and a TLS round-trip ride on it.
-	vpnGateFetchTimeout = 12 * time.Second
+	//
+	// 6s, not 12: on a blocked network the direct attempt fails fast (RST or
+	// DNS poison) and every extra second is pure wait before the fallback that
+	// actually works. A reachable network answers well inside this window.
+	vpnGateFetchTimeout = 6 * time.Second
 	// vpnGateProbeJobs / vpnGateProbeTimeout match the Android client: eight
 	// concurrent TCP probes, three seconds each. Only TCP profiles are probed;
 	// a UDP node keeps the API's self-reported ping.
@@ -102,6 +106,14 @@ type vpnGateNode struct {
 	// (vpngate-speeds.json), not the API's self-reported speed. It only ranks
 	// candidates; it never excludes one.
 	MeasuredBps int64 `json:"-"`
+	// ProbeState / ProbeMS come from the MANUAL OpenVPN handshake test only:
+	// "" = 未检测, "ok" = real handshake + download passed, "fail" = failed.
+	// Session-local on purpose: a pool refresh resets every row to 未检测.
+	ProbeState string `json:"-"`
+	ProbeMS    int64  `json:"-"`
+	// ProbeErr is the short reason a row failed (端口不可达 / 握手超时 / 下载中断).
+	// A bare 「失败」 left the user unable to tell a dead relay from a slow one.
+	ProbeErr string `json:"-"`
 }
 
 func (n vpnGateNode) endpoint() string { return net.JoinHostPort(n.IP, strconv.Itoa(n.Port)) }
@@ -329,7 +341,98 @@ func enrichVPNGateClasses(ctx context.Context, client *http.Client, nodes []vpnG
 			enrichClassify(&nodes[i], r)
 		}
 	}
+	// Second, independent source. Two APIs are required so a single stale or
+	// failed classification cannot mislabel a relay, and the merged verdict is
+	// always one of the two labels the picker knows.
+	crossCheckClasses(ctx, client, nodes)
 	return len(byIP), nil
+}
+
+// ipWhoEndpoint is the independent second source for the IP class cross-check.
+// It is keyless and returns the connection's ISP/Org/ASN, so the same
+// datacenter heuristics can be applied from a different data provider than
+// ip-api.com.
+const ipWhoEndpoint = "https://ipwho.is/"
+
+type ipWhoResult struct {
+	Success    bool `json:"success"`
+	Connection struct {
+		ASN int    `json:"asn"`
+		Org string `json:"org"`
+		ISP string `json:"isp"`
+	} `json:"connection"`
+}
+
+// crossCheckClasses asks the second source about every IP the first source
+// left as residential, then merges the two verdicts. A datacenter claim from
+// EITHER source wins: hosting flags and DC ASNs are strong positive evidence,
+// while "residential" is only the absence of such evidence. There is
+// deliberately no third bucket - no API answer, timeout or disagreement can
+// ever produce 未知. The picker only ever shows 家宽 or 机房.
+func crossCheckClasses(ctx context.Context, client *http.Client, nodes []vpnGateNode) {
+	ips := make([]string, 0, 64)
+	seen := map[string]bool{}
+	for i := range nodes {
+		if nodes[i].classKey() == "datacenter" || seen[nodes[i].IP] {
+			continue
+		}
+		seen[nodes[i].IP] = true
+		ips = append(ips, nodes[i].IP)
+	}
+	if len(ips) == 0 {
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	dcIPs := map[string]bool{}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for _, ip := range ips {
+		wg.Add(1)
+		go func(ip string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-checkCtx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, ipWhoEndpoint+ip, nil)
+			if err != nil {
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			var r ipWhoResult
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&r); err != nil || !r.Success {
+				return
+			}
+			blob := strings.ToLower(strings.TrimSpace(r.Connection.ISP + " " + r.Connection.Org))
+			if containsAny(blob, dcKeywords) || hardDCASN[r.Connection.ASN] {
+				mu.Lock()
+				dcIPs[ip] = true
+				mu.Unlock()
+			}
+		}(ip)
+	}
+	wg.Wait()
+
+	// Final normalisation: only two labels survive, whatever either API said.
+	for i := range nodes {
+		if dcIPs[nodes[i].IP] || strings.HasPrefix(strings.ToLower(nodes[i].HostName), "public-vpn") {
+			nodes[i].Class = "datacenter"
+		} else if nodes[i].Class != "datacenter" {
+			nodes[i].Class = "residential"
+		}
+	}
 }
 
 // ovpnProfile is the subset of OpenVPN directives mihomo's outbound parses. A
@@ -719,7 +822,11 @@ func fetchVPNGateNodesViaWARP(ctx context.Context, results []cachedEndpoint, run
 			continue
 		}
 		if stack := t.stack(); stack != nil && stack.tnet != nil {
-			enrichCtx, enrichCancel := context.WithTimeout(ctx, 20*time.Second)
+			// 8s, not 20: this only labels each relay as 家宽/机房. It ran after
+			// the list was already parsed, so its full budget was pure wait on the
+			// "正在获取节点" spinner — a 39-second fetch was mostly this. A relay
+			// that misses the window just shows without the tag.
+			enrichCtx, enrichCancel := context.WithTimeout(ctx, 8*time.Second)
 			_, _ = enrichVPNGateClasses(enrichCtx, newStackHTTPClient(stack, 15*time.Second), nodes)
 			enrichCancel()
 			probeVPNGateLatency(ctx, nodes, func(c context.Context, addr string) (net.Conn, error) {
@@ -1108,6 +1215,24 @@ func vpnGateCandidates(ctx context.Context, nodes []vpnGateNode, region, pin str
 			stageMsg(fmt.Sprintf("所选地区（%s）的节点都在 %s 内失败过，仍优先重试该地区",
 				targetCC, vpnGateFailTTL))
 			ordered = append(retry, ordered...)
+		}
+	}
+	// A pinned relay is an explicit user choice: the failure memory serves auto
+	// selection and must never overrule it. When the memory just filtered the
+	// pin out, put it back at the front and say so — the connect tries it first
+	// and reports clearly if it has to fall back, instead of asking mid-connect
+	// or silently moving to a different relay while the UI still shows the pin.
+	if pinNode != nil {
+		found := false
+		for _, n := range ordered {
+			if n.id() == pinNode.id() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			ordered = append([]vpnGateNode{*pinNode}, ordered...)
+			stageMsg(fmt.Sprintf("固定节点 %s 在 %s 内失败过，仍按你的固定选择优先尝试", pinNode.id(), vpnGateFailTTL))
 		}
 	}
 	if max > 0 && len(ordered) > max {
@@ -1504,6 +1629,14 @@ func measureVPNGateLatency(ctx context.Context, nodes []vpnGateNode) {
 func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		a, b := nodes[i], nodes[j]
+		// Reachability outranks every quality signal. A 家宽 node that timed out
+		// is not better than a 机房 node that answered: ranking class first put
+		// eight dead relays above two working ones, which reads as "the list is
+		// mostly broken".
+		am, bm := a.LatencyMS > 0, b.LatencyMS > 0
+		if am != bm {
+			return am
+		}
 		if ra, rb := a.classRank(), b.classRank(); ra != rb {
 			return ra < rb
 		}
@@ -1513,10 +1646,6 @@ func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 		}
 		if at != 1 && a.MeasuredBps != b.MeasuredBps {
 			return a.MeasuredBps > b.MeasuredBps
-		}
-		am, bm := a.LatencyMS > 0, b.LatencyMS > 0
-		if am != bm {
-			return am
 		}
 		if am && a.LatencyMS != b.LatencyMS {
 			return a.LatencyMS < b.LatencyMS
@@ -1610,4 +1739,49 @@ func vpnGateCountries(nodes []vpnGateNode) []vpnGateCountry {
 		return a.Name < b.Name
 	})
 	return out
+}
+
+// probeResult is one node's measured state for this session, keyed by id so a
+// pool rebuild (which recreates every vpnGateNode) cannot lose it.
+type probeResult struct {
+	State string // "ok" | "fail"
+	MS    int64
+	Bps   int64
+	Err   string
+}
+
+// fetchVPNGateViaSubscription fetches the VPN Gate list through an imported
+// node. It is the subscription-mode counterpart of fetchVPNGateNodesViaWARP:
+// the same subscription node the session will use carries the request, so a
+// network where vpngate.net is blocked directly still gets a fresh list, and
+// the mode never has to build a WARP tunnel it promised not to use.
+//
+// The list is returned WITHOUT a latency column on purpose. A SOCKS handshake
+// through one subscription node answers in ~1 ms because mihomo replies as soon
+// as the outbound is accepted, not when the tunnel's first byte lands; painting
+// that as "1ms" would rank dead relays first. The pool is ordered by line class
+// + this client's measured speed + the API's own ping, and 延迟测试 fills exact
+// numbers with a real OpenVPN handshake.
+func fetchVPNGateViaSubscription(ctx context.Context, proxies []ProxySpec, active string) ([]vpnGateNode, error) {
+	if len(proxies) == 0 {
+		return nil, fmt.Errorf("订阅模式还没有导入节点，请先在「节点」页导入订阅")
+	}
+	var out []vpnGateNode
+	err := withTempCore(ctx, "订阅节点抓取", func(mixedPort, apiPort int) []byte {
+		return subscriptionCarrierConfig(proxies, active, mixedPort, apiPort)
+	}, func(mixedPort, _ int) error {
+		raw, err := fetchVPNGateViaProxy(ctx, mixedPort)
+		if err != nil {
+			return err
+		}
+		nodes := parseVPNGateCSV(raw)
+		if len(nodes) == 0 {
+			return fmt.Errorf("VPN Gate 返回的列表为空")
+		}
+		_, _ = enrichVPNGateClasses(ctx, vpnGateProxyClient(mixedPort, 15*time.Second), nodes)
+		sortVPNGateNodesByLatency(nodes)
+		out = nodes
+		return nil
+	})
+	return out, err
 }

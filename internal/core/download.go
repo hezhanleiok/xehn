@@ -19,13 +19,20 @@ import (
 // without the user hunting for a binary.
 const (
 	releasesAPI = "https://api.github.com/repos/MetaCubeX/mihomo/releases"
-	// defaultVersion is the release tag the client falls back to when no core
-	// is present and the network cannot be reached to list newer ones.
-	// v1.19.32 is the official latest stable (2026-09-30): the first line that
-	// carries every protocol this client renders (wireguard+amnezia-wg-option,
-	// masque h2/h3, dialer-proxy chains).
-	defaultVersion = "v1.19.32"
+	// defaultVersion must match the core pack.ps1 bundles into the release ZIP.
+	// A mismatch here used to let a first-run download silently replace a
+	// working bundled core with an older build whose protocol support differs.
+	defaultVersion = "v1.19.33"
+	// mihomo switched from geoip.dat to geoip.metadb; accept both when a
+	// downloaded archive happens to carry geodata alongside the executable.
+	geoIPMetaName = "geoip.metadb"
 )
+
+// BundledCoreVersion is injected by pack.ps1 via -ldflags from the core it
+// actually put in the ZIP. When set it takes precedence over defaultVersion,
+// so reprovisioning can never install a core older than the shipped one.
+// It stays empty for plain `go build` / `go test` builds.
+var BundledCoreVersion = ""
 
 // ostuple returns the mihomo release asset fragment for this platform.
 func ostuple() (osPart, archPart, exeName string) {
@@ -72,7 +79,7 @@ type release struct {
 
 // EnsureBinary guarantees a working core binary in workDir. When one is
 // already present it is kept; otherwise the caller may supply localPath, and
-// failing that the client downloads the default (or a newer) release.
+// failing that the client downloads a matching release.
 func EnsureBinary(workDir, localPath string) (string, error) {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return "", err
@@ -91,22 +98,47 @@ func EnsureBinary(workDir, localPath string) (string, error) {
 	if err := downloadRelease(workDir); err != nil {
 		return "", fmt.Errorf("core: no mihomo binary and download failed: %w", err)
 	}
-	if isExecutable(candidate) {
-		return candidate, nil
+	if !isExecutable(candidate) {
+		return "", fmt.Errorf("core: download completed but %s is unusable", candidate)
 	}
-	return "", fmt.Errorf("core: download completed but %s is missing", candidate)
+	// A security product can leave a perfectly valid PE on disk that Windows
+	// refuses to execute (Smart App Control, quarantine, an execution policy).
+	// Prove the child actually runs before the UI claims the core is ready.
+	if _, err := BinaryVersion(candidate); err != nil {
+		return "", fmt.Errorf("core: downloaded binary cannot be executed (check antivirus / Smart App Control): %w", err)
+	}
+	return candidate, nil
 }
 
+// isExecutable rejects the shapes a broken first run leaves behind: a 0-byte
+// placeholder, a truncated download, or an HTML error page saved as an exe.
+// Checking size and magic bytes is cheap and stops a partial file from being
+// reported as "core ready" only to fail later at `mihomo -t`.
 func isExecutable(p string) bool {
 	fi, err := os.Stat(p)
-	return err == nil && !fi.IsDir() && fi.Size() > 0
+	if err != nil || fi.IsDir() || fi.Size() < 1<<20 {
+		return false
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var magic [2]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return magic[0] == 'M' && magic[1] == 'Z'
+	}
+	return magic[0] == 0x7f && magic[1] == 'E'
 }
 
 // downloadRelease fetches the latest release (falling back to defaultVersion)
 // and unpacks the archive that matches this host's OS+arch.
 func downloadRelease(workDir string) error {
 	client := httpClient(30 * time.Second)
-	version, assetURL, err := pickAsset(client)
+	_, assetURL, err := pickAsset(client)
 	if err != nil {
 		return err
 	}
@@ -122,12 +154,15 @@ func downloadRelease(workDir string) error {
 	if err != nil {
 		return err
 	}
-	_ = version
 	return unpackArchive(data, workDir)
 }
 
 func pickAsset(client *http.Client) (version, url string, err error) {
-	if v, u, ok := releaseFor(client, defaultVersion); ok {
+	tag := defaultVersion
+	if BundledCoreVersion != "" {
+		tag = BundledCoreVersion
+	}
+	if v, u, ok := releaseFor(client, tag); ok {
 		return v, u, nil
 	}
 	// Fall back to listing latest when the pinned one 404s (e.g. removed).
@@ -177,6 +212,10 @@ func matchingAsset(r release) (string, string, error) {
 	return "", "", fmt.Errorf("core: no %s asset in release %s", needle, r.TagName)
 }
 
+// unpackArchive writes each file atomically. The old O_TRUNC write straight to
+// the destination left a half-written mihomo.exe behind when the download was
+// interrupted; isExecutable used to accept that file, and the next launch
+// failed at `mihomo -t` with a misleading "core cannot parse this protocol".
 func unpackArchive(data []byte, workDir string) error {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -185,25 +224,34 @@ func unpackArchive(data []byte, workDir string) error {
 	for _, f := range zr.File {
 		name := filepath.Base(f.Name)
 		// Keep the exe plus the geodata mihomo needs for rule-based routing.
-		if name != ExeName() && name != geoSiteName && name != geoIPName {
+		if name != ExeName() && name != geoSiteName && name != geoIPName && name != geoIPMetaName {
 			continue
 		}
 		rc, err := f.Open()
 		if err != nil {
 			return err
 		}
-		out, err := os.OpenFile(filepath.Join(workDir, name), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+		dst := filepath.Join(workDir, name)
+		tmp := dst + ".part"
+		out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 		if err != nil {
 			rc.Close()
 			return err
 		}
-		if _, err := io.Copy(out, rc); err != nil {
-			out.Close()
-			rc.Close()
-			return err
+		_, copyErr := io.Copy(out, rc)
+		if copyErr == nil {
+			copyErr = out.Sync()
 		}
 		out.Close()
 		rc.Close()
+		if copyErr != nil {
+			_ = os.Remove(tmp)
+			return copyErr
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
 	}
 	return nil
 }

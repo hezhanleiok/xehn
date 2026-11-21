@@ -187,6 +187,16 @@ func TestRenderDNSLeak(t *testing.T) {
 // LAN access widens the listener, TUN adds its block, and the address family
 // decides both the core's IPv6 switch and the outbound's addresses/routes.
 func TestRenderCaptureAndFamily(t *testing.T) {
+	// The build ships no device identity (every install registers its own), so
+	// the test supplies a fixture and asserts against the literal. Asserting
+	// against the global was the bug: once it is empty, "ipv6: "+global becomes
+	// "ipv6: " and matches the header's own "ipv6: false".
+	prevKey, prevV6 := warpPrivateKey, warpAddressV6
+	warpPrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	warpAddressV6 = "2001:db8::1"
+	defer func() { warpPrivateKey, warpAddressV6 = prevKey, prevV6 }()
+	const testV6 = "2001:db8::1"
+
 	ce := cachedEndpoint{Endpoint: "162.159.192.1:2408"}
 	run := protoRun{kind: kindWG, name: protoWG}
 	base := options{mixedPort: 7890, apiPort: 9090, mtu: 1280, dns: "223.5.5.5"}
@@ -203,10 +213,9 @@ func TestRenderCaptureAndFamily(t *testing.T) {
 			want:   []string{`allow-lan: true`, `bind-address: "*"`},
 		},
 		{
-			name:    "lan off",
-			mutate:  func(o *options) { o.allowLan = false },
-			want:    []string{"allow-lan: false"},
-			notWant: []string{"bind-address:"},
+			name:   "lan off",
+			mutate: func(o *options) { o.allowLan = false },
+			want:   []string{"allow-lan: false", "bind-address: 127.0.0.1"},
 		},
 		{
 			name:   "tun",
@@ -217,14 +226,14 @@ func TestRenderCaptureAndFamily(t *testing.T) {
 			name:    "v4 only",
 			mutate:  func(o *options) { o.family = famV4 },
 			want:    []string{"ipv6: false", "ip: " + warpAddress, "allowed-ips: ['0.0.0.0/0']"},
-			notWant: []string{"ipv6: " + warpAddressV6, "::/0"},
+			notWant: []string{"ipv6: " + testV6, "::/0"},
 		},
 		{
 			name:   "v6 only",
 			mutate: func(o *options) { o.family = famV6 },
 			want: []string{
 				"ipv6: true",
-				"ipv6: " + warpAddressV6,
+				"ipv6: " + testV6,
 				"allowed-ips: ['::/0']",
 			},
 			notWant: []string{"ip: " + warpAddress, "0.0.0.0/0"},
@@ -235,7 +244,7 @@ func TestRenderCaptureAndFamily(t *testing.T) {
 			want: []string{
 				"ipv6: true",
 				"ip: " + warpAddress,
-				"ipv6: " + warpAddressV6,
+				"ipv6: " + testV6,
 				"allowed-ips: ['0.0.0.0/0', '::/0']",
 			},
 		},
@@ -339,5 +348,81 @@ func TestRenderBypassSplitsDNS(t *testing.T) {
 	}
 	if noGeo := render("223.5.5.5, 1.1.1.1"); strings.Contains(noGeo, "GEOSITE,cn,DIRECT") {
 		t.Errorf("geo rules emitted without geodata\n%s", noGeo)
+	}
+}
+
+// TestRenderSubscriptionTunDNS pins the mode-B defect fix: the subscription
+// renderer must emit the same resolver/TUN blocks as the WARP one. Before,
+// sub+TUN produced a config with no tun device (zero capture) and sub mode had
+// no dns block at all (leak protection and the bypass DNS split were inert).
+func TestRenderSubscriptionTunDNS(t *testing.T) {
+	base := options{
+		mixedPort: 7890,
+		apiPort:   9090,
+		proxyMode: modeCustom,
+		dnsLeak:   true,
+		connMode:  "subscription",
+		customProxies: []ProxySpec{
+			{Name: "node-a", Type: "ss", Fields: map[string]any{
+				"server": "1.2.3.4", "port": 8388, "cipher": "aes-128-gcm", "password": "pw",
+			}},
+		},
+		activeProxy: "node-a",
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*options)
+		want    []string
+		notWant []string
+	}{
+		{
+			name:   "tun capture",
+			mutate: func(o *options) { o.tunMode = true },
+			want: []string{
+				"dns:\n  enable: true",
+				"respect-rules: true",
+				"proxy-server-nameserver:",
+				"listen: 127.0.0.1:1053",
+				"tun:\n  enable: true",
+				"auto-route: true",
+				"dns-hijack:\n    - any:53",
+			},
+		},
+		{
+			name:    "system proxy capture",
+			mutate:  func(o *options) {},
+			want:    []string{"dns:\n  enable: true", "respect-rules: true", "nameserver:"},
+			notWant: []string{"tun:\n", "dns-hijack", "listen: 127.0.0.1:1053"},
+		},
+		{
+			name: "direct mode drops hardening",
+			mutate: func(o *options) {
+				o.tunMode = true
+				o.proxyMode = modeDirect
+			},
+			want:    []string{"tun:\n  enable: true", "dns:\n  enable: true"},
+			notWant: []string{"respect-rules", "dns-hijack"},
+		},
+	}
+
+	for _, tc := range cases {
+		opts := base
+		tc.mutate(&opts)
+		b, err := renderSubscriptionConfig(opts)
+		if err != nil {
+			t.Fatalf("%s: renderSubscriptionConfig: %v", tc.name, err)
+		}
+		cfg := string(b)
+		for _, w := range tc.want {
+			if !strings.Contains(cfg, w) {
+				t.Errorf("%s: config missing %q\n%s", tc.name, w, cfg)
+			}
+		}
+		for _, w := range tc.notWant {
+			if strings.Contains(cfg, w) {
+				t.Errorf("%s: config unexpectedly contains %q\n%s", tc.name, w, cfg)
+			}
+		}
 	}
 }
